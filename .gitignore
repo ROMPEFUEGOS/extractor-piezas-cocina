@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Resultados de extracción (datos de clientes — no subir)
+*_extraccion.json
+*_extraccion.txt
+*_piezas.dxf
+*_piezas.pdf
+
+# Archivos de trabajo de los proyectos (no subir datos de clientes)
+Cocimoble2025/
+ACyC*/
+Cocimoble2026/
+
+# Temporales
+*.tmp
+*.log
+*.bak
+.DS_Store
+
+# Modelos EasyOCR descargados (pesados)
+.EasyOCR/
