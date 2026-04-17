@@ -1,0 +1,459 @@
+"""
+calcular_tablas.py — Calcula el número de tablas (slabs) necesarias para fabricar
+las piezas de un trabajo de encimeras de cocina.
+
+Algoritmo: shelf-packing (guillotina horizontal) con kerf de 5mm entre piezas.
+Produce un informe legible y una representación ASCII del layout de cada tabla.
+
+Uso:
+    python calcular_tablas.py "/ruta/J0297_extraccion.json"
+    python calcular_tablas.py "/ruta/carpeta_trabajo"  # busca el JSON automáticamente
+"""
+
+import json
+import sys
+import math
+from pathlib import Path
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Medidas estándar de tablas por fabricante (largo × alto en mm)
+# ---------------------------------------------------------------------------
+TABLAS_ESTANDAR = {
+    # Porcelánico / Dekton / Ultra-compact
+    "dekton":       [(3200, 1440)],
+    "neolith":      [(3200, 1500), (3600, 1500)],
+    "coverlam":     [(3200, 1000), (3200, 1600)],
+    "laminam":      [(3000, 1000), (3000, 1500)],
+    "ceratop":      [(3200, 1440)],
+    "lapitec":      [(3000, 1440)],
+    # Cuarzo engineered
+    "silestone":    [(3040, 1440)],
+    "compac":       [(3050, 1440)],
+    "caesarstone":  [(3040, 1440)],
+    "diresco":      [(3030, 1440)],
+    "cosentino":    [(3040, 1440)],  # igual Silestone (misma empresa)
+    "samsung":      [(3040, 1440)],
+    # Piedra natural (granito, mármol, pizarra…) — variable; usamos media habitual
+    "piedra_natural": [(3000, 1800), (2800, 1800), (2500, 1600)],
+    # Guidoni (granito importado habitual)
+    "guidoni":      [(3000, 1800)],
+    # Por defecto para marcas desconocidas
+    "default":      [(3000, 1800)],
+}
+
+# Marcas que se pueden rotar (engineered / porcelánico)
+ROTAR_OK = {
+    "dekton", "neolith", "coverlam", "laminam", "ceratop", "lapitec",
+    "silestone", "compac", "caesarstone", "diresco", "cosentino", "samsung",
+}
+
+# Kerf (sierra): espacio mínimo entre piezas dentro de la misma tabla
+KERF_MM = 5
+
+
+# ---------------------------------------------------------------------------
+# Normalización: obtener (largo_mm, alto_mm) de cualquier pieza del JSON
+# ---------------------------------------------------------------------------
+def dimensiones_pieza(pieza: dict) -> Optional[tuple[float, float]]:
+    """
+    Devuelve (largo, alto) en mm a partir de un dict de pieza.
+    Devuelve None si no hay dimensiones suficientes.
+    """
+    tipo = pieza.get("tipo", "")
+    l = pieza.get("largo_mm")
+    a = pieza.get("ancho_mm")
+    h = pieza.get("altura_mm")
+    long_ml = pieza.get("longitud_ml")
+
+    # Piezas horizontales (encimera, isla, costado, paso, tabica, otro)
+    if l and a:
+        return (float(l), float(a))
+    # Piezas verticales (frontal/chapeado, pilastra)
+    if l and h:
+        return (float(l), float(h))
+    # Zócalo / copete — dato en ml + altura
+    if long_ml and h:
+        return (float(long_ml) * 1000, float(h))
+    # Sólo largo (caso raro — asumimos grosor mínimo)
+    if l:
+        return (float(l), 0)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Lookup de medidas de tabla para un material
+# ---------------------------------------------------------------------------
+def tabla_para_material(marca: Optional[str]) -> list[tuple[int, int]]:
+    if not marca:
+        return TABLAS_ESTANDAR["default"]
+    key = marca.lower().strip()
+    # Búsqueda directa
+    if key in TABLAS_ESTANDAR:
+        return TABLAS_ESTANDAR[key]
+    # Búsqueda parcial
+    for k in TABLAS_ESTANDAR:
+        if k in key or key in k:
+            return TABLAS_ESTANDAR[k]
+    return TABLAS_ESTANDAR["default"]
+
+
+def puede_rotar(marca: Optional[str]) -> bool:
+    if not marca:
+        return False
+    key = marca.lower().strip()
+    for m in ROTAR_OK:
+        if m in key or key in m:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Algoritmo de packing: shelf (estantería horizontal)
+# Guillotina simple: coloca piezas en filas horizontales.
+# Dentro de cada fila va de izquierda a derecha hasta que no quepan más.
+# ---------------------------------------------------------------------------
+
+class Shelf:
+    """Una fila horizontal de piezas dentro de una tabla."""
+    def __init__(self, y_inicio: float, tabla_ancho: float):
+        self.y = y_inicio          # posición Y dentro de la tabla
+        self.altura = 0.0          # altura de la pieza más alta en la fila
+        self.x_usado = 0.0         # cursor X
+        self.tabla_ancho = tabla_ancho
+        self.piezas_colocadas: list[dict] = []  # {label, w, h, x, y}
+
+    def cabe(self, w: float, h: float) -> bool:
+        espacio_x = self.tabla_ancho - self.x_usado - (KERF_MM if self.x_usado > 0 else 0)
+        return w <= espacio_x
+
+    def añadir(self, w: float, h: float, label: str) -> dict:
+        x = self.x_usado + (KERF_MM if self.x_usado > 0 else 0)
+        pos = {"label": label, "w": w, "h": h, "x": x, "y": self.y}
+        self.piezas_colocadas.append(pos)
+        self.x_usado = x + w
+        self.altura = max(self.altura, h)
+        return pos
+
+
+class Tabla:
+    """Una tabla (slab) con estantes horizontales."""
+    def __init__(self, ancho: float, alto: float):
+        self.ancho = ancho
+        self.alto = alto
+        self.shelves: list[Shelf] = []
+        self.y_usado = 0.0
+
+    def _shelf_actual(self) -> Optional[Shelf]:
+        return self.shelves[-1] if self.shelves else None
+
+    def añadir_pieza(self, w: float, h: float, label: str) -> bool:
+        """Intenta colocar la pieza. Devuelve True si hubo sitio."""
+        # Intentar en la shelf actual
+        sh = self._shelf_actual()
+        if sh and sh.cabe(w, h):
+            sh.añadir(w, h, label)
+            return True
+        # Abrir nueva shelf
+        y_nueva = self.y_usado + (KERF_MM if self.y_usado > 0 else 0) + (sh.altura if sh else 0)
+        if y_nueva + h <= self.alto:
+            nueva = Shelf(y_nueva, self.ancho)
+            nueva.añadir(w, h, label)
+            self.shelves.append(nueva)
+            self.y_usado = y_nueva
+            return True
+        return False
+
+    def area_usada(self) -> float:
+        total = 0.0
+        for sh in self.shelves:
+            for p in sh.piezas_colocadas:
+                total += p["w"] * p["h"]
+        return total
+
+    def aprovechamiento(self) -> float:
+        area_total = self.ancho * self.alto
+        return self.area_usada() / area_total * 100 if area_total > 0 else 0
+
+
+def pack_piezas(piezas_dim: list[tuple[float, float, str]],
+                tabla_ancho: int, tabla_alto: int,
+                rotar: bool) -> list[Tabla]:
+    """
+    Empaqueta una lista de (w, h, label) en el mínimo número de tablas.
+    Si rotar=True, prueba también la orientación girada 90°.
+    Devuelve la lista de Tabla con las piezas colocadas.
+    """
+    # Ordenar por área descendente (greedy — piezas grandes primero)
+    items = sorted(piezas_dim, key=lambda x: x[0] * x[1], reverse=True)
+
+    tablas: list[Tabla] = []
+
+    for w_orig, h_orig, label in items:
+        colocada = False
+        # Probar orientaciones
+        orientaciones = [(w_orig, h_orig)]
+        if rotar and w_orig != h_orig:
+            orientaciones.append((h_orig, w_orig))
+
+        for tabla in tablas:
+            for w, h in orientaciones:
+                if w <= tabla.ancho and h <= tabla.alto:
+                    if tabla.añadir_pieza(w, h, label):
+                        colocada = True
+                        break
+            if colocada:
+                break
+
+        if not colocada:
+            # Nueva tabla
+            nueva = Tabla(tabla_ancho, tabla_alto)
+            for w, h in orientaciones:
+                if w <= tabla_ancho and h <= tabla_alto:
+                    if nueva.añadir_pieza(w, h, label):
+                        colocada = True
+                        break
+            if not colocada:
+                # Pieza más grande que la tabla — colocar igualmente (advertencia)
+                nueva.añadir_pieza(w_orig, h_orig, label + " ⚠GRANDE")
+                colocada = True
+            tablas.append(nueva)
+
+    return tablas
+
+
+# ---------------------------------------------------------------------------
+# Función principal
+# ---------------------------------------------------------------------------
+
+def calcular_tablas(json_path: Path) -> dict:
+    """
+    Lee un JSON de extracción y calcula las tablas necesarias por material.
+    Devuelve un dict con el informe completo.
+    """
+    with open(json_path, encoding="utf-8") as f:
+        datos = json.load(f)
+
+    job_id = datos.get("job_id", "?")
+    cliente = datos.get("cliente", "?")
+
+    # Indexar materiales por rol
+    mat_index: dict[str, dict] = {}
+    for m in datos.get("materiales", []):
+        mat_index[m["rol"]] = m
+
+    # Resolver material real (es_igual_a)
+    def resolver_material(rol: str) -> Optional[dict]:
+        m = mat_index.get(rol)
+        if not m:
+            return None
+        if m.get("es_igual_a"):
+            return mat_index.get(m["es_igual_a"], m)
+        return m
+
+    # Agrupar piezas por (marca, color, grosor) — clave de tabla
+    grupos: dict[str, list] = {}
+    sin_material: list = []
+
+    for pieza in datos.get("piezas", []):
+        m = resolver_material(pieza.get("material_rol", ""))
+        if not m:
+            sin_material.append(pieza)
+            continue
+
+        marca = m.get("marca", "?")
+        color = m.get("color", "?")
+        grosor = m.get("grosor_cm", "?")
+        clave = f"{marca} {color} {grosor}cm"
+
+        grupos.setdefault(clave, {
+            "marca": marca,
+            "color": color,
+            "grosor_cm": grosor,
+            "piezas": [],
+            "advertencias_piezas": [],
+        })["piezas"].append(pieza)
+
+    # Para cada grupo, calcular tablas
+    resultado = {
+        "job_id": job_id,
+        "cliente": cliente,
+        "por_material": {},
+        "total_tablas": 0,
+        "advertencias": [],
+    }
+
+    for clave, grupo in grupos.items():
+        marca = grupo["marca"]
+        formatos = tabla_para_material(marca)
+        rotar = puede_rotar(marca)
+        # Usar el formato estándar principal (el primero)
+        tabla_w, tabla_h = formatos[0]
+
+        piezas_dim: list[tuple[float, float, str]] = []
+        advertencias_g: list[str] = []
+
+        for i, pieza in enumerate(grupo["piezas"]):
+            dims = dimensiones_pieza(pieza)
+            if not dims:
+                advertencias_g.append(
+                    f"Pieza #{i+1} ({pieza.get('tipo')} {pieza.get('zona','')}) sin dimensiones — no se calcula"
+                )
+                continue
+            w, h = dims
+            label = f"{pieza.get('tipo','')} {pieza.get('zona','')}"
+            if w == 0 or h == 0:
+                advertencias_g.append(f"Pieza #{i+1} ({label}) dimensión 0 — ignorada")
+                continue
+            # Verificar si supera la tabla
+            fits_normal = (w <= tabla_w and h <= tabla_h)
+            fits_rotada = rotar and (h <= tabla_w and w <= tabla_h)
+            if not fits_normal and not fits_rotada:
+                advertencias_g.append(
+                    f"⚠ PIEZA GRANDE: {label} ({w:.0f}×{h:.0f}mm) "
+                    f"supera tabla estándar {tabla_w}×{tabla_h}mm — verificar con proveedor"
+                )
+            piezas_dim.append((w, h, label))
+
+        if not piezas_dim:
+            resultado["por_material"][clave] = {
+                "tablas_necesarias": 0,
+                "formato_tabla_mm": f"{tabla_w}×{tabla_h}",
+                "piezas_totales": 0,
+                "layout": [],
+                "advertencias": advertencias_g,
+            }
+            continue
+
+        tablas = pack_piezas(piezas_dim, tabla_w, tabla_h, rotar)
+        n_tablas = len(tablas)
+
+        # Construir info de layout
+        layout = []
+        for idx, t in enumerate(tablas):
+            piezas_en_tabla = []
+            for sh in t.shelves:
+                for p in sh.piezas_colocadas:
+                    piezas_en_tabla.append({
+                        "label": p["label"],
+                        "w_mm": round(p["w"]),
+                        "h_mm": round(p["h"]),
+                    })
+            layout.append({
+                "tabla": idx + 1,
+                "aprovechamiento_pct": round(t.aprovechamiento(), 1),
+                "area_usada_m2": round(t.area_usada() / 1e6, 3),
+                "piezas": piezas_en_tabla,
+            })
+
+        resultado["por_material"][clave] = {
+            "tablas_necesarias": n_tablas,
+            "formato_tabla_mm": f"{tabla_w}×{tabla_h}",
+            "area_tabla_m2": round(tabla_w * tabla_h / 1e6, 3),
+            "piezas_totales": len(piezas_dim),
+            "layout": layout,
+            "advertencias": advertencias_g,
+            "rotar_permitido": rotar,
+        }
+        resultado["total_tablas"] += n_tablas
+
+    if sin_material:
+        resultado["advertencias"].append(
+            f"{len(sin_material)} pieza(s) sin material identificado — no calculadas"
+        )
+
+    return resultado
+
+
+# ---------------------------------------------------------------------------
+# Generación del informe de texto
+# ---------------------------------------------------------------------------
+
+def informe_texto(resultado: dict) -> str:
+    lines = []
+    lines.append(f"{'='*60}")
+    lines.append(f"CÁLCULO DE TABLAS — {resultado['job_id']} {resultado['cliente']}")
+    lines.append(f"{'='*60}")
+    lines.append(f"TOTAL TABLAS NECESARIAS: {resultado['total_tablas']}")
+    lines.append("")
+
+    for mat, info in resultado["por_material"].items():
+        n = info["tablas_necesarias"]
+        fmt = info.get("formato_tabla_mm", "?")
+        area = info.get("area_tabla_m2", 0)
+        lines.append(f"  {mat}")
+        lines.append(f"    Formato tabla: {fmt} mm  ({area} m²/tabla)")
+        lines.append(f"    Tablas necesarias: {n}  ({info['piezas_totales']} piezas)")
+
+        for t in info.get("layout", []):
+            lines.append(f"    ── Tabla {t['tabla']} ──  "
+                         f"Aprovechamiento: {t['aprovechamiento_pct']}%  "
+                         f"({t['area_usada_m2']} m² usados)")
+            for p in t["piezas"]:
+                lines.append(f"       • {p['label']}  {p['w_mm']}×{p['h_mm']} mm")
+
+        for adv in info.get("advertencias", []):
+            lines.append(f"    ⚠ {adv}")
+        lines.append("")
+
+    if resultado.get("advertencias"):
+        lines.append("ADVERTENCIAS GENERALES:")
+        for a in resultado["advertencias"]:
+            lines.append(f"  ⚠ {a}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Guardar resultados
+# ---------------------------------------------------------------------------
+
+def guardar_resultado(resultado: dict, json_path: Path) -> tuple[Path, Path]:
+    stem = json_path.stem.replace("_extraccion", "")
+    carpeta = json_path.parent
+
+    json_out = carpeta / f"{stem}_tablas.json"
+    txt_out = carpeta / f"{stem}_tablas.txt"
+
+    with open(json_out, "w", encoding="utf-8") as f:
+        json.dump(resultado, f, ensure_ascii=False, indent=2)
+    with open(txt_out, "w", encoding="utf-8") as f:
+        f.write(informe_texto(resultado))
+
+    return json_out, txt_out
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    if len(sys.argv) < 2:
+        print("Uso: python calcular_tablas.py <ruta_extraccion.json | carpeta_trabajo>")
+        sys.exit(1)
+
+    ruta = Path(sys.argv[1])
+
+    # Si es carpeta, buscar el JSON de extracción
+    if ruta.is_dir():
+        candidatos = list(ruta.glob("*_extraccion.json"))
+        if not candidatos:
+            print(f"No se encontró *_extraccion.json en {ruta}")
+            sys.exit(1)
+        json_path = sorted(candidatos)[-1]
+    else:
+        json_path = ruta
+
+    print(f"Procesando: {json_path.name}")
+    resultado = calcular_tablas(json_path)
+    print(informe_texto(resultado))
+
+    if "--guardar" in sys.argv:
+        j, t = guardar_resultado(resultado, json_path)
+        print(f"\nGuardado: {j.name}")
+        print(f"Guardado: {t.name}")
+
+
+if __name__ == "__main__":
+    main()
