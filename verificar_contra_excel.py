@@ -176,13 +176,23 @@ def resumen_json(datos: dict) -> dict:
         "zocalo_ml":   0.0,
     }
 
-    # Material (primer material que sea rol encimera o principal)
+    # Material: primero rol "encimera", luego cualquier rol que contenga "encimera"
+    # (encimera_opcion1, etc.), luego el primer material.
     mats = datos.get("materiales") or []
+    elegido = None
     for m in mats:
         if (m.get("rol") or "").lower() == "encimera":
-            partes = [m.get("marca",""), m.get("color",""), f"{m.get('grosor_cm','')}cm" if m.get('grosor_cm') else ""]
-            r["material"] = " ".join(p for p in partes if p).strip()
-            break
+            elegido = m; break
+    if not elegido:
+        for m in mats:
+            if "encimera" in (m.get("rol") or "").lower():
+                elegido = m; break
+    if not elegido and mats:
+        elegido = mats[0]
+    if elegido:
+        partes = [elegido.get("marca",""), elegido.get("color",""),
+                  f"{elegido.get('grosor_cm','')}cm" if elegido.get('grosor_cm') else ""]
+        r["material"] = " ".join(p for p in partes if p).strip()
 
     # Huecos
     for h in datos.get("huecos") or []:
@@ -286,11 +296,32 @@ def comparar(excel_data: dict, json_data: dict) -> list[dict]:
         "severidad":  "alta" if not match_mat else "ok",
     })
 
-    # Huecos
-    claves_huecos = set(excel_data.get("huecos", {}).keys()) | set(json_data.get("huecos", {}).keys())
+    # Huecos: comparar fregadero como TOTAL (fregadero + _be + _se) para evitar
+    # falsos positivos por categorización inconsistente. El Excel suele usar
+    # "UND HUECO FREGADERO/LAVABO" sin subtipo; Claude sí emite subtipo.
+    ex_h = dict(excel_data.get("huecos", {}))
+    js_h = dict(json_data.get("huecos", {}))
+    ex_fregadero_total = sum(ex_h.get(k, 0) for k in ("fregadero", "fregadero_be", "fregadero_se"))
+    js_fregadero_total = sum(js_h.get(k, 0) for k in ("fregadero", "fregadero_be", "fregadero_se"))
+    # Quitar las categorías de fregadero y comparar total aparte
+    for k in ("fregadero", "fregadero_be", "fregadero_se"):
+        ex_h.pop(k, None); js_h.pop(k, None)
+
+    if ex_fregadero_total or js_fregadero_total:
+        match = abs(ex_fregadero_total - js_fregadero_total) < 0.5
+        filas.append({
+            "concepto":  "hueco.fregadero (total)",
+            "excel":     ex_fregadero_total,
+            "json":      js_fregadero_total,
+            "match":     match,
+            "severidad": "alta" if not match else "ok",
+        })
+
+    # Resto de huecos (placa, grifo, enchufe, etc)
+    claves_huecos = set(ex_h.keys()) | set(js_h.keys())
     for k in sorted(claves_huecos):
-        v_ex = excel_data.get("huecos", {}).get(k, 0)
-        v_js = json_data.get("huecos", {}).get(k, 0)
+        v_ex = ex_h.get(k, 0)
+        v_js = js_h.get(k, 0)
         match = (abs(v_ex - v_js) < 0.5)
         filas.append({
             "concepto":   f"hueco.{k}",
