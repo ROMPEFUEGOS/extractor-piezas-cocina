@@ -108,10 +108,11 @@ Panel vertical lateral que cae desde la encimera hasta el suelo. Aparece en isla
 - enchufe: hueco rectangular para enchufe
 - dosificador: hueco pequeño para dosificador de jabón
 
-**NOTA — Tipo de fregadero según material:**
-- **Por defecto**: fregadero **sobre encimera** (sobreencimera estándar), salvo indicación contraria.
-- Los materiales **porcelánicos** (Dekton, Coverlam, Neolith, Ceratop, Laminam y similares) tienen recomendación de **fregadero sobre encimera** por su fragilidad al corte bajo encimera.
-- Usar siempre lo que indique la plantilla o el presupuesto MGR más reciente. Si hay discrepancia entre plantilla y presupuesto, anótalo en advertencias pero no lo corrijas automáticamente.
+**NOTA — Tipo de fregadero (subtipo):**
+- **NO ASUMAS el subtipo.** Solo emite `subtipo: "bajo_encimera"` o `"sobre_encimera"` si la nota/plantilla/presupuesto contiene las siglas explícitas **B/E**, **S/E**, **BE**, **SE**, o el texto "bajo encimera" / "sobre encimera" / "enrasado".
+- Si no se menciona ninguna de esas indicaciones, deja `subtipo: null` — es ambiguo y preferimos nulo antes que inventar.
+- Orientación (solo informativa, NO para decidir subtipo por defecto): los materiales porcelánicos (Dekton, Coverlam, Neolith, Ceratop, Laminam) suelen llevar sobre encimera por fragilidad al corte bajo encimera — pero si la nota no lo dice explícitamente, aún así deja `subtipo: null`.
+- Si hay discrepancia entre documentos, anótalo en advertencias pero usa el del presupuesto MGR más reciente sin inventar.
 
 **Cantos** (se cobran por ml — SOLO incluir en esta lista los tipos de abajo):
 - ingletado: unión en inglete 45° entre dos piezas (cascada, esquinas externas de pilares)
@@ -199,6 +200,14 @@ Cuando un PDF aparece etiquetado como "MEDIDAS REVISADAS (Segundas)" o similar, 
 - **Usa siempre las medidas de "Segundas" como las definitivas** cuando existan, descartando las de "Primeras" si hay contradicción.
 - Si hay diferencias entre primeras y segundas medidas, anótalo en advertencias indicando cuál se ha usado.
 
+## ⚠ MÚLTIPLES PRESUPUESTOS — NO DUPLICAR PIEZAS NI HUECOS:
+Cuando el proyecto contiene **varios presupuestos MGR** (p. ej. `PR_2100`, `PR_2102`, `PR_2103` con fechas distintas, o "Presupuesto 1043" y "Presupuesto 1047" en distintas hojas del mismo Excel), son **REVISIONES DE LA MISMA OBRA**, NO obras distintas ni adicionales.
+- **Usa ÚNICAMENTE el presupuesto más reciente** (número más alto / fecha más reciente) como fuente de verdad para piezas, huecos, cantos, material y cantidades.
+- **NO sumes** piezas, huecos o metros de presupuestos anteriores con los del más reciente.
+- **Cada pieza y cada hueco debe aparecer una sola vez.** Si detectas que estás a punto de emitir 2 encimeras idénticas o 2 fregaderos iguales porque aparecen en varios PDFs, es señal de que estás duplicando entre revisiones — quédate con los del más reciente.
+- Si un presupuesto anterior tenía un elemento (zócalo, copete, fregadero extra) que el más reciente ya no tiene, respeta al más reciente: probablemente el cliente lo eliminó. Anótalo en advertencias.
+- Lo mismo aplica a las hojas internas de un Excel MGR: si hay varias hojas "Presupuesto NNNN", **usa solo la de número más alto**.
+
 ## ZONAS MÚLTIPLES (cocina + lavandería, cocina + baño, etc.):
 - Cuando en una perspectiva o en la plantilla aparece la palabra "lavandería", "baño", "office", o similar, es una **zona separada** con su propia encimera independiente.
 - Crear piezas separadas para cada zona, indicando la zona en el campo `zona`.
@@ -224,16 +233,16 @@ En estos casos el presupuesto solo incluye **chapeado m2** sin encimera de piedr
 
 ## MÚLTIPLES MATERIALES:
 Cuando el trabajo es "Varios materiales":
-- Lo más habitual es que sean **2 presupuestos alternativos completos** (el cliente aún no ha elegido). Indicarlo con rol: "encimera_opcion1", "encimera_opcion2", etc.
+- Lo más habitual es que sean **2 presupuestos alternativos completos** (el cliente aún no ha elegido).
 - En casos muy concretos y bien especificados, puede ser que distintas zonas de la misma cocina lleven materiales distintos (ej: encimera de una zona en material A y de otra zona en material B). En ese caso, asignar el material correcto a cada pieza.
 - La plantilla marmolista con 2 columnas = 2 opciones alternativas.
 - Cada opción incluye su propio frontal, copete y zócalo del mismo material.
 
-**REGLA CRÍTICA para piezas con opciones alternativas**: Cada pieza debe tener UN SOLO `material_rol` claramente definido.
-Cuando las opciones son alternativas (el cliente elige una), duplica las piezas:
-- Las mismas piezas geométricas con `material_rol: "encimera_opcion1"` para la opción 1
-- Las mismas piezas geométricas con `material_rol: "encimera_opcion2"` para la opción 2
-NUNCA uses `/` ni `|` en el campo `material_rol`.
+**REGLA CRÍTICA — rol "encimera" sin sufijo por defecto**:
+- Si en el **presupuesto MGR más reciente** aparece UN SOLO material elegido para la encimera, emite ese material con `rol: "encimera"` (sin sufijo `_opcion1`, `_opcion2`, etc.) y las piezas con `material_rol: "encimera"`.
+- Usa sufijos `encimera_opcion1`, `encimera_opcion2` SOLO cuando realmente hay varios materiales alternativos **no resueltos** en el presupuesto más reciente (el cliente todavía no eligió). En ese caso, duplica las piezas por opción y NUNCA uses `/` ni `|` en `material_rol`.
+- Si en presupuestos antiguos había varias opciones pero el presupuesto más reciente ya concreta una sola, la opción elegida se emite como `rol: "encimera"` y el resto se descarta (opcionalmente anótalo en advertencias).
+- Si hay ambigüedad, emite la que primero aparece en el presupuesto más reciente como `rol: "encimera"` principal y documenta las alternativas en `advertencias`.
 
 **Huecos con variaciones por opción**: Si el tipo de fregadero o hueco difiere entre opciones, inclúyelo en `notas` del hueco o crea dos entradas de hueco con `notas` indicando a qué opción pertenece.
 
@@ -254,7 +263,7 @@ Y añadir a cantos: {"tipo": "ingletado", "longitud_ml": ancho_encimera}
 7. **Si el material copete está definido**, SIEMPRE crea al menos una pieza de tipo "copete" con su `longitud_ml`. Si no tienes la medida exacta, estímala de los presupuestos o del largo de la encimera.
 8. **Si la plantilla indica DOSIFICADOR = SÍ**, inclúyelo en huecos: `{"tipo": "dosificador", "cantidad": 1, "posicion": "derecha/izquierda si se indica"}`.
 9. **Grosor uniforme por opción**: Dentro de la misma opción, encimera y chapeado/copete suelen tener distinto grosor (encimera 2cm o 3cm, chapeado/copete 1.2cm). Lo que NO varía es el grosor de la encimera dentro de una misma opción. **Excepción**: cuando hay varias opciones de material alternativas, el grosor de la encimera puede cambiar entre opciones (ej: opción A con encimera 3cm y opción B con encimera 2cm del mismo material). Leer siempre el grosor de cada opción del presupuesto MGR correspondiente y reflejarlo en `grosor_cm`.
-10. **Opciones alternativas — piezas idénticas en geometría**: Cuando hay varias opciones de material alternativas (el cliente elige una), **todas las piezas son idénticas en geometría** entre opciones que tengan las mismas dimensiones. Si el grosor varía entre opciones, crea materiales distintos con el `grosor_cm` correcto para cada uno. Duplica todas las piezas con el `material_rol` correspondiente a cada opción.
+10. **Opciones alternativas — piezas idénticas en geometría**: Cuando hay varias opciones de material alternativas **no resueltas en el presupuesto más reciente** (el cliente aún no ha elegido), **todas las piezas son idénticas en geometría** entre opciones que tengan las mismas dimensiones. Si el grosor varía entre opciones, crea materiales distintos con el `grosor_cm` correcto para cada uno. Duplica todas las piezas con el `material_rol` correspondiente a cada opción (`encimera_opcion1`, `encimera_opcion2`). Si en cambio el presupuesto más reciente ya tiene un material concreto elegido, emite una sola versión con `material_rol: "encimera"` (sin sufijo).
 11. **Múltiples opciones con combinaciones de material**: Cuando un trabajo tiene presupuestos donde se combina material A en encimera con material B en chapeado (y otras combinaciones), crear una opción por cada combinación distinta, nombrándola claramente. Ej: `encimera_goiana_chapeado_fokos`, `encimera_goiana_todo_goiana`, etc. En las advertencias, listar cada opción con su precio total si está disponible para que el cliente pueda comparar.
 
 ## CANTOS PULIDOS — QUÉ SE INCLUYE:
