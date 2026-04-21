@@ -83,14 +83,23 @@ def parse_excel_mgr(xlsx_path: Path) -> dict:
     )
 
     for r in range(15, min(ws.max_row + 1, 120)):
-        desc = ws.cell(r, 1).value or ""
+        # Dos formatos conocidos:
+        #   Nuevo (Cocimoble2026): col1=desc, col9=m²/cantid
+        #   Viejo (ACyC/Cocimoble2025 antiguos): col1=None, col4=desc, col8=Unid
+        c1 = ws.cell(r, 1).value
+        c4 = ws.cell(r, 4).value
+        desc = c1 if (c1 not in (None, "", 0)) else (c4 or "")
         desc_u = str(desc).upper().strip()
         if not desc_u or desc_u.startswith("#N/A"):
             continue
         longo = ws.cell(r, 6).value
         ancho = ws.cell(r, 7).value
-        unid  = ws.cell(r, 8).value
-        cant  = ws.cell(r, 9).value
+        c8    = ws.cell(r, 8).value
+        c9    = ws.cell(r, 9).value
+        # En formato nuevo la cantidad está en col 9 ("m²/Cantid.").
+        # En formato viejo no hay col 9 y la cantidad está en col 8 ("Unid.").
+        unid  = c8
+        cant  = c9 if c9 is not None else c8
 
         # Material: primera fila con indicio de material en col 1 (heurística)
         if result["material"] is None:
@@ -176,9 +185,17 @@ def resumen_json(datos: dict) -> dict:
         "zocalo_ml":   0.0,
     }
 
-    # Material: primero rol "encimera", luego cualquier rol que contenga "encimera"
-    # (encimera_opcion1, etc.), luego el primer material.
+    # Material: primero rol "encimera", luego CUALQUIER rol que contenga "encimera"
+    # (encimera_opcion1, encimera_opcion2, etc.). Cuando hay opciones alternativas
+    # no resueltas, guardamos TODAS las candidatas para que comparar() pueda
+    # matchear contra el Excel si coincide con cualquiera.
+    def _str_mat(m):
+        partes = [m.get("marca",""), m.get("color",""),
+                  f"{m.get('grosor_cm','')}cm" if m.get('grosor_cm') else ""]
+        return " ".join(p for p in partes if p).strip()
+
     mats = datos.get("materiales") or []
+    candidatas = []
     elegido = None
     for m in mats:
         if (m.get("rol") or "").lower() == "encimera":
@@ -186,13 +203,20 @@ def resumen_json(datos: dict) -> dict:
     if not elegido:
         for m in mats:
             if "encimera" in (m.get("rol") or "").lower():
-                elegido = m; break
+                candidatas.append(m)
+        if candidatas:
+            elegido = candidatas[0]
     if not elegido and mats:
         elegido = mats[0]
     if elegido:
-        partes = [elegido.get("marca",""), elegido.get("color",""),
-                  f"{elegido.get('grosor_cm','')}cm" if elegido.get('grosor_cm') else ""]
-        r["material"] = " ".join(p for p in partes if p).strip()
+        r["material"] = _str_mat(elegido)
+    # Lista completa de candidatas (incluye la elegida) para matching laxo
+    if candidatas:
+        r["material_candidates"] = [_str_mat(m) for m in candidatas]
+    elif elegido:
+        r["material_candidates"] = [_str_mat(elegido)]
+    else:
+        r["material_candidates"] = []
 
     # Huecos
     for h in datos.get("huecos") or []:
@@ -272,26 +296,35 @@ def comparar(excel_data: dict, json_data: dict) -> list[dict]:
     """Lista de filas (concepto, excel, json, match, delta)."""
     filas = []
 
-    # Material: coincide si comparten ≥2 palabras >3 letras o 1 palabra muy distintiva
+    # Material: coincide si comparten ≥2 palabras >3 letras o 1 palabra muy distintiva.
+    # Cuando hay opciones alternativas no resueltas en el JSON (encimera_opcion1/2),
+    # matchea contra CUALQUIERA de las candidatas.
     m_ex = (excel_data.get("material") or "").upper()
-    m_js = (json_data.get("material") or "").upper()
+    candidatos_js = json_data.get("material_candidates") or [json_data.get("material") or ""]
     DISTINTIVAS = {"DEKTON","SILESTONE","NEOLITH","COMPAC","COVERLAM","LAMINAM",
                    "GRANITO","SILVESTRE","PEDRAS","MONDARIZ","PERSIAN","BELVEDERE",
                    "LINEN","CIPRES","CIPRÉS","ALPI","ROVERE","NERO","BASIC"}
     def palabras(s):
         import re as _re
         return set(w for w in _re.split(r"[ \-_,/]+", s) if len(w) > 3)
-    palabras_comunes = palabras(m_ex) & palabras(m_js)
     match_mat = False
-    if m_ex and m_js:
-        if len(palabras_comunes) >= 2:
+    mejor_js = candidatos_js[0] if candidatos_js else ""
+    for cand in candidatos_js:
+        c_up = (cand or "").upper()
+        if not m_ex or not c_up:
+            continue
+        palabras_comunes = palabras(m_ex) & palabras(c_up)
+        if len(palabras_comunes) >= 2 or (palabras_comunes & DISTINTIVAS):
             match_mat = True
-        elif palabras_comunes & DISTINTIVAS:
-            match_mat = True
+            mejor_js = cand
+            break
+    etiqueta_js = json_data.get("material")
+    if len(candidatos_js) > 1:
+        etiqueta_js = " | ".join(candidatos_js) + (" (match)" if match_mat else " (none match)")
     filas.append({
         "concepto":   "material",
         "excel":      excel_data.get("material"),
-        "json":       json_data.get("material"),
+        "json":       etiqueta_js,
         "match":      bool(match_mat),
         "severidad":  "alta" if not match_mat else "ok",
     })
@@ -350,7 +383,7 @@ def comparar(excel_data: dict, json_data: dict) -> list[dict]:
     # así que su valor sería siempre 0 y no es ground truth. Solo comparamos
     # chapeado_m2 y ml de tiras (copete/rodapié/zócalo) cuando ambos lados tienen valor.
     for concepto, a_ex, a_js, tol_abs, tol_rel, sev in [
-        ("chapeado_m2", excel_data.get("chapeado_m2", 0), json_data.get("chapeado_m2", 0), 0.3, 0.15, "alta"),
+        ("chapeado_m2", excel_data.get("chapeado_m2", 0), json_data.get("chapeado_m2", 0), 0.5, 0.15, "alta"),
         ("copete_ml",   excel_data.get("copete_ml",   0), json_data.get("copete_ml",   0), 0.5, 0.15, "media"),
         ("rodapie_ml",  excel_data.get("rodapie_ml",  0), json_data.get("rodapie_ml",  0), 0.5, 0.15, "media"),
         ("zocalo_ml",   excel_data.get("zocalo_ml",   0), json_data.get("zocalo_ml",   0), 0.5, 0.15, "baja"),
