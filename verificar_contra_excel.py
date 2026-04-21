@@ -245,16 +245,35 @@ def resumen_json(datos: dict) -> dict:
             r["cantos_ml"]["recto_pulido_agua"] = r["cantos_ml"].get("recto_pulido_agua", 0) + ml
         elif "bisel" in tipo:
             r["cantos_ml"]["bisel"] = r["cantos_ml"].get("bisel", 0) + ml
-        elif "inglete" in tipo:
+        elif "inglet" in tipo:  # cubre "inglete" e "ingletado"
             r["cantos_ml"]["inglete"] = r["cantos_ml"].get("inglete", 0) + ml
         elif "boleado" in tipo:
             r["cantos_ml"]["boleado"] = r["cantos_ml"].get("boleado", 0) + ml
         elif "pilastra" in tipo:
             r["cantos_ml"]["pilastra"] = r["cantos_ml"].get("pilastra", 0) + ml
 
-    # m² y ml de piezas (suman áreas de piezas según tipo)
-    for p in datos.get("piezas") or []:
+    # m² y ml de piezas — SI hay opciones alternativas (material_rol con sufijo
+    # _opcion1, _opcion2...), las piezas están duplicadas entre opciones con la
+    # misma geometría. Contamos solo UNA opción para no duplicar áreas.
+    import re as _re
+    piezas = datos.get("piezas") or []
+    sufijos = set()
+    for p in piezas:
+        mr = (p.get("material_rol") or "").lower()
+        m = _re.search(r"_opcion(\d+)$", mr)
+        if m:
+            sufijos.add(m.group(1))
+    hay_opciones = len(sufijos) > 1
+    # Elegir la opción canónica (menor número)
+    opcion_canon = min(sufijos, key=int) if sufijos else None
+
+    for p in piezas:
         tipo = (p.get("tipo") or "").lower()
+        mr = (p.get("material_rol") or "").lower()
+        m = _re.search(r"_opcion(\d+)$", mr)
+        # Si hay varias opciones, solo contar piezas de la canónica (o sin sufijo)
+        if hay_opciones and m and m.group(1) != opcion_canon:
+            continue
         largo = float(p.get("largo_mm") or 0) / 1000
         ancho = float(p.get("ancho_mm") or 0) / 1000
         alto  = float(p.get("altura_mm") or p.get("alto_mm") or 0) / 1000
@@ -296,25 +315,30 @@ def comparar(excel_data: dict, json_data: dict) -> list[dict]:
     """Lista de filas (concepto, excel, json, match, delta)."""
     filas = []
 
-    # Material: coincide si comparten ≥2 palabras >3 letras o 1 palabra muy distintiva.
-    # Cuando hay opciones alternativas no resueltas en el JSON (encimera_opcion1/2),
-    # matchea contra CUALQUIERA de las candidatas.
+    # Material: coincide si comparten ≥1 palabra NO-genérica (>3 letras y no
+    # stopword como MM, CM, PULIDO, MATE, NATURAL...). El Excel en formato viejo
+    # a veces solo trae color + acabado sin marca, por eso basta con 1 palabra
+    # distintiva en común. Matchea contra CUALQUIERA de las candidatas si hay
+    # opciones alternativas no resueltas.
     m_ex = (excel_data.get("material") or "").upper()
     candidatos_js = json_data.get("material_candidates") or [json_data.get("material") or ""]
-    DISTINTIVAS = {"DEKTON","SILESTONE","NEOLITH","COMPAC","COVERLAM","LAMINAM",
-                   "GRANITO","SILVESTRE","PEDRAS","MONDARIZ","PERSIAN","BELVEDERE",
-                   "LINEN","CIPRES","CIPRÉS","ALPI","ROVERE","NERO","BASIC"}
+    STOPWORDS = {"MM","CM","PULIDO","MATE","NATURAL","TEXTURIZADO","BRILLO",
+                 "APOMAZADO","APOMAZ","SOFT","TOUCH","VELVET","ACABADO",
+                 "NACIONAL","IMPORTACION","TABLA","ENCIMERA","CHAPEADO","PULIDA"}
+    # Normalizar acentos sencillos para que "Nacré" matchee con "NACRE"
+    import unicodedata
+    def norm(s):
+        return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn").upper()
     def palabras(s):
         import re as _re
-        return set(w for w in _re.split(r"[ \-_,/]+", s) if len(w) > 3)
+        return set(w for w in _re.split(r"[ \-_,/\(\)]+", norm(s)) if len(w) > 3 and w not in STOPWORDS)
     match_mat = False
     mejor_js = candidatos_js[0] if candidatos_js else ""
     for cand in candidatos_js:
-        c_up = (cand or "").upper()
-        if not m_ex or not c_up:
+        if not m_ex or not cand:
             continue
-        palabras_comunes = palabras(m_ex) & palabras(c_up)
-        if len(palabras_comunes) >= 2 or (palabras_comunes & DISTINTIVAS):
+        palabras_comunes = palabras(m_ex) & palabras(cand)
+        if palabras_comunes:
             match_mat = True
             mejor_js = cand
             break
