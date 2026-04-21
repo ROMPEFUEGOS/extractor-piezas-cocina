@@ -190,8 +190,10 @@ La letra de los planos y plantillas es frecuentemente muy difícil de leer. Erro
   - Si la plantilla dice "0" o deja el campo en blanco o con guión → **0 enchufes**, aunque el MGR los incluya.
   - Si la plantilla indica un número concreto → usar ese número.
 - **No incluir enchufes si no hay chapeado/frontal**, salvo que la plantilla los especifique explícitamente (pueden ir en una isla, por ejemplo).
-- **Regla por defecto cuando la plantilla no especifica cantidad pero hay frontal**: 1 enchufe por cada 1,5m lineales de frontal (redondear hacia arriba). Ej: 2m → 2 enchufes; 3,5m → 3 enchufes.
+- **Default cuando la plantilla no especifica cantidad pero hay frontal trasero (de pared, no "de cabeza")**: poner **mínimo 1 enchufe** en el presupuesto aunque la nota no lo marque. Criterio de la marmolería: si hay chapeado trasero es muy probable que haya al menos 1 enchufe.
+- **Regla de escalado con frontal largo**: 1 enchufe por cada 1,5m lineales de frontal (redondear hacia arriba, mínimo 1). Ej: 2m → 2 enchufes; 3,5m → 3 enchufes.
 - Si la plantilla tiene marcada la casilla de enchufes pero el número no está claro, incluir **mínimo 2 huecos de enchufe**.
+- **EXCEPCIÓN — Lavandería/baño/office**: el default de "1 enchufe si hay chapeado" **NO aplica** en zonas secundarias. Solo incluir enchufes en lavandería/baño/office si la plantilla los marca explícitamente (en ese caso, usar el número que marque).
 
 ## MEDIDAS REVISADAS — SUBCARPETAS "SEGUNDAS", "TERCERAS":
 Cuando un PDF aparece etiquetado como "MEDIDAS REVISADAS (Segundas)" o similar, significa que el cliente envió una **segunda toma de medidas más reciente** que corrige o complementa las primeras.
@@ -244,7 +246,14 @@ Cuando el trabajo es "Varios materiales":
 - Si en presupuestos antiguos había varias opciones pero el presupuesto más reciente ya concreta una sola, la opción elegida se emite como `rol: "encimera"` y el resto se descarta (opcionalmente anótalo en advertencias).
 - Si hay ambigüedad, emite la que primero aparece en el presupuesto más reciente como `rol: "encimera"` principal y documenta las alternativas en `advertencias`.
 
-**Huecos con variaciones por opción**: Si el tipo de fregadero o hueco difiere entre opciones, inclúyelo en `notas` del hueco o crea dos entradas de hueco con `notas` indicando a qué opción pertenece.
+**⚠ HUECOS NO SE DUPLICAN ENTRE OPCIONES**: Los huecos (placa, fregadero, grifo, enchufe, dosificador) **son los mismos físicamente** — es la misma cocina, solo cambia el material. Emítelos UNA sola vez aunque haya 2+ opciones de material. La sección "PLACAS/FREGADEROS/GRIFOS/ENCHUFES" de la plantilla se lee UNA vez.
+- Si hay 1 placa + 1 fregadero + 1 grifo + 2 enchufes, el JSON lleva 1+1+1+2 huecos, NO 2+2+2+4.
+- Si el tipo/subtipo de fregadero difiere entre opciones (ej: opción1 = bajo encimera, opción2 = sobre encimera), emite UNA sola entrada de fregadero con el subtipo más común o null, e indica la variación en `notas`.
+- La plantilla marmolista con marcas "X" para tipo de fregadero o números de huecos se lee UNA vez — esas X y números NO se multiplican por número de opciones.
+
+**⚠ PIEZAS FRONTAL/COPETE/ZÓCALO — misma geometría entre opciones**:
+- Si duplicas piezas por opción (porque el material no está resuelto), usa sufijos `_opcion1`, `_opcion2` en `material_rol` para que el downstream pueda deduplicar.
+- NUNCA emitas dos piezas de igual geometría con `material_rol: "frontal"` (sin sufijo). Si hay dos opciones sin resolver y quieres representarlas, usa `frontal_opcion1` y `frontal_opcion2`. Si hay una sola decisión, emite UNA sola pieza con `material_rol: "frontal"`.
 
 ## COSTADO INGLETADO — IDENTIFICACIÓN:
 Si en el plano aparece una anotación como "X.XX × Y.YY Costado Ingletado" o "Costado" junto a una pieza lateral de isla o encimera, crear una pieza de tipo "costado" con:
@@ -270,8 +279,14 @@ Y añadir a cantos: {"tipo": "ingletado", "longitud_ml": ancho_encimera}
 Los cantos pulidos (recto_pulido / recto_pulido_agua) corresponden a **todos los bordes vistos** de las piezas de piedra:
 - Todos los cantos frontales de las encimeras (el borde que queda al aire, de cara al usuario)
 - Todos los copetes (su canto frontal visible)
-- Los laterales de los chapeados/frontales que quedan vistos (ej: el lado que pega contra una ventana o un hueco)
 - Las cabezas (extremos cortos) de los rodapiés/zócalos que quedan vistos
+
+**⚠ NO DOBLAR CUENTAS — el ML CANTO RECTO PULIDO AGUA del presupuesto MGR es solo el canto FRONTAL DE ENCIMERA**:
+- En el presupuesto MGR, la línea `M2 COLOCACION CHAPEADO PARED` **ya incluye el corte y pulido de todos los lados del chapeado/frontal**. **NO sumes esos lados al ml de canto pulido.**
+- La línea `ML CANTO RECTO PULIDO AGUA` del MGR corresponde EXCLUSIVAMENTE a: el canto frontal visible de la encimera + el canto frontal del copete si se presupuesta como pieza separada.
+- **Los laterales del chapeado/frontal NO se cuentan como ml separado** — están incluidos en el chapeado_m2.
+- **Cuando tengas el valor del MGR `ML CANTO RECTO PULIDO AGUA`, úsalo TAL CUAL como longitud del canto**. NO lo sumes a los perímetros calculados tú — ya está calculado. Emite UNA sola entrada `recto_pulido_agua` con la longitud exacta del MGR.
+
 No son el dato más crítico del trabajo — si hay incertidumbre, anótalos en advertencias pero no bloquees la extracción.
 
 ## ESPESOR EN COPETE/CHAPEADO — PLANTILLA VS MATERIAL REAL:
