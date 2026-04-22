@@ -186,14 +186,19 @@ La letra de los planos y plantillas es frecuentemente muy difícil de leer. Erro
 - La dirección se lee del **documento**. El nombre de la carpeta puede tener la ciudad incorrecta (ej: carpeta dice "Vilanova de Arousa" pero el documento dice "Vilagarcia de Arousa" → usar la del documento).
 
 ## HUECOS — ENCHUFES:
-- **La plantilla tiene SIEMPRE prioridad** sobre el presupuesto MGR en cuanto a número de enchufes.
-  - Si la plantilla dice "0" o deja el campo en blanco o con guión → **0 enchufes**, aunque el MGR los incluya.
-  - Si la plantilla indica un número concreto → usar ese número.
-- **No incluir enchufes si no hay chapeado/frontal**, salvo que la plantilla los especifique explícitamente (pueden ir en una isla, por ejemplo).
-- **Default cuando la plantilla no especifica cantidad pero hay frontal trasero (de pared, no "de cabeza")**: poner **mínimo 1 enchufe** en el presupuesto aunque la nota no lo marque. Criterio de la marmolería: si hay chapeado trasero es muy probable que haya al menos 1 enchufe.
-- **Regla de escalado con frontal largo**: 1 enchufe por cada 1,5m lineales de frontal (redondear hacia arriba, mínimo 1). Ej: 2m → 2 enchufes; 3,5m → 3 enchufes.
-- Si la plantilla tiene marcada la casilla de enchufes pero el número no está claro, incluir **mínimo 2 huecos de enchufe**.
-- **EXCEPCIÓN — Lavandería/baño/office**: el default de "1 enchufe si hay chapeado" **NO aplica** en zonas secundarias. Solo incluir enchufes en lavandería/baño/office si la plantilla los marca explícitamente (en ese caso, usar el número que marque).
+**La plantilla tiene prioridad cuando dice algo explícito, pero su silencio NO significa "cero"**:
+- Si la plantilla pone un número explícito (ej: "0", "1", "2", "3") → **usar ese número exacto**, aunque el MGR diga otra cosa.
+- Si la plantilla deja el campo **en blanco, con guión o sin marcar** → aplicar el default de abajo (NO es 0).
+- Si la plantilla tiene la casilla de enchufes marcada pero el número no está claro → **mínimo 2**.
+
+**DEFAULT cuando plantilla en silencio (campo vacío, guión, sin marca)**:
+- **En cocina**, si hay frontal/chapeado TRASERO (pegado a pared, no "de cabeza"/lateral de isla) → **mínimo 1 enchufe** (criterio de marmolería: es muy probable que lo haya).
+- **Escalado con frontal largo**: 1 enchufe por cada 1,5m lineales de frontal (redondear hacia arriba, mínimo 1). Ej: 2m → 2; 3,5m → 3.
+- **Si NO hay frontal** o solo hay frontal "de cabeza" (cabezas cortas de isla) → 0 enchufes por defecto, a menos que la plantilla los indique.
+
+**EXCEPCIÓN — zonas secundarias (lavandería, baño, office)**:
+- El default automático "1 enchufe si hay chapeado" **NO aplica** en estas zonas.
+- Solo incluir enchufes en lavandería/baño/office si la plantilla los marca explícitamente con número. Si silenciosa → 0.
 
 ## MEDIDAS REVISADAS — SUBCARPETAS "SEGUNDAS", "TERCERAS":
 Cuando un PDF aparece etiquetado como "MEDIDAS REVISADAS (Segundas)" o similar, significa que el cliente envió una **segunda toma de medidas más reciente** que corrige o complementa las primeras.
@@ -251,6 +256,11 @@ Cuando el trabajo es "Varios materiales":
 - Si el tipo/subtipo de fregadero difiere entre opciones (ej: opción1 = bajo encimera, opción2 = sobre encimera), emite UNA sola entrada de fregadero con el subtipo más común o null, e indica la variación en `notas`.
 - La plantilla marmolista con marcas "X" para tipo de fregadero o números de huecos se lee UNA vez — esas X y números NO se multiplican por número de opciones.
 
+**⚠ CANTOS NO SE DUPLICAN ENTRE OPCIONES**: Los cantos (ingletado, recto_pulido, recto_pulido_agua, bisel, boleado, canto_pilastra) **son los mismos físicamente** — es la misma geometría de pieza. Emite UNA sola entrada por tipo de canto aunque varios presupuestos MGR lo listen por opción.
+- NO crees entradas separadas `recto_pulido_agua: 4ml (opción 1)` + `recto_pulido_agua: 13ml (opción 3)`. Usa la longitud del presupuesto MGR más reciente Y que corresponda a la opción que vayas a emitir como encimera principal.
+- Si hay varias opciones no resueltas con cantos idénticos, usa la longitud de una sola (la más reciente) y describe en `notas` que aplica a todas.
+- NUNCA sumes longitudes de cantos de distintos presupuestos: es doblecuenta.
+
 **⚠ PIEZAS FRONTAL/COPETE/ZÓCALO — misma geometría entre opciones**:
 - Si duplicas piezas por opción (porque el material no está resuelto), usa sufijos `_opcion1`, `_opcion2` en `material_rol` para que el downstream pueda deduplicar.
 - NUNCA emitas dos piezas de igual geometría con `material_rol: "frontal"` (sin sufijo). Si hay dos opciones sin resolver y quieres representarlas, usa `frontal_opcion1` y `frontal_opcion2`. Si hay una sola decisión, emite UNA sola pieza con `material_rol: "frontal"`.
@@ -276,9 +286,13 @@ Y añadir a cantos: {"tipo": "ingletado", "longitud_ml": ancho_encimera}
 11. **Múltiples opciones con combinaciones de material**: Cuando un trabajo tiene presupuestos donde se combina material A en encimera con material B en chapeado (y otras combinaciones), crear una opción por cada combinación distinta, nombrándola claramente. Ej: `encimera_goiana_chapeado_fokos`, `encimera_goiana_todo_goiana`, etc. En las advertencias, listar cada opción con su precio total si está disponible para que el cliente pueda comparar.
 
 ## CANTOS PULIDOS — QUÉ SE INCLUYE:
-Los cantos pulidos (recto_pulido / recto_pulido_agua) corresponden a **todos los bordes vistos** de las piezas de piedra:
+**Tipo por defecto**: `recto_pulido_agua` (pulido normal con media caña). Usar `recto_pulido` (seco) SOLO si el material es **apomazado** o **abujardado**. Si el MGR lista "ML CANTO RECTO PULIDO" sin la palabra "AGUA", interpretarlo igualmente como `recto_pulido_agua` (terminología antigua NAT/PREF).
+
+Los cantos pulidos corresponden a **todos los bordes vistos** de las piezas de piedra:
 - Todos los cantos frontales de las encimeras (el borde que queda al aire, de cara al usuario)
 - Todos los copetes (su canto frontal visible)
+- Las **cabezas (extremos cortos) de copetes y chapeados que queden vistas** — no ocultas contra pared ni dentro de hueco de mueble. Pulidas.
+- **Cantos de copetes/chapeados que peguen contra una ventana**: van pulidos (sobresalen un poco y se rematan).
 - Las cabezas (extremos cortos) de los rodapiés/zócalos que quedan vistos
 
 **⚠ NO DOBLAR CUENTAS — el ML CANTO RECTO PULIDO AGUA del presupuesto MGR es solo el canto FRONTAL DE ENCIMERA**:

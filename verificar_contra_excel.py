@@ -140,8 +140,9 @@ def parse_excel_mgr(xlsx_path: Path) -> dict:
             # Fregadero/lavabo sin subtipo específico
             result["huecos"]["fregadero"] = result["huecos"].get("fregadero", 0) + (cant or 1)
 
-        # Cantos
-        if desc_u.startswith("ML CANTO RECTO PULIDO AGUA"):
+        # Cantos — "ML CANTO RECTO PULIDO" (con o sin 'AGUA') mapea a recto_pulido_agua
+        # (convención actual: ya no se diferencia NAT/PREF; solo apomazados usan seco)
+        if desc_u.startswith("ML CANTO RECTO PULIDO"):
             result["cantos_ml"]["recto_pulido_agua"] = result["cantos_ml"].get("recto_pulido_agua", 0) + (cant or 0)
         elif desc_u.startswith("ML BISEL") or "BISEL" in desc_u:
             result["cantos_ml"]["bisel"] = result["cantos_ml"].get("bisel", 0) + (cant or 0)
@@ -244,16 +245,14 @@ def resumen_json(datos: dict) -> dict:
         elif tipo == "enchufe":
             r["huecos"]["enchufe"] = r["huecos"].get("enchufe", 0) + cant
 
-    # Cantos
+    # Cantos — "recto_pulido" y "recto_pulido_agua" se consideran el mismo bucket
+    # salvo para materiales apomazados. Convención usuario 2026-04-22: pulido normal
+    # siempre mapea a recto_pulido_agua en el comparativo contra Excel.
     for c in datos.get("cantos") or []:
         tipo = (c.get("tipo") or "").lower()
         ml = float(c.get("longitud_ml") or 0)
-        # "recto_pulido_agua" y "recto_pulido" (seco) son cantos distintos
-        # en el Excel MGR. No los mezcles aquí o sumas dobles.
-        if "recto" in tipo and "pulido" in tipo and "agua" in tipo:
+        if "recto" in tipo and "pulido" in tipo:
             r["cantos_ml"]["recto_pulido_agua"] = r["cantos_ml"].get("recto_pulido_agua", 0) + ml
-        elif "recto" in tipo and "pulido" in tipo:
-            r["cantos_ml"]["recto_pulido"] = r["cantos_ml"].get("recto_pulido", 0) + ml
         elif "bisel" in tipo:
             r["cantos_ml"]["bisel"] = r["cantos_ml"].get("bisel", 0) + ml
         elif "inglet" in tipo:  # cubre "inglete" e "ingletado"
@@ -404,7 +403,8 @@ def comparar(excel_data: dict, json_data: dict) -> list[dict]:
     for k in sorted(claves_cantos):
         v_ex = excel_data.get("cantos_ml", {}).get(k, 0)
         v_js = json_data.get("cantos_ml", {}).get(k, 0)
-        match = _aprox_eq(v_ex, v_js, tol_abs=0.5, tol_rel=0.1)
+        # Tolerancia canto: 1ml absoluto (feedback usuario 2026-04-22)
+        match = _aprox_eq(v_ex, v_js, tol_abs=1.0, tol_rel=0.15)
         filas.append({
             "concepto":   f"canto.{k} (ml)",
             "excel":      round(v_ex, 2),
