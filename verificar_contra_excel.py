@@ -35,11 +35,18 @@ import openpyxl
 # ── Parseo del Excel MGR ──────────────────────────────────────────────────────
 
 def _última_hoja_presupuesto(wb) -> Optional[str]:
-    """Devuelve el nombre de la hoja 'Presupuesto NNNN' con fecha más reciente."""
+    """Devuelve el nombre de la hoja de presupuesto con fecha más reciente.
+    Busca por nombre 'Presupuesto' primero; si no hay, detecta hojas cuyo
+    cell(1,5) contiene 'PRESUPUESTO' (formato antiguo con hojas nombradas
+    por material tipo 'Miami vena', 'Kairos', etc)."""
     candidatos = []
     for name in wb.sheetnames:
-        if "presupuesto" in name.lower():
-            ws = wb[name]
+        ws = wb[name]
+        es_presup = "presupuesto" in name.lower()
+        if not es_presup:
+            cabecera = str(ws.cell(1, 5).value or "").upper()
+            es_presup = "PRESUPUESTO" in cabecera
+        if es_presup:
             fecha = ws.cell(1, 4).value
             if isinstance(fecha, datetime):
                 candidatos.append((fecha, name))
@@ -241,8 +248,12 @@ def resumen_json(datos: dict) -> dict:
     for c in datos.get("cantos") or []:
         tipo = (c.get("tipo") or "").lower()
         ml = float(c.get("longitud_ml") or 0)
-        if "recto" in tipo and "pulido" in tipo:
+        # "recto_pulido_agua" y "recto_pulido" (seco) son cantos distintos
+        # en el Excel MGR. No los mezcles aquí o sumas dobles.
+        if "recto" in tipo and "pulido" in tipo and "agua" in tipo:
             r["cantos_ml"]["recto_pulido_agua"] = r["cantos_ml"].get("recto_pulido_agua", 0) + ml
+        elif "recto" in tipo and "pulido" in tipo:
+            r["cantos_ml"]["recto_pulido"] = r["cantos_ml"].get("recto_pulido", 0) + ml
         elif "bisel" in tipo:
             r["cantos_ml"]["bisel"] = r["cantos_ml"].get("bisel", 0) + ml
         elif "inglet" in tipo:  # cubre "inglete" e "ingletado"

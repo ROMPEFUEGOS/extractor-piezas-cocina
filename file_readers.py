@@ -27,8 +27,9 @@ def should_ignore(path: Path) -> bool:
     return False
 
 
-def image_to_base64(path: Path) -> tuple[str, str]:
-    """Devuelve (base64_data, media_type)."""
+def image_to_base64(path: Path, max_bytes: int = 4_500_000) -> tuple[str, str]:
+    """Devuelve (base64_data, media_type). Redimensiona/comprime si excede max_bytes.
+    Límite API Claude es 5MB por imagen; dejamos margen en 4.5MB."""
     ext = path.suffix.lower()
     media_map = {
         '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -36,9 +37,35 @@ def image_to_base64(path: Path) -> tuple[str, str]:
         '.webp': 'image/webp', '.bmp': 'image/png',
     }
     media_type = media_map.get(ext, 'image/jpeg')
-    with open(path, 'rb') as f:
-        data = base64.standard_b64encode(f.read()).decode('utf-8')
-    return data, media_type
+
+    size = path.stat().st_size
+    if size <= max_bytes:
+        with open(path, 'rb') as f:
+            data = base64.standard_b64encode(f.read()).decode('utf-8')
+        return data, media_type
+
+    # Imagen grande: reescalar y guardar a JPEG con calidad progresiva
+    from PIL import Image
+    import io
+    img = Image.open(path)
+    img = img.convert("RGB")
+    # Arrancar con escala basada en ratio de tamaño
+    scale = (max_bytes / size) ** 0.5
+    w = max(1, int(img.width * scale))
+    h = max(1, int(img.height * scale))
+    img_small = img.resize((w, h), Image.LANCZOS)
+    for quality in (85, 75, 65, 55):
+        buf = io.BytesIO()
+        img_small.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= max_bytes:
+            data = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
+            return data, "image/jpeg"
+    # Último recurso: reducir más
+    img_small = img_small.resize((w // 2, h // 2), Image.LANCZOS)
+    buf = io.BytesIO()
+    img_small.save(buf, format="JPEG", quality=60, optimize=True)
+    data = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
+    return data, "image/jpeg"
 
 
 _easyocr_reader = None
