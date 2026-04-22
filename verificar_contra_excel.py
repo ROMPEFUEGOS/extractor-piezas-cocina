@@ -34,11 +34,34 @@ import openpyxl
 
 # ── Parseo del Excel MGR ──────────────────────────────────────────────────────
 
+def _parse_fecha(v) -> datetime:
+    """Parsea datetime directo o string 'DD/MM/YYYY'/'YYYY-MM-DD'."""
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, str):
+        for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y"):
+            try:
+                return datetime.strptime(v.strip(), fmt)
+            except ValueError:
+                pass
+    return datetime(1900, 1, 1)
+
+
 def _última_hoja_presupuesto(wb) -> Optional[str]:
     """Devuelve el nombre de la hoja de presupuesto con fecha más reciente.
     Busca por nombre 'Presupuesto' primero; si no hay, detecta hojas cuyo
-    cell(1,5) contiene 'PRESUPUESTO' (formato antiguo con hojas nombradas
-    por material tipo 'Miami vena', 'Kairos', etc)."""
+    cell(1,5) contiene 'PRESUPUESTO'. Parsea fechas como datetime o string.
+    Tie-break en empate de fechas: hoja con más líneas de contenido
+    (evita elegir una hoja de 'lavandería' sobre la principal de 'cocina'
+    en proyectos multi-zona con misma fecha)."""
+    def _n_lineas(ws):
+        n = 0
+        for r in range(15, min(ws.max_row + 1, 50)):
+            c4 = ws.cell(r, 4).value
+            if c4 and str(c4).strip() not in ("", "#N/A", "0"):
+                n += 1
+        return n
+
     candidatos = []
     for name in wb.sheetnames:
         ws = wb[name]
@@ -47,15 +70,12 @@ def _última_hoja_presupuesto(wb) -> Optional[str]:
             cabecera = str(ws.cell(1, 5).value or "").upper()
             es_presup = "PRESUPUESTO" in cabecera
         if es_presup:
-            fecha = ws.cell(1, 4).value
-            if isinstance(fecha, datetime):
-                candidatos.append((fecha, name))
-            else:
-                candidatos.append((datetime(1900, 1, 1), name))
+            candidatos.append((_parse_fecha(ws.cell(1, 4).value), _n_lineas(ws), name))
     if not candidatos:
         return None
-    candidatos.sort(reverse=True)
-    return candidatos[0][1]
+    # Ordena por fecha desc, luego por # líneas desc (más contenido gana)
+    candidatos.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return candidatos[0][2]
 
 
 def parse_excel_mgr(xlsx_path: Path) -> dict:
@@ -93,9 +113,19 @@ def parse_excel_mgr(xlsx_path: Path) -> dict:
         # Dos formatos conocidos:
         #   Nuevo (Cocimoble2026): col1=desc, col9=m²/cantid
         #   Viejo (ACyC/Cocimoble2025 antiguos): col1=None, col4=desc, col8=Unid
+        # Algunos Excel tienen col1 con texto STALE del template (ej: 'SILVESTRE
+        # LALIN' copiado de otro proyecto) mientras col4 tiene el dato real.
+        # Regla: para filas de material (col5 ∈ {Tabla, Encimera, Chapeado, Copete, Rodapé}),
+        # preferir col4 que es donde el sistema pone el material REAL. Para
+        # filas de huecos/cantos, col1 suele estar vacía y col4 tiene la descripción.
         c1 = ws.cell(r, 1).value
         c4 = ws.cell(r, 4).value
-        desc = c1 if (c1 not in (None, "", 0)) else (c4 or "")
+        c5_up = str(ws.cell(r, 5).value or "").strip().upper()
+        FILAS_MATERIAL = ("TABLA","ENCIMERA","CHAPEADO M2","COPETE ML","RODAPE > 9CM.","RODAPÉ > 9CM.")
+        if any(c5_up.startswith(m) for m in FILAS_MATERIAL) and c4 not in (None, "", 0):
+            desc = c4
+        else:
+            desc = c1 if (c1 not in (None, "", 0)) else (c4 or "")
         desc_u = str(desc).upper().strip()
         if not desc_u or desc_u.startswith("#N/A"):
             continue
