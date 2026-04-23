@@ -108,6 +108,27 @@ Panel vertical lateral que cae desde la encimera hasta el suelo. Aparece en isla
 - enchufe: hueco rectangular para enchufe
 - dosificador: hueco pequeño para dosificador de jabón
 
+**📐 POSICIÓN Y TAMAÑO DE HUECOS — CAMPOS OBLIGATORIOS para placa y fregadero (para nesting)**:
+
+Para CADA hueco de **placa** y **fregadero** (también recomendable para grifo), **SIEMPRE emite** los tres campos:
+- `distancia_lado_mm`: distancia desde el BORDE IZQUIERDO de la encimera al CENTRO del hueco (mm). Se usará para decidir por dónde partir la encimera en el nesting.
+- `largo_mm`: dimensión del hueco a lo largo de la encimera (mm).
+- `ancho_mm`: dimensión del hueco en profundidad desde el frente (mm).
+
+**Cómo determinar estos valores** (en orden de prioridad):
+1. **Si la plantilla/plano muestra la medida exacta** (anotación manuscrita con cotas) → usar esa medida.
+2. **Si la plantilla muestra la posición gráficamente pero sin cota** → estimar proporcionalmente a la medida total de la encimera.
+3. **Si la plantilla NO da ninguna pista** → estimar:
+   - **Posición**: placa típicamente cerca del centro (40-60% del largo); fregadero hacia un extremo (20-30% desde un lado); grifo justo detrás del fregadero.
+   - **Tamaño (usar estos defaults)**:
+     - placa inducción 4 zonas: **600×520 mm**
+     - placa inducción 2 zonas / dominó: **300×520 mm**
+     - fregadero 1 seno: **400×400 mm**
+     - fregadero 2 senos: **780×480 mm**
+     - fregadero con escurridor: **1000×480 mm**
+     - grifo: **35×35 mm** (taladro)
+4. **NUNCA dejes placa o fregadero con `distancia_lado_mm: null`** — es un dato crítico para partir la encimera. Estima siempre y anota la confianza en `notas` (ej: "estimado centrado, sin cota explícita").
+
 **NOTA — Tipo de fregadero (subtipo):**
 - **NO ASUMAS el subtipo.** Solo emite `subtipo: "bajo_encimera"` o `"sobre_encimera"` si la nota/plantilla/presupuesto contiene las siglas explícitas **B/E**, **S/E**, **BE**, **SE**, o el texto "bajo encimera" / "sobre encimera" / "enrasado".
 - Si no se menciona ninguna de esas indicaciones, deja `subtipo: null` — es ambiguo y preferimos nulo antes que inventar.
@@ -367,9 +388,9 @@ Estructura de ejemplo para un trabajo real (J0297 Elisa Baños):
     {"tipo": "zocalo", "material_rol": "zocalo", "longitud_ml": 0.60, "altura_mm": 100, "zona": "lateral"}
   ],
   "huecos": [
-    {"tipo": "placa", "cantidad": 1},
-    {"tipo": "fregadero", "cantidad": 1, "subtipo": "sobre_encimera"},
-    {"tipo": "grifo", "cantidad": 1},
+    {"tipo": "placa", "cantidad": 1, "distancia_lado_mm": 2200, "largo_mm": 600, "ancho_mm": 520},
+    {"tipo": "fregadero", "cantidad": 1, "subtipo": "sobre_encimera", "distancia_lado_mm": 900, "largo_mm": 780, "ancho_mm": 480},
+    {"tipo": "grifo", "cantidad": 1, "distancia_lado_mm": 900},
     {"tipo": "enchufe", "cantidad": 1}
   ],
   "cantos": [
@@ -522,6 +543,9 @@ def json_to_trabajo(data: dict, folder_info: dict) -> TrabajoExtraido:
             tipo=h.get('tipo', 'desconocido'),
             cantidad=safe_int(h.get('cantidad')) or 1,
             posicion=h.get('posicion'),
+            distancia_lado_mm=h.get('distancia_lado_mm'),
+            largo_mm=h.get('largo_mm'),
+            ancho_mm=h.get('ancho_mm'),
             subtipo=h.get('subtipo'),
             notas=h.get('notas'),
         ))

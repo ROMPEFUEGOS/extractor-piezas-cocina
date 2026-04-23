@@ -56,7 +56,10 @@ class Hueco:
     """Un hueco o elaboración en la encimera/pieza."""
     tipo: str          # placa, fregadero, grifo, enchufe, bajo_encimera, enrasado_optico
     cantidad: int = 1
-    posicion: Optional[str] = None   # izquierda, derecha, centro
+    posicion: Optional[str] = None         # izquierda, derecha, centro (cualitativo)
+    distancia_lado_mm: Optional[float] = None   # distancia desde borde izquierdo al centro del hueco (para nesting)
+    largo_mm: Optional[float] = None            # dimensión del hueco a lo largo de la encimera
+    ancho_mm: Optional[float] = None            # dimensión del hueco a lo ancho (profundidad)
     subtipo: Optional[str] = None    # bajo_encimera, sobre_encimera, enrasado para fregadero
     notas: Optional[str] = None
 
