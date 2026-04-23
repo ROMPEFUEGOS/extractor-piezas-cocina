@@ -177,6 +177,46 @@ class Tabla:
         return self.area_usada() / area_total * 100 if area_total > 0 else 0
 
 
+LAVAVAJILLAS_ML = 600  # ml de rodapié estándar para hueco de lavavajillas
+
+
+def split_rodapie(largo: float, ancho: float, label: str,
+                   tabla_largo: int, tiene_lavavajillas: bool = True) -> list[tuple[float, float, str]]:
+    """
+    Rodapié/zócalo: cortes especiales.
+    - Máximo 3 trozos.
+    - Si hay lavavajillas (default True en cocinas), el rodapié del hueco
+      del lavavajillas (~600mm) va separado → 3 trozos totales si el
+      rodapié es > 4m aproximadamente.
+    - Si no, corte simétrico (mitad) o en 3 si no cabe en 2.
+    """
+    if largo <= tabla_largo:
+        return [(largo, ancho, label)]
+
+    # Rodapié > tabla_largo → necesita partir
+    n_min = math.ceil(largo / tabla_largo)
+    n = min(3, max(2, n_min))
+
+    if tiene_lavavajillas and largo > 4000 and n >= 2:
+        # 3 trozos: izq + lavavajillas + der
+        resto = largo - LAVAVAJILLAS_ML
+        mitad = resto / 2
+        if mitad <= tabla_largo and LAVAVAJILLAS_ML <= tabla_largo:
+            return [
+                (mitad, ancho, f"{label} (izq)"),
+                (LAVAVAJILLAS_ML, ancho, f"{label} (lavavajillas)"),
+                (mitad, ancho, f"{label} (der)"),
+            ]
+
+    # Corte equitativo en n trozos
+    chunk = largo / n
+    if chunk > tabla_largo:
+        # No cabe ni en n=3 → forzar n mayor (raro)
+        n = math.ceil(largo / tabla_largo)
+        chunk = largo / n
+    return [(chunk, ancho, f"{label} ({i+1}/{n})") for i in range(n)]
+
+
 def split_pieza_por_huecos(largo: float, ancho: float, label: str,
                             huecos_en_pieza: list[dict],
                             tabla_largo: int, kerf: int = KERF_MM) -> list[tuple[float, float, str]]:
@@ -232,46 +272,118 @@ def split_pieza_por_huecos(largo: float, ancho: float, label: str,
 def pack_piezas(piezas_dim: list[tuple[float, float, str]],
                 tabla_ancho: int, tabla_alto: int,
                 rotar: bool) -> list[Tabla]:
+    """Wrapper público que elige el mejor algoritmo disponible."""
+    return pack_piezas_rectpack(piezas_dim, tabla_ancho, tabla_alto, rotar)
+
+
+def pack_piezas_rectpack(piezas_dim: list[tuple[float, float, str]],
+                          tabla_ancho: int, tabla_alto: int,
+                          rotar: bool) -> list[Tabla]:
     """
-    Empaqueta una lista de (w, h, label) en el mínimo número de tablas.
-    Si rotar=True, prueba también la orientación girada 90°.
-    Devuelve la lista de Tabla con las piezas colocadas.
+    Empaqueta usando rectpack (MaxRects BSSF / Guillotine BSSF-SAS).
+    Prueba varios algoritmos y devuelve el que menos tablas use (desempate
+    por mayor aprovechamiento medio).
     """
-    # Ordenar por área descendente (greedy — piezas grandes primero)
+    try:
+        from rectpack import newPacker, MaxRectsBssf, MaxRectsBaf, GuillotineBssfSas, PackingMode, PackingBin, SORT_AREA
+    except ImportError:
+        # Fallback al shelf-packing simple (legacy)
+        return pack_piezas_shelf(piezas_dim, tabla_ancho, tabla_alto, rotar)
+
+    if not piezas_dim:
+        return []
+
+    # rectpack trabaja con enteros; redondeamos dimensiones a mm + kerf integrado
+    rects = []
+    for idx, (w, h, label) in enumerate(piezas_dim):
+        w_i = int(round(w)) + KERF_MM
+        h_i = int(round(h)) + KERF_MM
+        # rid = índice en piezas_dim para recuperar label
+        rects.append((w_i, h_i, idx))
+
+    candidatos = []
+    for algo in (MaxRectsBssf, MaxRectsBaf, GuillotineBssfSas):
+        packer = newPacker(mode=PackingMode.Offline, bin_algo=PackingBin.BFF,
+                            pack_algo=algo, sort_algo=SORT_AREA, rotation=rotar)
+        # Añadir muchos bins (tablas) suficientes — rectpack solo usa los que necesite
+        for _ in range(len(rects) + 2):
+            packer.add_bin(tabla_ancho + KERF_MM, tabla_alto + KERF_MM)
+        for w_i, h_i, rid in rects:
+            packer.add_rect(w_i, h_i, rid=rid)
+        packer.pack()
+
+        # Cuántos bins se usaron realmente
+        bins_usados = [b for b in packer if len(b) > 0]
+        if not bins_usados:
+            continue
+
+        tablas_result = []
+        for b in bins_usados:
+            t = Tabla(tabla_ancho, tabla_alto)
+            for rect in b:
+                x, y, rw, rh, rid = rect.x, rect.y, rect.width, rect.height, rect.rid
+                # Quitar kerf para dimensión real
+                rw_real = rw - KERF_MM
+                rh_real = rh - KERF_MM
+                label = piezas_dim[rid][2]
+                sh = Shelf(y, tabla_ancho)
+                sh.x_usado = x
+                sh.añadir(rw_real, rh_real, label)
+                t.shelves.append(sh)
+            tablas_result.append(t)
+
+        # Verificar que todas las piezas se colocaron
+        colocadas = sum(len(b) for b in bins_usados)
+        if colocadas < len(rects):
+            # Algunas piezas no cupieron — las añadimos a una tabla final con ⚠GRANDE
+            ids_colocados = {rect.rid for b in bins_usados for rect in b}
+            sobrantes = [(piezas_dim[i][0], piezas_dim[i][1], piezas_dim[i][2])
+                          for i in range(len(rects)) if i not in ids_colocados]
+            overflow = Tabla(tabla_ancho, tabla_alto)
+            for w, h, label in sobrantes:
+                sh = Shelf(0, tabla_ancho)
+                sh.añadir(w, h, label + " ⚠GRANDE")
+                overflow.shelves.append(sh)
+            tablas_result.append(overflow)
+
+        aprovechamiento_medio = sum(t.aprovechamiento() for t in tablas_result) / len(tablas_result)
+        candidatos.append((len(tablas_result), -aprovechamiento_medio, tablas_result, algo.__name__))
+
+    if not candidatos:
+        return pack_piezas_shelf(piezas_dim, tabla_ancho, tabla_alto, rotar)
+
+    candidatos.sort(key=lambda c: (c[0], c[1]))  # menos tablas, luego mayor aprovechamiento
+    return candidatos[0][2]
+
+
+def pack_piezas_shelf(piezas_dim: list[tuple[float, float, str]],
+                       tabla_ancho: int, tabla_alto: int,
+                       rotar: bool) -> list[Tabla]:
+    """Fallback shelf-packing legacy (sin rectpack)."""
     items = sorted(piezas_dim, key=lambda x: x[0] * x[1], reverse=True)
-
     tablas: list[Tabla] = []
-
     for w_orig, h_orig, label in items:
         colocada = False
-        # Probar orientaciones
         orientaciones = [(w_orig, h_orig)]
         if rotar and w_orig != h_orig:
             orientaciones.append((h_orig, w_orig))
-
         for tabla in tablas:
             for w, h in orientaciones:
-                if w <= tabla.ancho and h <= tabla.alto:
-                    if tabla.añadir_pieza(w, h, label):
-                        colocada = True
-                        break
+                if w <= tabla.ancho and h <= tabla.alto and tabla.añadir_pieza(w, h, label):
+                    colocada = True
+                    break
             if colocada:
                 break
-
         if not colocada:
-            # Nueva tabla
             nueva = Tabla(tabla_ancho, tabla_alto)
             for w, h in orientaciones:
-                if w <= tabla_ancho and h <= tabla_alto:
-                    if nueva.añadir_pieza(w, h, label):
-                        colocada = True
-                        break
+                if w <= tabla_ancho and h <= tabla_alto and nueva.añadir_pieza(w, h, label):
+                    colocada = True
+                    break
             if not colocada:
-                # Pieza más grande que la tabla — colocar igualmente (advertencia)
                 nueva.añadir_pieza(w_orig, h_orig, label + " ⚠GRANDE")
                 colocada = True
             tablas.append(nueva)
-
     return tablas
 
 
@@ -364,9 +476,16 @@ def calcular_tablas(json_path: Path) -> dict:
             fits_normal = (w <= tabla_w and h <= tabla_h)
             fits_rotada = rotar and (h <= tabla_w and w <= tabla_h)
             if not (fits_normal or fits_rotada):
-                # Solo huecos si es encimera/isla/cascada — resto va con corte libre
-                huecos_disponibles = huecos_globales if tipo_p in ("encimera", "isla", "cascada") else []
-                sub_piezas = split_pieza_por_huecos(w, h, label, huecos_disponibles, tabla_w)
+                # Dispatch según tipo de pieza:
+                #   encimera/isla/cascada → partir por huecos (placa > fregadero)
+                #   rodapie/zocalo → regla especial (lavavajillas separado, max 3 trozos)
+                #   resto (frontal, copete, chapeado, etc) → corte libre
+                if tipo_p in ("encimera", "isla", "cascada"):
+                    sub_piezas = split_pieza_por_huecos(w, h, label, huecos_globales, tabla_w)
+                elif tipo_p in ("rodapie", "zocalo"):
+                    sub_piezas = split_rodapie(w, h, label, tabla_w, tiene_lavavajillas=True)
+                else:
+                    sub_piezas = split_pieza_por_huecos(w, h, label, [], tabla_w)
                 if len(sub_piezas) > 1:
                     advertencias_g.append(
                         f"🔪 {label} ({w:.0f}×{h:.0f}mm) → {len(sub_piezas)} trozos: "
