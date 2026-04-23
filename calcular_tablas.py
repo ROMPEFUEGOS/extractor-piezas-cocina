@@ -177,6 +177,58 @@ class Tabla:
         return self.area_usada() / area_total * 100 if area_total > 0 else 0
 
 
+def split_pieza_por_huecos(largo: float, ancho: float, label: str,
+                            huecos_en_pieza: list[dict],
+                            tabla_largo: int, kerf: int = KERF_MM) -> list[tuple[float, float, str]]:
+    """
+    Si una pieza excede el largo de tabla, la parte priorizando huecos:
+    1º placa, 2º fregadero, 3º corte libre centrado.
+    Devuelve lista de (largo, ancho, label) para cada sub-pieza.
+
+    Política: el corte se hace justo al lado del hueco (del lado que permite
+    que AMBAS mitades quepan en tabla). Cada sub-pieza queda con UN borde en
+    el hueco (el hueco "desaparece" geométricamente al partir).
+    """
+    if largo <= tabla_largo:
+        return [(largo, ancho, label)]
+
+    # Ordenar huecos por prioridad: placa → fregadero → resto
+    def prioridad(h):
+        t = (h.get("tipo") or "").lower()
+        return {"placa": 0, "fregadero": 1, "grifo": 2}.get(t, 9)
+
+    candidatos_corte = []
+    for h in sorted(huecos_en_pieza, key=prioridad):
+        dist = h.get("distancia_lado_mm")
+        lh = h.get("largo_mm") or 0
+        if dist is None:
+            continue
+        borde_izq = max(0, dist - lh / 2)
+        borde_der = min(largo, dist + lh / 2)
+        # Dos opciones: cortar en el borde izquierdo del hueco o en el derecho
+        for corte in (borde_izq, borde_der):
+            sub1 = corte
+            sub2 = largo - corte
+            if 0 < sub1 and 0 < sub2 and sub1 <= tabla_largo and sub2 <= tabla_largo:
+                candidatos_corte.append((prioridad(h), corte, h.get("tipo")))
+
+    if candidatos_corte:
+        candidatos_corte.sort()  # menor prioridad = placa primero
+        _, corte, tipo_hueco = candidatos_corte[0]
+        sub1 = corte
+        sub2 = largo - corte
+        return [
+            (sub1, ancho, f"{label} (1/2 corte@{tipo_hueco})"),
+            (sub2, ancho, f"{label} (2/2 corte@{tipo_hueco})"),
+        ]
+
+    # Sin huecos útiles o no permiten partición — corte libre recursivo
+    n_trozos = math.ceil(largo / tabla_largo)
+    largo_trozo = largo / n_trozos
+    return [(largo_trozo, ancho, f"{label} ({i+1}/{n_trozos} corte libre)")
+            for i in range(n_trozos)]
+
+
 def pack_piezas(piezas_dim: list[tuple[float, float, str]],
                 tabla_ancho: int, tabla_alto: int,
                 rotar: bool) -> list[Tabla]:
@@ -294,6 +346,8 @@ def calcular_tablas(json_path: Path) -> dict:
         piezas_dim: list[tuple[float, float, str]] = []
         advertencias_g: list[str] = []
 
+        huecos_globales = datos.get("huecos") or []
+
         for i, pieza in enumerate(grupo["piezas"]):
             dims = dimensiones_pieza(pieza)
             if not dims:
@@ -306,15 +360,26 @@ def calcular_tablas(json_path: Path) -> dict:
             if w == 0 or h == 0:
                 advertencias_g.append(f"Pieza #{i+1} ({label}) dimensión 0 — ignorada")
                 continue
-            # Verificar si supera la tabla
+            tipo_p = (pieza.get("tipo") or "").lower()
             fits_normal = (w <= tabla_w and h <= tabla_h)
             fits_rotada = rotar and (h <= tabla_w and w <= tabla_h)
-            if not fits_normal and not fits_rotada:
-                advertencias_g.append(
-                    f"⚠ PIEZA GRANDE: {label} ({w:.0f}×{h:.0f}mm) "
-                    f"supera tabla estándar {tabla_w}×{tabla_h}mm — verificar con proveedor"
-                )
-            piezas_dim.append((w, h, label))
+            if not (fits_normal or fits_rotada):
+                # Solo huecos si es encimera/isla/cascada — resto va con corte libre
+                huecos_disponibles = huecos_globales if tipo_p in ("encimera", "isla", "cascada") else []
+                sub_piezas = split_pieza_por_huecos(w, h, label, huecos_disponibles, tabla_w)
+                if len(sub_piezas) > 1:
+                    advertencias_g.append(
+                        f"🔪 {label} ({w:.0f}×{h:.0f}mm) → {len(sub_piezas)} trozos: "
+                        + " + ".join(f"{s[0]:.0f}×{s[1]:.0f}" for s in sub_piezas)
+                    )
+                else:
+                    advertencias_g.append(
+                        f"⚠ PIEZA GRANDE: {label} ({w:.0f}×{h:.0f}mm) no se pudo partir — "
+                        f"supera tabla {tabla_w}×{tabla_h}mm"
+                    )
+                piezas_dim.extend(sub_piezas)
+            else:
+                piezas_dim.append((w, h, label))
 
         if not piezas_dim:
             resultado["por_material"][clave] = {
