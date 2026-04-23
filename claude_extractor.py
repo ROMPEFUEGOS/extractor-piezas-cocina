@@ -110,7 +110,8 @@ Panel vertical lateral que cae desde la encimera hasta el suelo. Aparece en isla
 
 **📐 POSICIÓN Y TAMAÑO DE HUECOS — CAMPOS OBLIGATORIOS para placa y fregadero (para nesting)**:
 
-Para CADA hueco de **placa** y **fregadero** (también recomendable para grifo), **SIEMPRE emite** los tres campos:
+Para CADA hueco de **placa** y **fregadero** (también recomendable para grifo), **SIEMPRE emite** los cuatro campos:
+- `pieza_zona`: la `zona` de la pieza (encimera/isla) a la que pertenece el hueco. Debe coincidir EXACTAMENTE con el campo `zona` de una encimera emitida en `piezas`. Ej: si la encimera tiene `zona: "pared principal"`, el hueco emite `pieza_zona: "pared principal"`. Si solo hay una encimera, pon su zona (o "encimera principal" como default).
 - `distancia_lado_mm`: distancia desde el BORDE IZQUIERDO de la encimera al CENTRO del hueco (mm). Se usará para decidir por dónde partir la encimera en el nesting.
 - `largo_mm`: dimensión del hueco a lo largo de la encimera (mm).
 - `ancho_mm`: dimensión del hueco en profundidad desde el frente (mm).
@@ -388,10 +389,10 @@ Estructura de ejemplo para un trabajo real (J0297 Elisa Baños):
     {"tipo": "zocalo", "material_rol": "zocalo", "longitud_ml": 0.60, "altura_mm": 100, "zona": "lateral"}
   ],
   "huecos": [
-    {"tipo": "placa", "cantidad": 1, "distancia_lado_mm": 2200, "largo_mm": 600, "ancho_mm": 520},
-    {"tipo": "fregadero", "cantidad": 1, "subtipo": "sobre_encimera", "distancia_lado_mm": 900, "largo_mm": 780, "ancho_mm": 480},
-    {"tipo": "grifo", "cantidad": 1, "distancia_lado_mm": 900},
-    {"tipo": "enchufe", "cantidad": 1}
+    {"tipo": "placa", "cantidad": 1, "pieza_zona": "pared superior izquierda", "distancia_lado_mm": 2200, "largo_mm": 600, "ancho_mm": 520},
+    {"tipo": "fregadero", "cantidad": 1, "subtipo": "sobre_encimera", "pieza_zona": "pared superior izquierda", "distancia_lado_mm": 900, "largo_mm": 780, "ancho_mm": 480},
+    {"tipo": "grifo", "cantidad": 1, "pieza_zona": "pared superior izquierda", "distancia_lado_mm": 900},
+    {"tipo": "enchufe", "cantidad": 1, "pieza_zona": "pared superior izquierda"}
   ],
   "cantos": [
     {"tipo": "ingletado", "longitud_ml": 3.48},
@@ -542,6 +543,7 @@ def json_to_trabajo(data: dict, folder_info: dict) -> TrabajoExtraido:
         huecos.append(Hueco(
             tipo=h.get('tipo', 'desconocido'),
             cantidad=safe_int(h.get('cantidad')) or 1,
+            pieza_zona=h.get('pieza_zona'),
             posicion=h.get('posicion'),
             distancia_lado_mm=h.get('distancia_lado_mm'),
             largo_mm=h.get('largo_mm'),

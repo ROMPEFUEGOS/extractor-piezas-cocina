@@ -460,6 +460,25 @@ def calcular_tablas(json_path: Path) -> dict:
 
         huecos_globales = datos.get("huecos") or []
 
+        def huecos_de_pieza(pieza: dict) -> list[dict]:
+            """Devuelve los huecos asociados a una pieza por su campo `zona`.
+            Si ningún hueco tiene pieza_zona, se asume que todos pertenecen a
+            la encimera más larga (heurística legacy)."""
+            zona_p = (pieza.get("zona") or "").strip().lower()
+            asociados = [h for h in huecos_globales
+                         if (h.get("pieza_zona") or "").strip().lower() == zona_p and zona_p]
+            if asociados:
+                return asociados
+            # Fallback: si ningún hueco tiene pieza_zona, solo asignar a la
+            # encimera más larga del grupo
+            if not any(h.get("pieza_zona") for h in huecos_globales):
+                encimeras = [p for p in grupo["piezas"] if (p.get("tipo") or "").lower() == "encimera"]
+                if encimeras:
+                    mas_larga = max(encimeras, key=lambda p: float(p.get("largo_mm") or 0))
+                    if pieza is mas_larga:
+                        return huecos_globales
+            return []
+
         for i, pieza in enumerate(grupo["piezas"]):
             dims = dimensiones_pieza(pieza)
             if not dims:
@@ -481,7 +500,7 @@ def calcular_tablas(json_path: Path) -> dict:
                 #   rodapie/zocalo → regla especial (lavavajillas separado, max 3 trozos)
                 #   resto (frontal, copete, chapeado, etc) → corte libre
                 if tipo_p in ("encimera", "isla", "cascada"):
-                    sub_piezas = split_pieza_por_huecos(w, h, label, huecos_globales, tabla_w)
+                    sub_piezas = split_pieza_por_huecos(w, h, label, huecos_de_pieza(pieza), tabla_w)
                 elif tipo_p in ("rodapie", "zocalo"):
                     sub_piezas = split_rodapie(w, h, label, tabla_w, tiene_lavavajillas=True)
                 else:
