@@ -30,6 +30,42 @@ Superficie horizontal sobre los muebles bajos. Profundidad estándar 600mm salvo
 Puede tener forma rectangular, en L, en U, con entrantes por electrodomésticos (marcados con X en plano).
 También puede ser isla o península independiente.
 
+**🔺 ENCIMERAS NO RECTANGULARES — EMITIR UNA PIEZA POR TRAMO (CRÍTICO PARA NESTING)**:
+Cuando la encimera NO es un simple rectángulo, emite **una pieza por cada tramo rectangular**, no una sola pieza sumada. El MGR da el total en m² pero NO refleja la forma — hay que leerla del **plano/plantilla**.
+
+**📏 COMO INTERPRETAR EL MGR EN ENCIMERAS EN L/U (MUY IMPORTANTE)**:
+Una línea MGR como `Encimera 4.415 × 0.620` para una cocina en L **NO significa "una pieza rectangular de 4415×620"**. Significa **"longitud total de encimera = 4415mm (sumando los tramos de la L) × fondo 620mm"**. El MGR no dibuja la forma, solo cobra metros lineales × fondo.
+
+**Si el plano muestra anotaciones manuscritas en paredes perpendiculares (ej: '3460' en pared norte, '955' o '600' en pared oeste)**, son los **tramos de la L**, NO son orientativos. Emite 2 encimeras, una por tramo:
+- Verifica: `tramo1_largo + tramo2_largo ≈ MGR.Longo` (puede haber diferencia por solape en la esquina = fondo).
+  Ej: MGR=4415, plano=3460+955 → 3460+955=4415 ✓
+  Ej: MGR=4415, plano=3460+600 → 3460+600=4060. Diferencia 355≈fondo/2. Aceptable.
+- Ambos tramos tienen `ancho_mm` = fondo del MGR (ej: 620), salvo que el plano indique otro fondo para algún tramo (ej: esquina con 280mm).
+- Usa `zona` distinta por tramo: "tramo principal", "tramo esquina", "pared norte", etc.
+
+**Regla dura**: si el plano muestra medidas en 2+ paredes perpendiculares, **NO es una encimera rectangular**, es al menos una L. Emite multi-tramo.
+
+**Solo emites 1 pieza rectangular** si:
+- El plano muestra claramente UNA sola pared con UNA medida larga.
+- O es una isla/península exenta.
+
+Casos típicos:
+- **Encimera en L**: 2 piezas, una por cada brazo. Ej: brazo largo 2500×620 + brazo corto 1400×620. Usa `zona` para distinguir ("tramo pared norte", "tramo pared oeste").
+- **Encimera en U**: 3 piezas, una por cada tramo.
+- **Entrante por pilar/columna**: si la pared tiene un pilar que hace que la encimera tenga un tramo más estrecho (ej: 280mm de fondo en vez de 620mm), emite ese tramo como pieza separada con el ancho real.
+- **Zona final más estrecha** (típica en esquinas con armarios de menor fondo): pieza separada con el ancho real (ej: final a 280mm).
+
+Cuando SÍ es una sola pieza:
+- Encimera puramente rectangular en una sola pared.
+- Isla/península exenta (una pieza única con su largo×ancho).
+
+**Verificación de áreas**: la suma de áreas de los tramos debe aproximarse al m² total del MGR (tolerancia ±5%). Si no cuadra, revisa las medidas. Si el MGR tiene 2.5m² y tus tramos suman 3.1m², has medido algo mal o hay solape.
+
+**Pistas en el plano**:
+- Medidas manuscritas en los extremos de cada pared (ej: "2.50", "1.90") indican tramos.
+- Cambios de fondo marcados (ej: "620" en tramo largo, "280" en tramo esquina).
+- Anotaciones como "L", "U", "pilar", "entrada de pilar", "armario corto".
+
 ### Frontal (= Chapeado = Chapeado Pared)
 **IMPORTANTE**: "Frontal", "chapeado" y "chapeado pared" son EXACTAMENTE el mismo tipo de pieza.
 Es el panel vertical pegado a la pared detrás de la encimera, entre la encimera y los muebles altos.
