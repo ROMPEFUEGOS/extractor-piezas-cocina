@@ -33,21 +33,33 @@ También puede ser isla o península independiente.
 **🔺 ENCIMERAS NO RECTANGULARES — EMITIR UNA PIEZA POR TRAMO (CRÍTICO PARA NESTING)**:
 Cuando la encimera NO es un simple rectángulo, emite **una pieza por cada tramo rectangular**, no una sola pieza sumada. El MGR da el total en m² pero NO refleja la forma — hay que leerla del **plano/plantilla**.
 
-**📏 COMO INTERPRETAR EL MGR EN ENCIMERAS EN L/U (MUY IMPORTANTE)**:
-Una línea MGR como `Encimera 4.415 × 0.620` para una cocina en L **NO significa "una pieza rectangular de 4415×620"**. Significa **"longitud total de encimera = 4415mm (sumando los tramos de la L) × fondo 620mm"**. El MGR no dibuja la forma, solo cobra metros lineales × fondo.
+**📏 COMO INTERPRETAR EL MGR — ES EL RECTÁNGULO DE MATERIAL CONSUMIDO, NO LA FORMA REAL**:
 
-**Si el plano muestra anotaciones manuscritas en paredes perpendiculares (ej: '3460' en pared norte, '955' o '600' en pared oeste)**, son los **tramos de la L**, NO son orientativos. Emite 2 encimeras, una por tramo:
-- Verifica: `tramo1_largo + tramo2_largo ≈ MGR.Longo` (puede haber diferencia por solape en la esquina = fondo).
-  Ej: MGR=4415, plano=3460+955 → 3460+955=4415 ✓
-  Ej: MGR=4415, plano=3460+600 → 3460+600=4060. Diferencia 355≈fondo/2. Aceptable.
-- Ambos tramos tienen `ancho_mm` = fondo del MGR (ej: 620), salvo que el plano indique otro fondo para algún tramo (ej: esquina con 280mm).
-- Usa `zona` distinta por tramo: "tramo principal", "tramo esquina", "pared norte", etc.
+El MGR `Encimera 4.415 × 0.620` representa **el rectángulo de material que se consume / se cobra**, incluyendo las zonas que se cortan y tiran (el hueco de una L, la esquina de una U, etc). Ejemplo: para hacer una L de 3460×620 + 955×280 se parte de un rectángulo 4415×620 y se tira la parte que no se usa — pero se cobra el rectángulo entero.
 
-**Regla dura**: si el plano muestra medidas en 2+ paredes perpendiculares, **NO es una encimera rectangular**, es al menos una L. Emite multi-tramo.
+**Consecuencia clave**: el MGR NO describe la forma real. **El plano/plantilla es la ÚNICA fuente de forma.**
 
-**Solo emites 1 pieza rectangular** si:
-- El plano muestra claramente UNA sola pared con UNA medida larga.
-- O es una isla/península exenta.
+**FUENTE DE VERDAD PARA FORMA = PLANO (planta 2D)**:
+- El **plano de planta 2D** (vista aérea, programa 2020) muestra las encimeras como polígonos reales con medidas por pared.
+- La **plantilla manuscrita** muestra los tramos con cotas anotadas a mano por pared/segmento.
+- Ambos superan al MGR en descripción de forma.
+
+**OBLIGACIÓN al procesar el plano**:
+1. Mira el plano con atención. Cuenta cuántas paredes/tramos tiene la encimera.
+2. Si la encimera rodea una esquina (L), si recorre 3 paredes (U), si tiene zona estrecha al final (entrada de armario menor fondo), si tiene entrante por un pilar → son FORMAS NO RECTANGULARES y requieren MÚLTIPLES piezas.
+3. **Cada tramo recto** del polígono real = 1 pieza. Ej: L → 2 piezas. U → 3 piezas. Rectángulo con final estrecho → 2 piezas.
+4. Las medidas en el plano son DEFINITIVAS. Si aparecen "3460" y "600" en paredes perpendiculares, son largo del tramo 1 y largo del tramo 2 — no son orientativas.
+5. El ancho de cada tramo también se lee del plano. Habitual 620mm, pero puede variar (ej: esquina a 280mm, zona estrecha final a 280mm).
+
+**Validación con MGR (pero NUNCA anular la forma del plano)**:
+- El área total de tus tramos debe ser ≤ área MGR (porque MGR incluye merma).
+- Puedes anotar en advertencias la diferencia como "cut-off de la L" o "material cortado en entrante".
+
+**Cuando emites 1 sola pieza**:
+- Solo si el plano muestra inequívocamente UNA pared rectangular única.
+- O es isla/península exenta rectangular.
+
+**REGLA IMPERATIVA**: ante duda entre "1 rectángulo" vs "2+ tramos", **SIEMPRE prefiere multi-tramo**. Es peor perder información de forma que sobrar.
 
 Casos típicos:
 - **Encimera en L**: 2 piezas, una por cada brazo. Ej: brazo largo 2500×620 + brazo corto 1400×620. Usa `zona` para distinguir ("tramo pared norte", "tramo pared oeste").
