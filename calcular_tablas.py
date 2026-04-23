@@ -532,7 +532,7 @@ def calcular_tablas(json_path: Path) -> dict:
         tablas = pack_piezas(piezas_dim, tabla_w, tabla_h, rotar)
         n_tablas = len(tablas)
 
-        # Construir info de layout
+        # Construir info de layout (con x/y para visualización)
         layout = []
         for idx, t in enumerate(tablas):
             piezas_en_tabla = []
@@ -540,11 +540,15 @@ def calcular_tablas(json_path: Path) -> dict:
                 for p in sh.piezas_colocadas:
                     piezas_en_tabla.append({
                         "label": p["label"],
+                        "x_mm": round(p["x"]),
+                        "y_mm": round(p["y"]),
                         "w_mm": round(p["w"]),
                         "h_mm": round(p["h"]),
                     })
             layout.append({
                 "tabla": idx + 1,
+                "ancho_mm": tabla_w,
+                "alto_mm": tabla_h,
                 "aprovechamiento_pct": round(t.aprovechamiento(), 1),
                 "area_usada_m2": round(t.area_usada() / 1e6, 3),
                 "piezas": piezas_en_tabla,
@@ -627,6 +631,94 @@ def guardar_resultado(resultado: dict, json_path: Path) -> tuple[Path, Path]:
     return json_out, txt_out
 
 
+def dibujar_layout_pdf(resultado: dict, pdf_path: Path) -> Path:
+    """Genera un PDF con una página por tabla mostrando el reparto de piezas."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    # Paleta por tipo de pieza (busca palabras clave en el label)
+    COLORES = {
+        "encimera": "#FFD966",   # amarillo cálido
+        "isla":     "#FFC080",   # naranja
+        "cascada":  "#FFA060",
+        "frontal":  "#9DC3E6",   # azul claro
+        "chapeado": "#9DC3E6",
+        "costado":  "#A9D18E",   # verde claro
+        "pilastra": "#C5E0B4",
+        "copete":   "#D5A6BD",   # rosa
+        "zocalo":   "#B4A7D6",   # lila
+        "rodapie":  "#B4A7D6",
+        "default":  "#CCCCCC",
+    }
+
+    def color_para(label: str) -> str:
+        low = label.lower()
+        for k, c in COLORES.items():
+            if k in low:
+                return c
+        return COLORES["default"]
+
+    with PdfPages(pdf_path) as pdf:
+        # Portada
+        fig, ax = plt.subplots(figsize=(11, 8.5))
+        ax.axis('off')
+        ax.text(0.5, 0.75, f"REPARTO EN TABLAS — {resultado['job_id']}",
+                fontsize=20, ha='center', fontweight='bold')
+        ax.text(0.5, 0.68, resultado.get('cliente', ''), fontsize=13, ha='center')
+        ax.text(0.5, 0.58, f"TOTAL TABLAS: {resultado['total_tablas']}",
+                fontsize=24, ha='center', color='#C00000', fontweight='bold')
+        # Resumen por material
+        y = 0.48
+        for mat, info in resultado["por_material"].items():
+            ax.text(0.1, y, f"• {mat}: {info['tablas_necesarias']} tablas "
+                            f"({info['piezas_totales']} piezas, "
+                            f"formato {info.get('formato_tabla_mm','?')} mm)",
+                    fontsize=11)
+            y -= 0.04
+        pdf.savefig(fig); plt.close(fig)
+
+        # Una página por cada tabla
+        for mat, info in resultado["por_material"].items():
+            tabla_w = info["layout"][0]["ancho_mm"] if info.get("layout") else 3000
+            tabla_h = info["layout"][0]["alto_mm"] if info.get("layout") else 1440
+            for t in info.get("layout", []):
+                fig, ax = plt.subplots(figsize=(14, max(6, tabla_h / tabla_w * 12)))
+                # Fondo de la tabla
+                ax.add_patch(Rectangle((0, 0), tabla_w, tabla_h,
+                                       facecolor='#F5F5F5', edgecolor='black', linewidth=2))
+                # Piezas
+                for p in t["piezas"]:
+                    x, y = p["x_mm"], p["y_mm"]
+                    w, h = p["w_mm"], p["h_mm"]
+                    ax.add_patch(Rectangle((x, y), w, h,
+                                           facecolor=color_para(p["label"]),
+                                           edgecolor='black', linewidth=1, alpha=0.9))
+                    # Etiqueta centrada
+                    etiq = f"{p['label']}\n{w}×{h}"
+                    # Ajustar fontsize al área
+                    area_rel = (w * h) / (tabla_w * tabla_h)
+                    fs = max(6, min(10, int(area_rel * 80) + 5))
+                    ax.text(x + w/2, y + h/2, etiq,
+                            fontsize=fs, ha='center', va='center', wrap=True)
+
+                ax.set_xlim(-100, tabla_w + 100)
+                ax.set_ylim(-100, tabla_h + 100)
+                ax.set_aspect('equal')
+                ax.set_title(
+                    f"{mat} — TABLA {t['tabla']}/{info['tablas_necesarias']}   "
+                    f"{tabla_w}×{tabla_h}mm   "
+                    f"Aprovechamiento: {t['aprovechamiento_pct']}%",
+                    fontsize=12)
+                ax.set_xlabel("mm")
+                ax.set_ylabel("mm")
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                pdf.savefig(fig); plt.close(fig)
+
+    return pdf_path
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -656,6 +748,12 @@ def main():
         j, t = guardar_resultado(resultado, json_path)
         print(f"\nGuardado: {j.name}")
         print(f"Guardado: {t.name}")
+
+    if "--pdf" in sys.argv or "--guardar" in sys.argv:
+        stem = json_path.stem.replace("_extraccion", "")
+        pdf_out = json_path.parent / f"{stem}_tablas.pdf"
+        dibujar_layout_pdf(resultado, pdf_out)
+        print(f"Guardado: {pdf_out.name}")
 
 
 if __name__ == "__main__":
