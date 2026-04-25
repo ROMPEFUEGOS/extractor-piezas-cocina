@@ -75,6 +75,29 @@ El MGR `Encimera 4.415 × 0.620` representa **el rectángulo de material que se 
 
 **REGLA IMPERATIVA**: ante duda entre "1 rectángulo" vs "2+ tramos", **SIEMPRE prefiere multi-tramo**. Es peor perder información de forma que sobrar.
 
+**🎯 PROPÓSITO DEL OUTPUT — IMPORTANTE para tomar decisiones**:
+Tu output NO se usa para hacer presupuestos (los presupuestos ya están hechos por el MGR humano). Tu output se usa para **NESTING**: calcular cuántas tablas hay que comprar y cómo se reparten las piezas. Para que el nesting funcione necesitamos las piezas REALES, no el rectángulo bounding del MGR.
+
+**REGLA DE COHERENCIA INTERNA — VERIFICACIÓN FINAL OBLIGATORIA**:
+Antes de emitir el JSON final, RE-LEE tus propias notas y advertencias. Si en cualquier punto dices "la forma es en L/U", "el plano muestra forma en L", "según plano hay península/barra", "hay tramos en paredes perpendiculares", "multi-tramo recomendado", "forma no rectangular", "TRASETA"/"TRASENA"/anotaciones de tramos, o cualquier otra observación que reconozca forma NO rectangular → **OBLIGATORIO** emitir multi-tramo.
+
+**NO es válido**:
+- ❌ Notas: "es L según plano" + emitir 1 rectángulo
+- ❌ Notas: "Geometría exacta de tramos no confirmada sin plano CAD preciso" + emitir 1 rectángulo
+- ❌ Notas: "Idealmente debería emitirse como N tramos separados pero las cotas exactas..." + emitir 1 rectángulo
+- ❌ Notas: "Sin cotas explícitas de cada brazo en el plano, se emite como pieza única" + emitir 1 rectángulo
+
+**SÍ es válido**:
+- ✓ Notas: "forma en L. Tramo largo y corto estimados proporcionalmente del dibujo (60%/40% del MGR total)" + emitir 2 piezas
+- ✓ Notas: "tramo norte y oeste leídos del plano: 287cm + 106cm" + emitir 2 piezas
+
+**Si no tienes cotas exactas**, ESTIMA por proporción del dibujo. Es preferible 2 tramos estimados (60/40 o 50/50) que 1 rectángulo monolítico que rompe el nesting. NUNCA escribas "ideal sería multi-tramo pero emito 1" — eso es inválido.
+
+Cuando emites multi-tramo y no hay cotas claras de cada tramo, usa estas reglas para estimar:
+- En L: si MGR dice "Longo 4415×0.620" y ves L en el plano, divide 4415 en 2 tramos: estima el largo de cada brazo proporcionalmente al dibujo (ej: 60% pared larga + 40% pared corta = 2650 + 1765).
+- En U: 3 tramos. Estima el del medio según dibujo (suele ser el más corto, que es la "panza" del U).
+- Anota `notas` que las medidas son ESTIMADAS por proporción del plano cuando no hay cota explícita.
+
 Casos típicos:
 - **Encimera en L**: 2 piezas, una por cada brazo. Ej: brazo largo 2500×620 + brazo corto 1400×620. Usa `zona` para distinguir ("tramo pared norte", "tramo pared oeste").
 - **Encimera en U**: 3 piezas, una por cada tramo.
