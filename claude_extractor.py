@@ -33,6 +33,20 @@ También puede ser isla o península independiente.
 **🔺 ENCIMERAS NO RECTANGULARES — EMITIR UNA PIEZA POR TRAMO (CRÍTICO PARA NESTING)**:
 Cuando la encimera NO es un simple rectángulo, emite **una pieza por cada tramo rectangular**, no una sola pieza sumada. El MGR da el total en m² pero NO refleja la forma — hay que leerla del **plano/plantilla**.
 
+**🏛 PILARES Y COLUMNAS — IMPORTANTE para piezas pequeñas**:
+Cuando hay un **pilar/columna** en la pared, la encimera lo rodea por sus caras vistas. Esto genera piezas adicionales pequeñas:
+- **Si el pilar SOBRESALE de la pared hacia la cocina**, la encimera tiene 2 tramos (uno antes del pilar, otro después). Cada uno es 1 pieza.
+- **Si el pilar es exento (en el medio del espacio) y la encimera lo rodea**, hay 4 tramos: 2 a los lados (largos) + 2 frontales del pilar (cortos, ~150-300mm). Cada uno = pieza.
+- **Si la pared tiene un saliente/entrada de pilar**, la encimera tiene un escalón: 2 tramos rectos + 1 corto que cierra el escalón (~150-300mm × fondo).
+- Los **lados del pilar** suelen ser piezas estrechas: típicamente 150-300mm de largo × 600mm de fondo.
+- Los **frentes del pilar** suelen ser piezas: típicamente 600mm de largo × 150-300mm de fondo.
+
+NO sumes los tramos del pilar en la encimera principal. Cada cara visible del pilar que lleve encimera = 1 pieza separada con `zona`: "lateral pilar izq", "lateral pilar dch", "frente pilar", etc.
+
+**🔻 ZONAS ESTRECHAS / ESCALONES / ENTRADAS DE ARMARIO**:
+- Si en el plano se ve que la encimera tiene una **zona final más estrecha** (ej: el fondo cambia de 620mm a 280mm en el último tramo, típicamente porque el armario es más fino), emítela como **pieza separada** con su ancho real.
+- Lo mismo si hay una **zona intermedia más ancha o más estrecha**: cada cambio de fondo = nueva pieza.
+
 **📏 COMO INTERPRETAR EL MGR — ES EL RECTÁNGULO DE MATERIAL CONSUMIDO, NO LA FORMA REAL**:
 
 El MGR `Encimera 4.415 × 0.620` representa **el rectángulo de material que se consume / se cobra**, incluyendo las zonas que se cortan y tiran (el hueco de una L, la esquina de una U, etc). Ejemplo: para hacer una L de 3460×620 + 955×280 se parte de un rectángulo 4415×620 y se tira la parte que no se usa — pero se cobra el rectángulo entero.
@@ -639,9 +653,14 @@ def extract_trabajo(
     api_key: Optional[str] = None,
     model: str = "claude-sonnet-4-6",
     verbose: bool = True,
+    auto_clasificar: bool = True,
 ) -> TrabajoExtraido:
     """
     Función principal: dado un Path de carpeta, extrae todos los datos.
+
+    Si `auto_clasificar=True` y no existe `clasificacion.json`, lanza el
+    clasificador previamente para que el extractor reciba etiquetas
+    de tipo de contenido por archivo/página (mejora extracción de forma).
     """
     if verbose:
         print(f"\n[Procesando] {folder.name}")
@@ -649,8 +668,35 @@ def extract_trabajo(
     # Info básica del nombre de la carpeta
     folder_info = parse_folder_name(folder.name)
 
+    # Cargar / generar clasificación de fuentes
+    clasif_path = folder / "clasificacion.json"
+    clasificacion = None
+    if auto_clasificar and not clasif_path.exists():
+        if verbose:
+            print(f"  [pre-step] Clasificando fuentes (no existe clasificacion.json)...")
+        try:
+            from clasificador import clasificar_proyecto
+            clave = api_key or os.environ.get("ANTHROPIC_API_KEY")
+            if clave:
+                clasificacion = clasificar_proyecto(folder, clave, verbose=verbose)
+                clasif_path.write_text(
+                    json.dumps(clasificacion, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+        except Exception as e:
+            if verbose:
+                print(f"  [!] Clasificación falló (continuando sin ella): {e}")
+            clasificacion = None
+    elif clasif_path.exists():
+        try:
+            clasificacion = json.loads(clasif_path.read_text(encoding="utf-8"))
+            if verbose:
+                print(f"  [pre-step] clasificacion.json cargado")
+        except Exception:
+            clasificacion = None
+
     # Construir contenido para Claude
-    content, archivos = build_claude_content(folder, verbose=verbose)
+    content, archivos = build_claude_content(folder, verbose=verbose,
+                                              clasificacion=clasificacion)
 
     if len(content) <= 1:
         # Solo hay el texto de contexto, no hay archivos útiles

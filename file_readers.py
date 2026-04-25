@@ -277,26 +277,64 @@ def collect_files(folder: Path, max_pdfs: int = 5) -> dict:
     return files
 
 
-def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5) -> tuple[list, list[str]]:
+def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
+                          clasificacion: Optional[dict] = None) -> tuple[list, list[str]]:
     """
     Construye el contenido para enviar a Claude (lista de bloques de contenido).
     Devuelve (content_blocks, archivos_procesados).
+
+    Si se pasa `clasificacion` (output de clasificador.py), cada imagen/página
+    lleva una etiqueta [TIPO: <categoria>] para que Claude sepa qué tipo de
+    contenido tiene y pueda enrutarlo correctamente:
+      - forma → solo plano-*
+      - cantidades/precios → MGR-tabla
+      - huecos/material → plantilla-texto
+      - perspectiva-3D → solo contexto, NO cotas
     """
     files = collect_files(folder, max_pdfs=max_pdfs)
     content = []
     archivos = []
+    clasif = clasificacion.get("archivos", {}) if clasificacion else {}
+
+    def _tag(filename: str, pagina: Optional[int] = None) -> str:
+        """Devuelve etiqueta [TIPO: ...] si tenemos clasificación del archivo/página."""
+        info = clasif.get(filename)
+        if not info or "error" in info:
+            return ""
+        if pagina is not None and "paginas" in info:
+            for p in info["paginas"]:
+                if p.get("pagina") == pagina:
+                    cat = p.get("categoria", "?")
+                    cotas = ", ".join(p.get("cotas_visibles_mm", [])[:8])
+                    cotas_s = f" cotas:[{cotas}]" if cotas else ""
+                    return f"[TIPO:{cat}{cotas_s}]"
+        elif "categoria" in info:
+            cat = info.get("categoria", "?")
+            return f"[TIPO:{cat}]"
+        return ""
 
     segundas = [p for p, lbl in files['pdfs'] if lbl != 'Primeras']
     if verbose:
         omit_info = f", PDFs omitidos: {len(files['pdfs_omitidos'])}" if files['pdfs_omitidos'] else ""
         sub_info = f", Subcarpetas: {[s.name for s in files['subfolders']]}" if files['subfolders'] else ""
         seg_info = f", PDFs revisados (Segundas/Terceras): {len(segundas)}" if segundas else ""
+        clasif_info = f", clasificado: ✓" if clasif else ""
         print(f"  Imágenes: {len(files['images'])}, PDFs: {len(files['pdfs'])}, "
               f"Excels: {len(files['excels'])}, TXTs: {len(files['txts'])}"
-              f"{omit_info}{sub_info}{seg_info}")
+              f"{omit_info}{sub_info}{seg_info}{clasif_info}")
 
     # 1. Texto inicial de contexto
     ctx = f"Carpeta de trabajo: {folder.name}\n\nA continuación tienes los archivos del trabajo:"
+    if clasif:
+        ctx += ("\n\n📋 CLASIFICACIÓN DE FUENTES (úsala para enrutar tu atención):\n"
+                "  • Cada imagen/página viene con una etiqueta [TIPO:xxx].\n"
+                "  • Para FORMA y geometría de piezas: usa SOLO 'plano-planta-2D-cad', 'plano-anotado' y 'plano-manuscrito'.\n"
+                "  • Para PRECIOS, CANTIDADES TOTALES, m² facturados: usa SOLO 'MGR-tabla'.\n"
+                "  • Para HUECOS, MATERIAL, MARCA, COLOR, GROSOR: usa 'plantilla-texto'.\n"
+                "  • 'perspectiva-3D' y 'foto-cocina': solo contexto. NO tomes cotas de ahí.\n"
+                "  • 'whatsapp-plantilla': trátala como plantilla manuscrita o foto según calidad.\n"
+                "  • 'otro': ignorar.\n"
+                "  • Si extraes una cota de la imagen, indica de qué [TIPO] vino.")
     if files['pdfs_omitidos']:
         ctx += f"\n\nNOTA: Por límite de contexto se han omitido {len(files['pdfs_omitidos'])} PDFs menos prioritarios: "
         ctx += ", ".join(f.name for f, _ in files['pdfs_omitidos'])
@@ -372,6 +410,10 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5) 
                             })
                     else:
                         data, media_type = page_data[0], page_data[1]
+                    tag = _tag(pdf_path.name, pagina=i+1)
+                    if tag:
+                        content.append({"type": "text",
+                                         "text": f"[Página {i+1} de '{pdf_path.name}'] {tag}"})
                     content.append({
                         "type": "image",
                         "source": {
@@ -386,9 +428,10 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5) 
     for img_path in files['images']:
         try:
             data, media_type = image_to_base64(img_path)
+            tag = _tag(img_path.name)
             content.append({
                 "type": "text",
-                "text": f"\n--- IMAGEN: {img_path.name} ---"
+                "text": f"\n--- IMAGEN: {img_path.name} --- {tag}"
             })
             content.append({
                 "type": "image",
