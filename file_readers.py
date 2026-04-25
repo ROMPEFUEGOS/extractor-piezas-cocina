@@ -27,9 +27,10 @@ def should_ignore(path: Path) -> bool:
     return False
 
 
-def image_to_base64(path: Path, max_bytes: int = 4_500_000) -> tuple[str, str]:
+def image_to_base64(path: Path, max_bytes: int = 3_500_000) -> tuple[str, str]:
     """Devuelve (base64_data, media_type). Redimensiona/comprime si excede max_bytes.
-    Límite API Claude es 5MB por imagen; dejamos margen en 4.5MB."""
+    Límite API Claude es 5MB en BASE64; base64 infla ~33%, así que un archivo
+    de 3.5MB binario ≈ 4.7MB base64. Margen seguro."""
     ext = path.suffix.lower()
     media_map = {
         '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
