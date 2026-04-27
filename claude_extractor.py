@@ -43,9 +43,21 @@ Cuando hay un **pilar/columna** en la pared, la encimera lo rodea por sus caras 
 
 NO sumes los tramos del pilar en la encimera principal. Cada cara visible del pilar que lleve encimera = 1 pieza separada con `zona`: "lateral pilar izq", "lateral pilar dch", "frente pilar", etc.
 
-**🔻 ZONAS ESTRECHAS / ESCALONES / ENTRADAS DE ARMARIO**:
-- Si en el plano se ve que la encimera tiene una **zona final más estrecha** (ej: el fondo cambia de 620mm a 280mm en el último tramo, típicamente porque el armario es más fino), emítela como **pieza separada** con su ancho real.
-- Lo mismo si hay una **zona intermedia más ancha o más estrecha**: cada cambio de fondo = nueva pieza.
+**🔻 ZONAS ESTRECHAS / ESCALONES / ENTRADAS DE ARMARIO — DETECCIÓN OBLIGATORIA**:
+
+**Regla**: cada vez que el FONDO de la encimera cambia (de 620 a 280, de 620 a 400, etc), eso es un tramo nuevo. Cada combinación distinta de (fondo, largo) = pieza separada.
+
+**Cómo detectarlo en el plano**:
+- Si en el plano ves cotas como "280", "300", "350", "400", "450" cerca del borde de la encimera (especialmente en extremos o esquinas), son **fondos reducidos**. NO son orientativos. Son medidas reales del armario.
+- Si ves dos cotas juntas como "620" y "280" en zonas distintas del mismo tramo → la encimera tiene 2 sub-tramos con fondos distintos.
+- Cualquier cota menor que el fondo estándar 620mm que aparezca **transversalmente** (perpendicular al largo) en el plano = fondo reducido.
+
+**Patrones típicos**:
+- Encimera larga 4000mm con armario al final más estrecho: emite pieza1 (3500×620) + pieza2 (500×280).
+- Cocina en L con esquina de armario reducido: encimera_principal + encimera_esquina con fondo distinto.
+- Barra/península con vuelo: la barra suele tener fondo mayor (700-900mm) que la encimera estándar.
+
+**Nunca asumas fondo uniforme 620mm para toda la encimera** si el plano muestra cotas distintas. SUMA de todos los tramos × fondo correspondiente debe aproximar el m² del MGR.
 
 **📏 COMO INTERPRETAR EL MGR — ES EL RECTÁNGULO DE MATERIAL CONSUMIDO, NO LA FORMA REAL**:
 

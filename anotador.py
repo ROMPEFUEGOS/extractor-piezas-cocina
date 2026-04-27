@@ -92,19 +92,17 @@ def listar_paginas(folder: Path) -> list[dict]:
     for archivo in sorted(folder.iterdir()):
         if archivo.is_file() and archivo.suffix.lower() == ".pdf":
             try:
-                from pdf2image import convert_from_path  # noqa
-                # Solo contamos páginas (rapida)
                 import pypdf
                 reader = pypdf.PdfReader(str(archivo))
                 n_paginas = len(reader.pages)
             except Exception:
-                # Fallback: pdf2image
+                # Fallback: render barato a 72dpi para contar
                 try:
-                    pages = pdf_pages_to_base64(archivo, dpi=72, max_pages=20)
+                    pages = pdf_pages_to_base64(archivo, dpi=72, max_pages=30)
                     n_paginas = len(pages)
                 except Exception:
                     n_paginas = 0
-            for i in range(1, min(n_paginas, 20) + 1):
+            for i in range(1, min(n_paginas, 30) + 1):
                 paginas.append({
                     "id": f"pdf::{archivo.name}::{i}",
                     "fuente": archivo.name,
@@ -113,6 +111,25 @@ def listar_paginas(folder: Path) -> list[dict]:
                     "total_paginas": n_paginas,
                 })
     return paginas
+
+
+# Caché in-memory de páginas PDF renderizadas: { (path, mtime): [(bytes, mt), ...] }
+_PDF_CACHE: dict = {}
+
+
+def _pdf_pages_cached(archivo: Path, dpi: int = 140, max_pages: int = 30) -> list:
+    """Caché LRU simple por (path, mtime). Evita re-renderizar PDFs en navegación."""
+    key = (str(archivo.resolve()), archivo.stat().st_mtime)
+    if key in _PDF_CACHE:
+        return _PDF_CACHE[key]
+    pages = pdf_pages_to_base64(archivo, dpi=dpi, max_pages=max_pages)
+    # Convertir b64→bytes para no reencodear constantemente
+    decoded = [(base64.b64decode(p[0]), p[1]) for p in pages]
+    # Evitar memoria desbordada — limitar a 8 PDFs en caché
+    if len(_PDF_CACHE) > 8:
+        _PDF_CACHE.pop(next(iter(_PDF_CACHE)))
+    _PDF_CACHE[key] = decoded
+    return decoded
 
 
 def render_pagina(folder: Path, pagina_id: str) -> tuple[bytes, str]:
@@ -136,11 +153,11 @@ def render_pagina(folder: Path, pagina_id: str) -> tuple[bytes, str]:
         nombre, pag_str = rest.rsplit("::", 1)
         pagina_num = int(pag_str)
         archivo = folder / nombre
-        # Renderizar la página específica con dpi razonable
-        pages = pdf_pages_to_base64(archivo, dpi=140, max_pages=20)
+        if not archivo.exists():
+            raise FileNotFoundError(f"PDF no existe: {archivo}")
+        pages = _pdf_pages_cached(archivo, dpi=140, max_pages=30)
         if pagina_num <= len(pages):
-            data_b64, mt = pages[pagina_num - 1][0], pages[pagina_num - 1][1]
-            return base64.b64decode(data_b64), mt
+            return pages[pagina_num - 1]
     raise ValueError(f"Página inválida: {pagina_id}")
 
 
@@ -179,11 +196,28 @@ def index():
     return render_template_string(INDEX_HTML, proyectos=proyectos)
 
 
+def _es_ruta_segura(folder: Path) -> bool:
+    """Verifica que la carpeta esté dentro de uno de los ROOTS configurados."""
+    try:
+        f_abs = folder.resolve()
+        for r in ROOTS:
+            try:
+                f_abs.relative_to(r.resolve())
+                return True
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 @app.route("/proyecto/<path:ruta>")
 def proyecto(ruta):
     folder = Path("/" + ruta)
     if not folder.exists() or not folder.is_dir():
         return "Proyecto no existe", 404
+    if not _es_ruta_segura(folder):
+        return "Ruta no permitida (debe estar bajo un root configurado)", 403
     paginas = listar_paginas(folder)
     anot = cargar_anotaciones(folder)
     # Marcar cuáles ya están anotadas
@@ -200,6 +234,8 @@ def api_pagina_img():
     ruta = request.args.get("ruta")
     pagina_id = request.args.get("id")
     folder = Path(ruta)
+    if not _es_ruta_segura(folder):
+        return "Ruta no permitida", 403
     data, mt = render_pagina(folder, pagina_id)
     return send_file(io.BytesIO(data), mimetype=mt)
 
@@ -208,6 +244,8 @@ def api_pagina_img():
 def api_guardar_pagina():
     body = request.get_json()
     folder = Path(body["ruta"])
+    if not _es_ruta_segura(folder):
+        return jsonify({"ok": False, "error": "Ruta no permitida"}), 403
     pagina_id = body["pagina_id"]
     overlay_b64 = body.get("overlay_png_b64", "")  # canvas overlay (transparent)
     etiquetas = body.get("etiquetas", [])  # lista de {x,y,color,tipo,texto}
@@ -253,6 +291,8 @@ def api_guardar_pagina():
 def api_notas_globales():
     body = request.get_json()
     folder = Path(body["ruta"])
+    if not _es_ruta_segura(folder):
+        return jsonify({"ok": False, "error": "Ruta no permitida"}), 403
     notas = body.get("notas", [])
     anot = cargar_anotaciones(folder)
     anot["notas_globales"] = [n for n in notas if n.strip()]
