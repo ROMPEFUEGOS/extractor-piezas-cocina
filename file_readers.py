@@ -290,11 +290,47 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
       - cantidades/precios → MGR-tabla
       - huecos/material → plantilla-texto
       - perspectiva-3D → solo contexto, NO cotas
+
+    Si existe `anotaciones.json` en la carpeta del proyecto:
+      - Las páginas anotadas se sustituyen por su imagen anotada (con
+        overlay de rotulador del operador)
+      - Se inserta un bloque de notas globales y leyenda de colores
+        antes del contenido
     """
     files = collect_files(folder, max_pdfs=max_pdfs)
     content = []
     archivos = []
     clasif = clasificacion.get("archivos", {}) if clasificacion else {}
+
+    # Cargar anotaciones manuales si existen
+    anot_path = folder / "anotaciones.json"
+    anotaciones = {}
+    paginas_anot_dir = folder / "anotaciones"
+    if anot_path.exists():
+        try:
+            import json as _json
+            anotaciones = _json.loads(anot_path.read_text(encoding="utf-8"))
+        except Exception:
+            anotaciones = {}
+
+    def _safe_pagina_filename(pid: str) -> str:
+        return re.sub(r"[^A-Za-z0-9._-]", "_", pid) + ".png"
+
+    def _imagen_anotada_b64(pagina_id: str) -> Optional[tuple[str, str]]:
+        """Si la página tiene anotación manual, devuelve (b64, media_type) de
+        la imagen anotada (composite). Si no, None."""
+        info = (anotaciones.get("paginas_anotadas") or {}).get(pagina_id)
+        if not info or not info.get("tiene_trazos"):
+            return None
+        fname = _safe_pagina_filename(pagina_id)
+        path = paginas_anot_dir / fname
+        if not path.exists():
+            return None
+        try:
+            data, mt = image_to_base64(path)
+            return data, mt
+        except Exception:
+            return None
 
     def _tag(filename: str, pagina: Optional[int] = None) -> str:
         """Devuelve etiqueta [TIPO: ...] si tenemos clasificación del archivo/página."""
@@ -342,6 +378,38 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
         ctx += f"\n\nNOTA: Esta carpeta tiene subcarpetas con versiones adicionales: "
         ctx += ", ".join(s.name for s in files['subfolders'])
         ctx += ". Procesa los archivos de la carpeta raíz como la versión más definitiva."
+
+    # Anotaciones manuales: notas globales + leyenda de colores
+    if anotaciones:
+        notas = anotaciones.get("notas_globales") or []
+        n_anotadas = sum(1 for v in (anotaciones.get("paginas_anotadas") or {}).values()
+                         if v.get("tiene_trazos"))
+        if notas or n_anotadas:
+            ctx += "\n\n🖍 ANOTACIONES MANUALES DEL OPERADOR (autoritativas):"
+            if n_anotadas:
+                ctx += (f"\nHay {n_anotadas} página(s) con TRAZOS DE ROTULADOR del operador "
+                        f"sobre el plano original. Las verás como áreas coloreadas "
+                        f"semi-transparentes encima de la imagen. Significa:\n"
+                        f"  🟡 amarillo  = encimera/isla\n"
+                        f"  🔵 azul      = frontal/chapeado\n"
+                        f"  🟣 lila      = zócalo/rodapié\n"
+                        f"  🟠 naranja   = copete\n"
+                        f"  🟢 verde     = costado/cascada\n"
+                        f"  🟫 marrón    = pilar\n"
+                        f"  🔴 rojo      = hueco (placa/fregadero/grifo/enchufe)\n"
+                        f"\nPRIORIDAD: las áreas marcadas indican QUÉ ES cada zona física. "
+                        f"Las cotas pueden estar en otra página del mismo proyecto — cruza la "
+                        f"información: el área marcada en perspectiva 3D corresponde a la pieza "
+                        f"con esas cotas en la planta 2D.\n"
+                        f"Si el operador marca varias áreas separadas del mismo color en una "
+                        f"encimera, son TRAMOS DISTINTOS — emite cada uno como pieza separada.")
+            if notas:
+                ctx += "\n\nNotas globales del proyecto (texto del operador):"
+                for n in notas:
+                    ctx += f"\n  • {n}"
+                ctx += ("\nEstas notas son AUTORITATIVAS. Si dicen 'cascada al suelo' emite una "
+                        "pieza costado de la altura indicada. Si dicen 'pilar atrás' emite las "
+                        "piezas alrededor del pilar. No las ignores.")
     content.append({"type": "text", "text": ctx})
 
     # 2. TXTs
@@ -410,10 +478,18 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
                             })
                     else:
                         data, media_type = page_data[0], page_data[1]
+                    # Si la página tiene anotación manual, usar la imagen anotada
+                    pagina_id = f"pdf::{pdf_path.name}::{i+1}"
+                    anotada = _imagen_anotada_b64(pagina_id)
+                    if anotada:
+                        data, media_type = anotada
+                        tag_extra = " 🖍 CON ANOTACIÓN MANUAL DEL OPERADOR"
+                    else:
+                        tag_extra = ""
                     tag = _tag(pdf_path.name, pagina=i+1)
-                    if tag:
+                    if tag or tag_extra:
                         content.append({"type": "text",
-                                         "text": f"[Página {i+1} de '{pdf_path.name}'] {tag}"})
+                                         "text": f"[Página {i+1} de '{pdf_path.name}'] {tag}{tag_extra}"})
                     content.append({
                         "type": "image",
                         "source": {
@@ -428,10 +504,18 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
     for img_path in files['images']:
         try:
             data, media_type = image_to_base64(img_path)
+            # Si la imagen tiene anotación manual, sustituir
+            pagina_id = f"img::{img_path.name}"
+            anotada = _imagen_anotada_b64(pagina_id)
+            if anotada:
+                data, media_type = anotada
+                tag_extra = " 🖍 CON ANOTACIÓN MANUAL DEL OPERADOR"
+            else:
+                tag_extra = ""
             tag = _tag(img_path.name)
             content.append({
                 "type": "text",
-                "text": f"\n--- IMAGEN: {img_path.name} --- {tag}"
+                "text": f"\n--- IMAGEN: {img_path.name} --- {tag}{tag_extra}"
             })
             content.append({
                 "type": "image",
