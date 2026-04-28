@@ -37,6 +37,14 @@ from file_readers import IMG_EXTENSIONS, pdf_pages_to_base64, image_to_base64
 
 app = Flask(__name__)
 
+
+@app.after_request
+def no_cache(response):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 # Roots por defecto: las 3 carpetas conocidas
 ROOTS = [
     Path("/home/kecojones/Documents/ProgramaDeAcotacionesDXF/Cocimoble2025"),
@@ -378,12 +386,17 @@ header .nav-info { font-size: 13px; color: #aaa; }
 .section { padding: 12px 16px; border-bottom: 1px solid #333; }
 .section h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
               color: #888; font-weight: 600; }
-.paleta { display: flex; flex-wrap: wrap; gap: 4px; }
-.color-btn { width: 32px; height: 32px; border: 2px solid #555; border-radius: 4px;
-              cursor: pointer; position: relative; }
-.color-btn.active { border-color: #fff; transform: scale(1.1); }
-.color-btn .key { position: absolute; bottom: -2px; right: -2px; font-size: 9px;
-                   background: #000; color: #fff; padding: 0 3px; border-radius: 2px; }
+.paleta { display: flex; flex-direction: column; gap: 3px; }
+.color-btn { display: flex; align-items: center; gap: 8px;
+              padding: 4px 8px; border: 2px solid transparent; border-radius: 4px;
+              cursor: pointer; background: #2a2a2a; }
+.color-btn:hover { background: #333; }
+.color-btn.active { border-color: #fff; background: #3a3a3a; }
+.color-btn .swatch { width: 22px; height: 22px; border-radius: 3px; flex-shrink: 0;
+                      box-shadow: inset 0 0 0 1px rgba(0,0,0,0.3); }
+.color-btn .lbl { flex: 1; font-size: 12px; color: #ddd; }
+.color-btn .key { font-size: 10px; background: #000; color: #fff;
+                   padding: 1px 5px; border-radius: 2px; font-family: monospace; }
 .tool-btn { padding: 6px 10px; background: #333; color: #eee; border: 1px solid #555;
              border-radius: 3px; cursor: pointer; font-size: 12px; margin-right: 4px; }
 .tool-btn.active { background: #4a90e2; border-color: #4a90e2; }
@@ -437,7 +450,9 @@ textarea { width: 100%; background: #2a2a2a; color: #eee; border: 1px solid #555
       <h3>Color (rotulador)</h3>
       <div class="paleta">
         {% for c in paleta %}
-        <div class="color-btn" style="background:{{ c.color }}" data-tipo="{{ c.id }}" title="{{ c.label }} (tecla {{ c.tecla }})">
+        <div class="color-btn" data-tipo="{{ c.id }}" title="{{ c.label }} (tecla {{ c.tecla }})">
+          <div class="swatch" style="background:{{ c.color }}"></div>
+          <span class="lbl">{{ c.label }}</span>
           <span class="key">{{ c.tecla }}</span>
         </div>
         {% endfor %}
@@ -465,6 +480,9 @@ Otra nota..."></textarea>
       <kbd>Cmd+Z</kbd> deshacer · <kbd>←/→</kbd> ant/sig<br>
       <kbd>Espacio</kbd> guardar+sig · <kbd>Backspace</kbd> limpiar
     </div>
+    <div class="section" style="font-family:monospace;font-size:10px;color:#888;">
+      <span id="debugPanel">capas: 0 · trazos: 0</span>
+    </div>
     <div class="nav-controls">
       <button class="btn btn-skip" id="btnSkip">Saltar →</button>
       <button class="btn btn-save" id="btnSave">Guardar y →</button>
@@ -478,8 +496,9 @@ const PAGINAS = {{ paginas|tojson }};
 const PALETA = {{ paleta|tojson }};
 const ANOT = {{ anot|tojson }};
 
+// === Estado global ===
 let idxActual = 0;
-let trazos = [];      // historial para deshacer: [{tipo:'pen'|'erase', puntos:[[x,y]...], color, grosor}]
+let trazos = [];           // historial: [{tipo:'pen'|'erase', tipo_pieza, color, grosor, puntos:[[x,y]]}]
 let trazoActual = null;
 let dibujando = false;
 let tipoActual = "encimera";
@@ -489,30 +508,127 @@ let grosor = 22;
 
 const img = document.getElementById('imgPagina');
 const canvas = document.getElementById('canvasOverlay');
-const ctx = canvas.getContext('2d');
+const ctx = canvas.getContext('2d', { willReadFrequently: false });
 
-function dibujarTrazo(tr) {
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  ctx.lineWidth = tr.grosor;
-  if (tr.tipo === 'pen') {
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.strokeStyle = tr.color + '5A';   // alpha ~0.35 (5A hex)
-  } else {
-    ctx.globalCompositeOperation = 'destination-out';
-    ctx.strokeStyle = 'rgba(0,0,0,1)';
+// === Capas: un offscreen canvas opaco por cada tipo de pieza ===
+// Razón: el documento original puede tener colores propios (rojos en planos,
+// líneas azules CAD, etc.). Si pintamos con alpha sobre el documento,
+// los colores del operador y del documento se mezclan y Claude no distingue
+// quién pintó qué. Solución: cada color del operador en su propia capa.
+// La VISIBLE queda como composite final con alpha fijo, sin acumulación.
+const ALPHA = 0.55;
+const capas = Object.create(null);   // { tipo: HTMLCanvasElement }
+
+function inicCapas() {
+  for (const k of Object.keys(capas)) delete capas[k];
+  for (const p of PALETA) {
+    const c = document.createElement('canvas');
+    c.width = canvas.width;
+    c.height = canvas.height;
+    // Forzar contexto inmediatamente con willReadFrequently=true para que getImageData
+    // y operaciones internas usen backing store en CPU (evita bugs sync GPU).
+    c.getContext('2d', { willReadFrequently: true });
+    capas[p.id] = c;
   }
-  ctx.beginPath();
+  actualizarDebug();
+}
+
+function ctxDe(tipo) {
+  if (!capas[tipo]) return null;
+  return capas[tipo].getContext('2d', { willReadFrequently: true });
+}
+
+const _cuentaPaint = {};
+function pintarSegmentoEnCapa(tipo_pieza, color, p1, p2, ancho) {
+  const cap = capas[tipo_pieza];
+  if (!cap) { console.error('NO CAPA:', tipo_pieza); return; }
+  if (cap.width === 0 || cap.height === 0) { console.error('CAPA 0x0:', tipo_pieza); return; }
+  // Usar SIEMPRE las mismas options para que el browser devuelva el mismo contexto cacheado
+  const c = cap.getContext('2d', { willReadFrequently: true });
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  c.lineWidth = ancho;
+  c.globalCompositeOperation = 'source-over';
+  c.globalAlpha = 1;       // por si algo lo dejó en otro valor
+  c.strokeStyle = color;
+  c.beginPath();
+  c.moveTo(p1[0], p1[1]);
+  c.lineTo(p2[0], p2[1]);
+  c.stroke();
+  _cuentaPaint[tipo_pieza] = (_cuentaPaint[tipo_pieza] || 0) + 1;
+}
+
+function pintarTrazoEnCapa(tr) {
+  if (tr.tipo === 'erase') {
+    // Borrador: borra de TODAS las capas
+    for (const id of Object.keys(capas)) {
+      const c = capas[id].getContext('2d', { willReadFrequently: true });
+      c.lineCap = 'round'; c.lineJoin = 'round';
+      c.lineWidth = tr.grosor;
+      c.globalCompositeOperation = 'destination-out';
+      c.strokeStyle = 'rgba(0,0,0,1)';
+      c.beginPath();
+      for (let i = 0; i < tr.puntos.length; i++) {
+        const [x, y] = tr.puntos[i];
+        if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+      }
+      c.stroke();
+    }
+    return;
+  }
+  const c = ctxDe(tr.tipo_pieza);
+  if (!c) return;
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  c.lineWidth = tr.grosor;
+  c.globalCompositeOperation = 'source-over';
+  c.strokeStyle = tr.color;
+  c.beginPath();
   for (let i = 0; i < tr.puntos.length; i++) {
     const [x, y] = tr.puntos[i];
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
   }
-  ctx.stroke();
+  c.stroke();
+}
+
+function recomponerVista() {
+  ctx.save();
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = ALPHA;
+  for (const p of PALETA) {
+    const cap = capas[p.id];
+    if (cap) ctx.drawImage(cap, 0, 0);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+  actualizarDebug();
+}
+
+function limpiarCapas() {
+  for (const id of Object.keys(capas)) {
+    const c = capas[id].getContext('2d', { willReadFrequently: true });
+    c.clearRect(0, 0, capas[id].width, capas[id].height);
+  }
 }
 
 function redibujar() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  for (const tr of trazos) dibujarTrazo(tr);
+  limpiarCapas();
+  for (const tr of trazos) pintarTrazoEnCapa(tr);
+  recomponerVista();
+  actualizarDebug();
+}
+
+function actualizarDebug() {
+  const dbg = document.getElementById('debugPanel');
+  if (!dbg) return;
+  const counts = {};
+  for (const id of Object.keys(capas)) {
+    counts[id] = trazos.filter(t => t.tipo === 'pen' && t.tipo_pieza === id).length;
+  }
+  dbg.textContent = 'capas: ' + Object.keys(capas).length +
+    ' · trazos: ' + trazos.length +
+    ' · activo: ' + tipoActual +
+    ' (' + (counts[tipoActual] || 0) + ')';
 }
 
 function cargarPagina(idx) {
@@ -522,11 +638,9 @@ function cargarPagina(idx) {
     return;
   }
   const p = PAGINAS[idx];
-  // Marcar item actual
   document.querySelectorAll('.pag-item').forEach((el, i) => {
     el.classList.toggle('actual', i === idx);
   });
-  // Cargar imagen
   trazos = [];
   trazoActual = null;
   img.onload = () => {
@@ -534,6 +648,7 @@ function cargarPagina(idx) {
     canvas.height = img.naturalHeight;
     canvas.style.width = img.clientWidth + 'px';
     canvas.style.height = img.clientHeight + 'px';
+    inicCapas();
     redibujar();
   };
   img.src = `/api/pagina_img?ruta=${encodeURIComponent(RUTA_PROYECTO)}&id=${encodeURIComponent(p.id)}`;
@@ -560,45 +675,95 @@ canvas.onpointerdown = e => {
 };
 canvas.onpointermove = e => {
   if (!dibujando) return;
-  trazoActual.puntos.push(ptCanvas(e));
-  // dibujar incremental
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  ctx.lineWidth = trazoActual.grosor;
+  const punto = ptCanvas(e);
+  trazoActual.puntos.push(punto);
+  const n = trazoActual.puntos.length;
+  if (n < 2) return;
+  const prev = trazoActual.puntos[n-2];
   if (trazoActual.tipo === 'pen') {
+    // 1. Pintar en la capa offscreen (registro real)
+    pintarSegmentoEnCapa(trazoActual.tipo_pieza, trazoActual.color, prev, punto, trazoActual.grosor);
+    // 2. Pintar DIRECTAMENTE en la canvas visible para feedback instantáneo
+    //    (sin recomposición completa — mucho más rápido).
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.lineWidth = trazoActual.grosor;
     ctx.globalCompositeOperation = 'source-over';
-    ctx.strokeStyle = trazoActual.color + '5A';
+    ctx.globalAlpha = ALPHA;
+    ctx.strokeStyle = trazoActual.color;
+    ctx.beginPath();
+    ctx.moveTo(prev[0], prev[1]);
+    ctx.lineTo(punto[0], punto[1]);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
   } else {
+    // Borrador: borrar en todas las capas + en visible
+    for (const id of Object.keys(capas)) {
+      const c = capas[id].getContext('2d', { willReadFrequently: true });
+      c.lineCap = 'round'; c.lineJoin = 'round';
+      c.lineWidth = trazoActual.grosor;
+      c.globalCompositeOperation = 'destination-out';
+      c.strokeStyle = 'rgba(0,0,0,1)';
+      c.beginPath(); c.moveTo(prev[0], prev[1]); c.lineTo(punto[0], punto[1]); c.stroke();
+    }
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.lineWidth = trazoActual.grosor;
     ctx.globalCompositeOperation = 'destination-out';
     ctx.strokeStyle = 'rgba(0,0,0,1)';
+    ctx.beginPath(); ctx.moveTo(prev[0], prev[1]); ctx.lineTo(punto[0], punto[1]); ctx.stroke();
+    ctx.globalCompositeOperation = 'source-over';
   }
-  const n = trazoActual.puntos.length;
-  ctx.beginPath();
-  ctx.moveTo(trazoActual.puntos[n-2][0], trazoActual.puntos[n-2][1]);
-  ctx.lineTo(trazoActual.puntos[n-1][0], trazoActual.puntos[n-1][1]);
-  ctx.stroke();
 };
 canvas.onpointerup = e => {
   if (!dibujando) return;
   dibujando = false;
   if (trazoActual && trazoActual.puntos.length > 1) {
     trazos.push(trazoActual);
+    // Diagnóstico: cuentas reales por tipo + pixeles por capa
+    const stats = {};
+    for (const p of PALETA) {
+      const cap = capas[p.id];
+      if (!cap) { stats[p.id] = 'NO_CAP'; continue; }
+      try {
+        const data = cap.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, cap.width, cap.height).data;
+        let n = 0;
+        for (let i = 3; i < data.length; i += 4) if (data[i] > 0) n++;
+        stats[p.id] = n;
+      } catch (e) { stats[p.id] = 'ERR'; }
+    }
+    console.log('[upStats] último='+trazoActual.tipo_pieza,
+      'paints/tipo:', JSON.stringify(_cuentaPaint),
+      'pixeles:', JSON.stringify(stats));
+    recomponerVista();
   }
   trazoActual = null;
 };
 
-// Paleta
-document.querySelectorAll('.color-btn').forEach(btn => {
-  btn.onclick = () => {
-    document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    tipoActual = btn.dataset.tipo;
-    const p = PALETA.find(p => p.id === tipoActual);
-    colorActual = p.color;
-    toolActual = 'pen';
-    document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
-    document.querySelector('.tool-btn[data-tool=pen]').classList.add('active');
-  };
+// Paleta — usar event delegation para robustez contra clicks en inner elements
+const paletaEl = document.querySelector('.paleta');
+paletaEl.addEventListener('click', (ev) => {
+  const btn = ev.target.closest('.color-btn');
+  if (!btn) return;
+  const tipo = btn.dataset.tipo;
+  if (!tipo) {
+    console.warn('color-btn sin data-tipo', btn);
+    return;
+  }
+  const p = PALETA.find(x => x.id === tipo);
+  if (!p) {
+    console.warn('PALETA no encuentra tipo:', tipo);
+    return;
+  }
+  document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  tipoActual = tipo;
+  colorActual = p.color;
+  toolActual = 'pen';
+  document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+  const penBtn = document.querySelector('.tool-btn[data-tool=pen]');
+  if (penBtn) penBtn.classList.add('active');
+  // Log visible
+  console.log('Color cambiado:', {tipo, color: p.color});
+  actualizarDebug();
 });
 document.querySelector('.color-btn').classList.add('active');
 
@@ -606,7 +771,11 @@ document.querySelector('.color-btn').classList.add('active');
 document.querySelectorAll('.tool-btn').forEach(btn => {
   btn.onclick = () => {
     const tool = btn.dataset.tool;
-    if (tool === 'undo') { trazos.pop(); redibujar(); return; }
+    if (tool === 'undo') {
+      if (trazos.length) trazos.pop();
+      redibujar();
+      return;
+    }
     document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     toolActual = tool;
@@ -638,7 +807,9 @@ document.addEventListener('keydown', e => {
   } else if (e.key === 'e' || e.key === 'E') {
     document.querySelector('.tool-btn[data-tool=erase]').click(); e.preventDefault();
   } else if (e.key === 'z' && (e.metaKey || e.ctrlKey)) {
-    trazos.pop(); redibujar(); e.preventDefault();
+    if (trazos.length) trazos.pop();
+    redibujar();
+    e.preventDefault();
   } else if (e.key === 'ArrowRight') {
     document.getElementById('btnSkip').click(); e.preventDefault();
   } else if (e.key === 'ArrowLeft') {
@@ -646,7 +817,12 @@ document.addEventListener('keydown', e => {
   } else if (e.key === ' ') {
     document.getElementById('btnSave').click(); e.preventDefault();
   } else if (e.key === 'Backspace') {
-    if (confirm('Limpiar todos los trazos?')) { trazos = []; redibujar(); }
+    if (confirm('Limpiar todos los trazos?')) {
+      trazos = [];
+      limpiarCapas();
+      recomponerVista();
+      actualizarDebug();
+    }
     e.preventDefault();
   }
 });

@@ -43,6 +43,22 @@ Cuando hay un **pilar/columna** en la pared, la encimera lo rodea por sus caras 
 
 NO sumes los tramos del pilar en la encimera principal. Cada cara visible del pilar que lleve encimera = 1 pieza separada con `zona`: "lateral pilar izq", "lateral pilar dch", "frente pilar", etc.
 
+**📐 EJEMPLO REAL — CÓMO INTERPRETAR ENCIMERA EN L CON ZONA FINAL ESTRECHA**:
+
+Caso real I007 (Dekton Avorio 1.2cm):
+- **MGR**: `Encimera 4.415 × 0.620 = 2.737m²` (bounding rectangle facturado)
+- **Plano de planta** muestra cocina en L con tramo principal y zona final con cota transversal "280" + cota longitudinal "545"
+- **Realidad**: 2 tramos:
+  - Tramo principal largo: 3870 × 620 mm
+  - Tramo final estrecho: 545 × 280 mm
+- **Verificación**: 3870 + 545 = 4415mm = MGR Longo ✓ (la merma de cortar la L explica la diferencia de área 2.737 - 2.552 = 0.185 m²)
+
+**Patrón general**:
+- Cuando ves "280", "300", "350", "400" como cota TRANSVERSAL en un extremo del plano → es un fondo reducido en esa zona.
+- El MGR Longo total = SUMA de largos de los tramos (no del bounding individual).
+- El MGR Ancho = ancho del tramo más ancho (típicamente 620), NO el ancho de los tramos estrechos.
+- Emite cada tramo como pieza separada con su `(largo, ancho)` real.
+
 **🔻 ZONAS ESTRECHAS / ESCALONES / ENTRADAS DE ARMARIO — DETECCIÓN OBLIGATORIA**:
 
 **Regla**: cada vez que el FONDO de la encimera cambia (de 620 a 280, de 620 a 400, etc), eso es un tramo nuevo. Cada combinación distinta de (fondo, largo) = pieza separada.
