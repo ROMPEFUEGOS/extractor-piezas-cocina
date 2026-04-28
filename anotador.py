@@ -631,7 +631,17 @@ function actualizarDebug() {
     ' (' + (counts[tipoActual] || 0) + ')';
 }
 
+// Cache en memoria de trazos por pagina_id (sobrevive a navegación entre páginas
+// dentro de la misma sesión; solo se persiste a disco con Guardar/Espacio).
+const cacheTrazos = {};
+
 function cargarPagina(idx) {
+  // Antes de cambiar de página: guardar trazos actuales en cache
+  if (typeof idxActual === 'number' && idxActual >= 0 && idxActual < PAGINAS.length) {
+    const idActual = PAGINAS[idxActual] && PAGINAS[idxActual].id;
+    if (idActual) cacheTrazos[idActual] = trazos.slice();
+  }
+
   idxActual = idx;
   if (idx < 0 || idx >= PAGINAS.length) {
     alert('Última página. Vuelve al listado de proyectos.');
@@ -641,7 +651,8 @@ function cargarPagina(idx) {
   document.querySelectorAll('.pag-item').forEach((el, i) => {
     el.classList.toggle('actual', i === idx);
   });
-  trazos = [];
+  // Restaurar trazos de la cache si la página ya se visitó en esta sesión
+  trazos = (cacheTrazos[p.id] || []).slice();
   trazoActual = null;
   img.onload = () => {
     canvas.width = img.naturalWidth;

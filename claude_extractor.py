@@ -13,15 +13,109 @@ from models import TrabajoExtraido, MaterialSpec, Pieza, Hueco, Canto
 from file_readers import build_claude_content, collect_files
 
 SYSTEM_PROMPT = """Eres un experto en la extracción de datos de proyectos de encimeras y revestimientos de piedra para cocinas.
-Tu tarea es analizar todos los documentos de una carpeta de trabajo de una empresa de cocinas (Cocimoble) y extraer TODA la información relevante con máxima precisión.
+Tu tarea es analizar los documentos de medición de una carpeta de trabajo y extraer TODA la información relevante para fabricar las piezas reales.
+
+## 🗺 REPRESENTACIÓN GEOMÉTRICA 2D — DISEÑA CADA PIEZA COMO UN POLÍGONO REAL
+
+Tu objetivo principal es **diseñar cada pieza en 2D** como si la dibujaras directamente
+en un programa CAD. Esto significa:
+
+1. **Cada encimera es UN POLÍGONO**, no varios rectángulos sueltos. Si la encimera es
+   en L, U, o tiene una entrada de pilar, emite UN solo objeto `pieza` con su lista
+   completa de vértices `vertices_mm`.
+
+2. **CONVENCIÓN DE EJES (CRÍTICA — IMPORTANTE)**:
+   - X: a lo largo de la encimera (de izquierda a derecha cuando el usuario la mira de frente).
+   - Y=0: FRENTE de la encimera (el borde donde el usuario se acerca, donde está el canto pulido visible).
+   - Y=ancho_mm: PARED trasera (donde la encimera toca la pared / fondo).
+   - Por tanto, los **pilares y entradas a la pared están en Y ALTO (trasero)**, NO en Y bajo (frente).
+   - Vértices empiezan en esquina FRONTAL-IZQUIERDA `[0,0]` y van CCW.
+
+3. **Formas típicas**:
+   - **Rectangular**: 4 vértices. `[[0,0],[L,0],[L,A],[0,A]]`
+   - **Encimera con MUESCA (entrada) de pilar atrás-derecha** (caso MUY común — el pilar
+     sobresale de la pared trasera ENTRA en la zona de la encimera, y la encimera
+     se corta para dejar paso al pilar).
+     Ej: encimera principal 2700×600 con muesca de pilar 300×200 en esquina trasera-derecha:
+     `[[0,0],[2700,0],[2700,400],[2400,400],[2400,600],[0,600]]`
+     - Bbox: 2700×600 (no se añade material extra; el pilar QUITA material).
+     - La muesca está en X=2400→2700, Y=400→600 (esquina TRASERA-DERECHA, FUERA del polígono).
+     - ⚠ NO uses saliente exterior (X > 2700). El pilar reduce la pieza, no la agranda.
+   - **L (esquina trasera derecha más estrecha)**: ej. tramo principal 3000×600
+     + zona final 545mm con fondo reducido a 280mm:
+     `[[0,0],[3000,0],[3000,600],[2455,600],[2455,320],[0,320]]` — la zona estrecha
+     queda atrás-abajo si el armario reducido está al final.
+   - **U**: 8+ vértices. Tres tramos perpendiculares.
+
+4. **Bounding box**: SIEMPRE rellena `largo_mm` y `ancho_mm` con bbox del polígono
+   (max-x − min-x, max-y − min-y). Para nesting se usa este bbox.
+
+5. **Huecos con coordenadas y orientación REALES**:
+   - `centro_x_mm` y `centro_y_mm`: posición del centro del hueco relativa a (0,0)
+     de la pieza.
+   - `largo_mm`: dimensión del hueco a lo largo del EJE X (paralelo al frente).
+   - `ancho_mm`: dimensión del hueco a lo largo del EJE Y (frente-fondo).
+
+   **TAMAÑOS estándar (encimera fondo 600-620mm)** — usar SIEMPRE estos defaults
+   cuando la nota/plantilla no especifique modelo concreto:
+   - **Placa inducción 60cm (Bosch/Balay)**: `largo_mm: 562, ancho_mm: 492`.
+   - **Placa inducción dominó**: `270×490`.
+   - **Fregadero 1 seno (default Teka)**: `largo_mm: 500, ancho_mm: 400`.
+   - **Fregadero 2 senos**: `780×440`.
+   - **Fregadero con escurridor**: `1000×440`.
+   - **Grifo**: `35×35` (taladro).
+
+   **POSICIONAMIENTO Y NO SOLAPAMIENTO (CRÍTICO)**:
+   - Origen (0,0) en esquina FRONTAL-IZQUIERDA. Y crece hacia la pared trasera.
+   - **Margen al frente** (Y=0): ≥40mm (canto pulido visible).
+   - **Margen a la pared** (Y=ancho): ≥10mm.
+   - **Placa**: centro_y ≈ ancho_encimera/2 (centrada en fondo). Centro_x según módulo del mueble.
+   - **Fregadero**: centro_y ≈ 290 (frente a 50, atrás a 510 → deja 90mm para grifo).
+     Centro_x hacia el extremo opuesto a la placa (1 seno) o central (2 senos).
+   - **Grifo**: SIEMPRE detrás del fregadero, NUNCA solapado.
+     `centro_x` = mismo que fregadero (o pequeño offset lateral).
+     `centro_y` = ancho_encimera − 35 (para 600mm → centro_y=565; para 620 → 585).
+     Verifica que `centro_y_grifo > centro_y_fregadero + ancho_fregadero/2 + 10`.
+   - **Enchufes**: van en el frontal/chapeado, no en la encimera. Si sí van en
+     encimera (raro), centro_y cerca de la pared (Y = ancho-50), separados ≥150mm
+     entre sí.
+
+6. **CHAPEADOS EN ESQUINA DE PILAR**: cuando hay un pilar que sobresale trasero,
+   el chapeado/frontal se compone de **2 piezas perpendiculares unidas con INGLETE**:
+   - Una pieza lateral (paralela al pilar): ej. 200×600 (200mm a lo largo, 600mm alto).
+   - Una pieza frontal (cara visible del pilar): ej. 300×600 (300mm a lo largo, 600mm alto).
+   - Emite ambas como piezas frontal separadas + entrada en `cantos`:
+     `{"tipo": "ingletado", "longitud_ml": 0.6, "notas": "unión pilar"}`.
+   - NO unifiques en una sola pieza grande.
+
+7. **Todas las cotas visibles del plano**: extrae cada medida que veas. Si el plano
+   marca "2400" para el frontal y "2700" para la encimera, ambas distintas; ambas van.
+
+8. **NO simplifiques a rectángulos** cuando hay forma irregular. Si pintaste pilar
+   marrón o el plano muestra notch, los vértices DEBEN reflejar la muesca.
+
+## ⚠ FUENTES DE INFORMACIÓN — IMPORTANTE LEER ANTES DE EMPEZAR
+
+**Lo que SÍ recibes** (toda la información sale SOLO de estas fuentes):
+1. **Plano de planta 2D** (vista aérea de la cocina con cotas reales).
+2. **Render/perspectiva 3D** (referencia visual; cotas orientativas).
+3. **Plantilla del operador** (formulario texto con campos: material, marca, color, grosor, acabado, hueco counts, frontal/copete/zócalo SI/NO, observaciones).
+4. **Anotaciones manuales del operador** (rotulador de colores sobre el plano + notas globales — autoritativas para forma).
+5. **Notas TXT** (cualquier indicación adicional escrita).
+
+**Lo que NO recibes (filtrado del input)**:
+- **Presupuesto del marmolista** (PDFs `PR*` o `F*` y Excels con hojas "Presupuesto"). NO están disponibles en este flujo.
+- Ya **no debes** apelar al "MGR" como fuente. Toda la forma, las cotas y la cantidad de piezas salen de plano + plantilla + anotaciones.
+
+**Consecuencia importante**:
+- Si tu razonamiento te lleva a inferir "el MGR dice X cm" o "el bounding del MGR es Y" → **stop**: no tienes esa información. Trabaja solo con el plano, lo que ves, y lo que el operador marcó.
+- Cuando este prompt menciona "MGR" más adelante, ignóralo — son referencias legacy. Las únicas fuentes válidas son las cinco enumeradas arriba.
 
 ## Tipos de documentos que puedes encontrar:
 1. **Plantilla presupuesto marmolista**: Formulario con datos del cliente, material (marca, color, grosor, acabado), tipo de copete, frontal, zócalo, fregadero, elaboraciones y observaciones.
 2. **Plano de planta 2D**: Vista desde arriba de la cocina con medidas en mm y etiquetas de tipo de pieza (ENCIMERA, FRONTAL H:XXcm, COPETE H:Xcm, ZOCALO H:Xcm...). Las X sobre muebles indican electrodomésticos sin piedra.
 3. **Render/perspectiva 3D**: Imagen visual de la cocina montada. Ayuda a entender disposición, pilares, islas, cascadas, y confirmar dónde van los distintos materiales y piezas.
-4. **Presupuesto del marmolista** (PDF con membrete "Mármoles y Granitos Redondela"): Lista de líneas con: material, dimensiones (Longo x Ancho), tipo de elaboración, precio.
-5. **Excel de presupuesto**: Similar al PDF pero en tabla Excel con columnas Ref, Produto, Descrición, Longo, Ancho, Unid., m²/Cantid., Prezo, Total.
-6. **TXT extra**: Notas adicionales del cliente o comentarios.
+4. **TXT extra**: Notas adicionales del cliente o comentarios.
 
 ## TIPOS DE PIEZAS — DEFINICIONES PRECISAS:
 
@@ -166,6 +260,48 @@ Se mide en ml (metros lineales) o en piezas individuales.
 - Copete **≤ 9cm**: se trata como copete (franja estrecha).
 - Copete **> 9cm** (ej: 10cm, 15cm, "hasta la ventana"): aunque el cliente o la plantilla lo llame "copete", **se trata y presupuesta como chapeado/frontal**. Crear la pieza como tipo `frontal` con su altura real. Esto ocurre cuando se quiere llegar a la altura de una ventana o proteger una pared de manchas.
 
+**⚠ COPETE Y CHAPEADO/FRONTAL SON MUTUAMENTE EXCLUYENTES — REGLA INVIOLABLE**:
+Una zona física (pared norte, frente pilar, lateral pilar, etc.) lleva **O copete O frontal,
+NUNCA LOS DOS A LA VEZ**. NO HAY EXCEPCIONES.
+
+Algoritmo obligatorio para evitar duplicados:
+1. Lista todas las zonas que llevan frontal (donde la plantilla marca FRONTAL=SI o el plano
+   muestra FRONTAL H:XX).
+2. Lista todas las zonas que llevan copete (donde la plantilla marca COPETE=SI).
+3. Si una zona aparece en AMBAS listas → **decide UNA sola**:
+   - Por defecto, gana el frontal (porque cubre más altura y tapa el copete).
+   - Solo si el plano explícitamente muestra "COPETE H:5cm" en una zona Y NO muestra
+     frontal ahí, entonces va copete.
+4. Emite UNA sola pieza por zona — frontal O copete, no ambas.
+
+**Ejemplo de I008 (caso real)**:
+- Plano: FRONTAL H:600 cubre 2400mm de pared norte, lateral pilar 200×600, frente pilar 300×600.
+- Plantilla dice también COPETE 5cm.
+- DECISIÓN: emitir SOLO los 3 frontales (norte 2400, lateral pilar 200, frente pilar 300).
+  NO emitir copete en esas zonas porque YA están cubiertas por frontal.
+- Si hubiera una pared adicional sin muebles altos donde no va frontal, ESA llevaría copete.
+- En este caso, no hay tal pared → **0 piezas de copete**.
+
+**⚠ LARGO DE COPETES Y CHAPEADOS — sigue la PARED, NO el pilar**:
+- El **copete sigue el largo de la PARED** (tramo recto donde se apoya).
+- Si la pared mide 2400mm con un saliente de pilar de 300mm al final, el copete del
+  tramo recto es 2400mm de largo (NO 300mm del pilar). El pilar tendrá su copete propio
+  de 300mm en su frente más quizá 200mm en su lateral.
+- Lee siempre del plano la cota de la PARED para el largo del copete, no la cota del pilar.
+
+**🔹 COPETE DE CABEZA VISTA (extremos abiertos de encimera)**:
+Cuando un extremo de la encimera es CABEZA VISTA (no termina contra pared), lleva un
+copete vertical de **largo = fondo de encimera** (no la cota del extremo del armario):
+- Encimera 2700×600 con cabeza vista en extremo izquierdo → copete cabeza izq = **600mm × 50** (ml=0.6).
+- Encimera con muesca de pilar a la derecha (Y=400→600): la cabeza vista derecha es la
+  pared del corte (X=2700, Y=0→400), cabeza derecha = **400mm × 50** (ml=0.4).
+- Cabeza pegada a pared (oculta) → SIN copete.
+
+**Regla práctica**:
+- Largo del copete de cabeza = profundidad libre de la encimera en ese punto.
+- NUNCA inventes longitudes sueltas como "310mm" u otras que no correspondan ni a
+  fondo ni a largo de pared.
+
 **IMPORTANTE — FRONTAL/COPETE = NO**: Si la plantilla indica FRONTAL = NO o GROSOR = NO,
 NO incluyas material ni pieza de tipo "frontal" o "copete". Simplemente no aparecen en el JSON.
 
@@ -233,10 +369,14 @@ Para CADA hueco de **placa** y **fregadero** (también recomendable para grifo),
 1. **Si la plantilla/plano muestra la medida exacta** (anotación manuscrita con cotas) → usar esa medida.
 2. **Si la plantilla muestra la posición gráficamente pero sin cota** → estimar proporcionalmente a la medida total de la encimera.
 3. **Si la plantilla NO da ninguna pista** → estimar:
-   - **Posición**: placa típicamente cerca del centro (40-60% del largo); fregadero hacia un extremo (20-30% desde un lado); grifo justo detrás del fregadero.
-   - **Tamaño (usar estos defaults)**:
-     - placa inducción 4 zonas: **600×520 mm**
-     - placa inducción 2 zonas / dominó: **300×520 mm**
+   - **Posición**: cada hueco va **centrado en el módulo de mueble** que lo aloja (típicamente 60cm o 90cm de ancho). Si conoces la posición del módulo en la encimera, usa el centro de ese módulo. Si no, asume:
+     - placa: cerca del centro (40-60% del largo de la encimera)
+     - fregadero: hacia un extremo (20-30% desde un lado)
+     - grifo: justo detrás del fregadero
+   - **Tamaño (defaults reales de corte)**:
+     - placa inducción 4 zonas (60cm): **492×562 mm** (tamaño de hueco de placa estándar Bosch/Balay/Siemens)
+     - placa inducción 2 zonas / dominó: **270×490 mm**
+     - placa gas 60cm: **560×480 mm**
      - fregadero 1 seno: **400×400 mm**
      - fregadero 2 senos: **780×480 mm**
      - fregadero con escurridor: **1000×480 mm**
@@ -488,24 +628,77 @@ Estructura de ejemplo para un trabajo real (J0297 Elisa Baños):
     {"rol": "zocalo", "marca": "Guidoni", "color": "Blanco Absoluto", "grosor_cm": 1.2, "acabado": "Pulido", "altura_cm": 10}
   ],
   "piezas": [
-    {"tipo": "encimera", "material_rol": "encimera", "largo_mm": 2180, "ancho_mm": 610, "zona": "pared superior izquierda"},
-    {"tipo": "encimera", "material_rol": "encimera", "largo_mm": 990, "ancho_mm": 600, "zona": "pared superior derecha"},
-    {"tipo": "frontal", "material_rol": "frontal", "largo_mm": 2180, "altura_mm": 580, "zona": "segmento 1"},
-    {"tipo": "frontal", "material_rol": "frontal", "largo_mm": 195, "altura_mm": 580, "zona": "pilar cara izquierda"},
-    {"tipo": "frontal", "material_rol": "frontal", "largo_mm": 360, "altura_mm": 580, "zona": "segmento 2"},
-    {"tipo": "frontal", "material_rol": "frontal", "largo_mm": 150, "altura_mm": 580, "zona": "pilar cara derecha"},
-    {"tipo": "frontal", "material_rol": "frontal", "largo_mm": 330, "altura_mm": 580, "zona": "segmento 3"},
-    {"tipo": "frontal", "material_rol": "frontal", "largo_mm": 340, "altura_mm": 580, "zona": "pilar cara fondo"},
-    {"tipo": "frontal", "material_rol": "frontal", "largo_mm": 990, "altura_mm": 580, "zona": "segmento 4"},
-    {"tipo": "copete", "material_rol": "copete", "longitud_ml": 4.545, "altura_mm": 50, "notas": "rodea pilar igual que frontal"},
-    {"tipo": "zocalo", "material_rol": "zocalo", "longitud_ml": 3.18, "altura_mm": 100, "zona": "pared superior muebles bajos"},
-    {"tipo": "zocalo", "material_rol": "zocalo", "longitud_ml": 0.60, "altura_mm": 100, "zona": "lateral"}
+    /* Encimera principal con pilar saliente trasero-derecha.
+       Tramo principal 2700×600, saliente trasero 300×200 (200 mm extra de fondo
+       hacia la pared, en los últimos 300mm a lo largo). Vértices en orden CCW
+       desde esquina FRONTAL-izquierda. El saliente va Y alto (atrás), no Y bajo. */
+    {
+      "tipo": "encimera", "material_rol": "encimera",
+      "forma": "poligono",
+      "vertices_mm": [[0,0],[2700,0],[2700,400],[3000,400],[3000,600],[0,600]],
+      "largo_mm": 3000, "ancho_mm": 600,
+      "zona": "pared norte principal con saliente pilar trasero derecho"
+    },
+    {
+      "tipo": "isla", "material_rol": "encimera",
+      "forma": "rectangulo",
+      "vertices_mm": [[0,0],[2200,0],[2200,900],[0,900]],
+      "largo_mm": 2200, "ancho_mm": 900,
+      "zona": "isla central"
+    },
+    /* Cuando hay pilar saliente trasero, el chapeado se hace en 2 piezas
+       unidas con inglete: una lateral del pilar y otra frontal. */
+    {
+      "tipo": "frontal", "material_rol": "frontal",
+      "largo_mm": 2400, "altura_mm": 600, "zona": "frontal pared norte tramo principal"
+    },
+    {
+      "tipo": "frontal", "material_rol": "frontal",
+      "largo_mm": 200, "altura_mm": 600, "zona": "frontal lateral pilar (cara este)"
+    },
+    {
+      "tipo": "frontal", "material_rol": "frontal",
+      "largo_mm": 300, "altura_mm": 600, "zona": "frontal frente pilar"
+    },
+    /* COPETE: SOLO en cabezas vistas (extremos abiertos de encimera). En las paredes
+       donde ya hay frontal (chapeado), NO emitir copete. */
+    {
+      "tipo": "copete", "material_rol": "copete",
+      "longitud_ml": 0.6, "altura_mm": 50,
+      "zona": "copete cabeza vista izquierda (extremo abierto encimera)"
+    },
+    {
+      "tipo": "copete", "material_rol": "copete",
+      "longitud_ml": 0.4, "altura_mm": 50,
+      "zona": "copete cabeza vista derecha (extremo encimera junto al pilar — fondo libre 400)"
+    },
+    {
+      "tipo": "zocalo", "material_rol": "zocalo",
+      "longitud_ml": 3.18, "altura_mm": 100, "zona": "pared superior muebles bajos"
+    }
   ],
   "huecos": [
-    {"tipo": "placa", "cantidad": 1, "pieza_zona": "pared superior izquierda", "distancia_lado_mm": 2200, "largo_mm": 600, "ancho_mm": 520},
-    {"tipo": "fregadero", "cantidad": 1, "subtipo": "sobre_encimera", "pieza_zona": "pared superior izquierda", "distancia_lado_mm": 900, "largo_mm": 780, "ancho_mm": 480},
-    {"tipo": "grifo", "cantidad": 1, "pieza_zona": "pared superior izquierda", "distancia_lado_mm": 900},
-    {"tipo": "enchufe", "cantidad": 1, "pieza_zona": "pared superior izquierda"}
+    /* Placa Bosch 60cm: 562mm a lo largo de la encimera × 492mm de fondo.
+       Centrada en su módulo de mueble (centro_x=1350, centro_y a media profundidad). */
+    {
+      "tipo": "placa", "cantidad": 1, "pieza_zona": "pared norte principal",
+      "centro_x_mm": 1350, "centro_y_mm": 310,
+      "largo_mm": 562, "ancho_mm": 492
+    },
+    {
+      "tipo": "fregadero", "cantidad": 1, "subtipo": "sobre_encimera",
+      "pieza_zona": "pared norte principal",
+      "centro_x_mm": 600, "centro_y_mm": 290,
+      "largo_mm": 780, "ancho_mm": 480
+    },
+    {
+      "tipo": "grifo", "cantidad": 1, "pieza_zona": "pared norte principal",
+      "centro_x_mm": 600, "centro_y_mm": 540,
+      "largo_mm": 35, "ancho_mm": 35
+    },
+    {
+      "tipo": "enchufe", "cantidad": 1, "pieza_zona": "pared norte principal"
+    }
   ],
   "cantos": [
     {"tipo": "ingletado", "longitud_ml": 3.48},
@@ -637,16 +830,21 @@ def json_to_trabajo(data: dict, folder_info: dict) -> TrabajoExtraido:
     # Piezas
     piezas = []
     for p in data.get('piezas', []):
+        # vertices_mm puede venir como lista de [x,y] o lista de {"x":..,"y":..}
+        verts = p.get('vertices_mm') or p.get('vertices')
+        if verts and len(verts) > 0 and isinstance(verts[0], dict):
+            verts = [[v.get('x'), v.get('y')] for v in verts]
         piezas.append(Pieza(
             tipo=p.get('tipo', 'desconocido'),
             material_rol=p.get('material_rol', 'encimera'),
+            forma=p.get('forma'),
+            vertices_mm=verts,
             largo_mm=safe_float(p.get('largo_mm')),
             ancho_mm=safe_float(p.get('ancho_mm')),
             altura_mm=safe_float(p.get('altura_mm')),
             area_m2=safe_float(p.get('area_m2')),
             longitud_ml=safe_float(p.get('longitud_ml')),
             zona=p.get('zona'),
-            forma=p.get('forma'),
             notas=p.get('notas'),
         ))
 
@@ -657,10 +855,12 @@ def json_to_trabajo(data: dict, folder_info: dict) -> TrabajoExtraido:
             tipo=h.get('tipo', 'desconocido'),
             cantidad=safe_int(h.get('cantidad')) or 1,
             pieza_zona=h.get('pieza_zona'),
+            centro_x_mm=safe_float(h.get('centro_x_mm')),
+            centro_y_mm=safe_float(h.get('centro_y_mm')),
+            largo_mm=safe_float(h.get('largo_mm')),
+            ancho_mm=safe_float(h.get('ancho_mm')),
             posicion=h.get('posicion'),
-            distancia_lado_mm=h.get('distancia_lado_mm'),
-            largo_mm=h.get('largo_mm'),
-            ancho_mm=h.get('ancho_mm'),
+            distancia_lado_mm=safe_float(h.get('distancia_lado_mm')),
             subtipo=h.get('subtipo'),
             notas=h.get('notas'),
         ))

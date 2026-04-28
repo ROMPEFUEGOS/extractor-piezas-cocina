@@ -16,7 +16,9 @@ EXCEL_EXTENSIONS = {'.xlsx', '.xls'}
 TXT_EXTENSIONS = {'.txt'}
 
 # Archivos a ignorar
-IGNORE_PATTERNS = {'.tmp', '.lnk', '.dat', 'winmail', '.log'}
+IGNORE_PATTERNS = {'.tmp', '.lnk', '.dat', 'winmail', '.log',
+                    '_extraccion.json', '_extraccion.txt', '_tablas.pdf',
+                    '_tablas.json', '_tablas.txt', 'clasificacion.json'}
 
 
 def should_ignore(path: Path) -> bool:
@@ -224,38 +226,76 @@ def _score_pdf(path: Path) -> int:
     return score
 
 
-def collect_files(folder: Path, max_pdfs: int = 5) -> dict:
+def _es_mgr_marmolista(path: Path) -> bool:
+    """
+    Detecta archivos del MGR/presupuesto del marmolista por heurística:
+    - PDFs cuyo nombre empieza por 'PR\\d+'  (ej: PR1382_J0015...)
+    - PDFs cuyo nombre empieza por 'F\\d+'   (facturas: F250121_...)
+    - Excels cuyo nombre coincide con el código del trabajo + descripción
+      (suelen ser exports del MGR, contienen 'Presupuesto' interno).
+
+    El extractor IGNORA estos archivos: solo trabaja con plano, plantilla,
+    fotos y anotaciones del operador.
+    """
+    name = path.name
+    # PDFs de marmolista: PR\d+ o F\d+
+    if path.suffix.lower() == '.pdf':
+        if re.match(r'^(PR|F)\d+', name):
+            return True
+    # Excels: si la primera hoja se llama 'Presupuesto NNNN', es del marmolista
+    if path.suffix.lower() == '.xlsx':
+        try:
+            wb = openpyxl.load_workbook(str(path), read_only=True, data_only=False)
+            sheet_names_lower = [s.lower() for s in wb.sheetnames]
+            wb.close()
+            for s in sheet_names_lower:
+                if 'presupuesto' in s:
+                    return True
+            # También detectar por contenido típico (col 1 fila 14 = 'Ref.')
+        except Exception:
+            pass
+    return False
+
+
+def collect_files(folder: Path, max_pdfs: int = 5,
+                   excluir_mgr: bool = True) -> dict:
     """
     Recopila y prioriza los archivos de una carpeta de trabajo.
     Incluye archivos de subcarpetas "Segundas", "Terceras", etc. (medidas revisadas).
-    Devuelve dict con listas por tipo + info de subcarpetas.
+
+    `excluir_mgr=True` (default): omite los archivos del presupuesto del
+    marmolista (PR*.pdf, F*.pdf, *.xlsx con hojas 'Presupuesto'). El
+    extractor solo usa plano + plantilla + anotaciones — la forma de la
+    encimera viene SOLO de esas fuentes.
     """
-    # Subcarpetas de medidas revisadas, en orden cronológico
     MEDIDAS_SUBFOLDERS = ['segundas', 'terceras', 'cuartas', 'segundas medidas', 'terceras medidas']
 
     files = {
         'images': [],
-        'pdfs': [],           # lista de (Path, etiqueta) donde etiqueta indica origen
+        'pdfs': [],
         'excels': [],
         'txts': [],
         'ignored': [],
         'subfolders': [],
         'pdfs_omitidos': [],
+        'mgr_excluidos': [],   # archivos MGR ignorados (informativo)
     }
 
-    all_pdfs = []  # lista de (Path, etiqueta)
+    all_pdfs = []
 
     def scan_dir(directory: Path, label: str):
         for f in sorted(directory.iterdir()):
             if f.is_dir():
                 subfolder_name = f.name.lower()
                 if any(s in subfolder_name for s in MEDIDAS_SUBFOLDERS):
-                    # Es una subcarpeta de medidas revisadas → procesarla
                     scan_dir(f, f.name)
                 elif not should_ignore(f):
                     files['subfolders'].append(f)
                 continue
             if not f.is_file() or should_ignore(f):
+                continue
+            if excluir_mgr and _es_mgr_marmolista(f):
+                files['mgr_excluidos'].append(f)
                 continue
             ext = f.suffix.lower()
             if ext in IMG_EXTENSIONS:
@@ -269,7 +309,6 @@ def collect_files(folder: Path, max_pdfs: int = 5) -> dict:
 
     scan_dir(folder, 'Primeras')
 
-    # Ordenar PDFs por prioridad (más importante primero), luego limitar
     all_pdfs.sort(key=lambda x: _score_pdf(x[0]), reverse=True)
     files['pdfs'] = all_pdfs[:max_pdfs]
     files['pdfs_omitidos'] = all_pdfs[max_pdfs:]
@@ -317,8 +356,7 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
         return re.sub(r"[^A-Za-z0-9._-]", "_", pid) + ".png"
 
     def _imagen_anotada_b64(pagina_id: str) -> Optional[tuple[str, str]]:
-        """Si la página tiene anotación manual, devuelve (b64, media_type) de
-        la imagen anotada (composite). Si no, None."""
+        """Composite (original + overlay del operador). Útil para context."""
         info = (anotaciones.get("paginas_anotadas") or {}).get(pagina_id)
         if not info or not info.get("tiene_trazos"):
             return None
@@ -329,6 +367,30 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
         try:
             data, mt = image_to_base64(path)
             return data, mt
+        except Exception:
+            return None
+
+    def _overlay_solo_b64(pagina_id: str) -> Optional[tuple[str, str]]:
+        """Overlay aislado del operador con fondo blanco para máxima claridad
+        de QUÉ marcó. Las zonas no pintadas son blancas (no transparentes)."""
+        info = (anotaciones.get("paginas_anotadas") or {}).get(pagina_id)
+        if not info or not info.get("tiene_trazos"):
+            return None
+        fname = _safe_pagina_filename(pagina_id)
+        overlay_path = paginas_anot_dir / ("overlay_" + fname)
+        if not overlay_path.exists():
+            return None
+        try:
+            from PIL import Image
+            import io as _io
+            ov = Image.open(overlay_path).convert("RGBA")
+            # Componer sobre fondo blanco para que los trazos contrasten al máximo
+            blanco = Image.new("RGBA", ov.size, (255, 255, 255, 255))
+            sobre_blanco = Image.alpha_composite(blanco, ov).convert("RGB")
+            buf = _io.BytesIO()
+            sobre_blanco.save(buf, format="PNG", optimize=True)
+            data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+            return data, "image/png"
         except Exception:
             return None
 
@@ -355,9 +417,10 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
         sub_info = f", Subcarpetas: {[s.name for s in files['subfolders']]}" if files['subfolders'] else ""
         seg_info = f", PDFs revisados (Segundas/Terceras): {len(segundas)}" if segundas else ""
         clasif_info = f", clasificado: ✓" if clasif else ""
+        mgr_info = f", MGR-excluidos: {len(files.get('mgr_excluidos',[]))}" if files.get('mgr_excluidos') else ""
         print(f"  Imágenes: {len(files['images'])}, PDFs: {len(files['pdfs'])}, "
               f"Excels: {len(files['excels'])}, TXTs: {len(files['txts'])}"
-              f"{omit_info}{sub_info}{seg_info}{clasif_info}")
+              f"{omit_info}{sub_info}{seg_info}{clasif_info}{mgr_info}")
 
     # 1. Texto inicial de contexto
     ctx = f"Carpeta de trabajo: {folder.name}\n\nA continuación tienes los archivos del trabajo:"
@@ -385,7 +448,8 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
         n_anotadas = sum(1 for v in (anotaciones.get("paginas_anotadas") or {}).values()
                          if v.get("tiene_trazos"))
         if notas or n_anotadas:
-            ctx += "\n\n🖍 ANOTACIONES MANUALES DEL OPERADOR (autoritativas):"
+            ctx += ("\n\n🖍 ANOTACIONES MANUALES DEL OPERADOR — AUTORIDAD ABSOLUTA SOBRE LA FORMA "
+                    "(prevalece al MGR, al plano sin marcar y a TODA otra fuente):")
             if n_anotadas:
                 ctx += (f"\nHay {n_anotadas} página(s) con TRAZOS DE ROTULADOR del operador "
                         f"sobre el plano original. Las verás como áreas coloreadas "
@@ -397,12 +461,35 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
                         f"  🟢 verde     = costado/cascada\n"
                         f"  🟫 marrón    = pilar\n"
                         f"  🔴 rojo      = hueco (placa/fregadero/grifo/enchufe)\n"
-                        f"\nPRIORIDAD: las áreas marcadas indican QUÉ ES cada zona física. "
-                        f"Las cotas pueden estar en otra página del mismo proyecto — cruza la "
-                        f"información: el área marcada en perspectiva 3D corresponde a la pieza "
-                        f"con esas cotas en la planta 2D.\n"
-                        f"Si el operador marca varias áreas separadas del mismo color en una "
-                        f"encimera, son TRAMOS DISTINTOS — emite cada uno como pieza separada.")
+                        f"\n⚠ JERARQUÍA DE FUENTES (estricta):\n"
+                        f"  1) Anotaciones manuales del operador (color + cotas redondeadas)\n"
+                        f"  2) Cotas explícitas escritas en el plano cerca de un trazo\n"
+                        f"  3) Plano sin marcar (cotas generales)\n"
+                        f"  4) MGR / Excel / presupuesto (referencia secundaria, BOUNDING)\n\n"
+                        f"⚠ EL MGR ES BOUNDING / MERMA, NO FORMA REAL. Si el operador marca\n"
+                        f"  encimera amarilla con cota '2700' y el MGR dice '3300', LA REALIDAD ES 2700.\n"
+                        f"  Los 600mm de diferencia son zona oculta, merma de pilar, o cobranza\n"
+                        f"  por área no fabricada. NO inventes piezas que el MGR sugiere pero el\n"
+                        f"  operador NO marcó.\n\n"
+                        f"⚠ MARRÓN = PILAR (saliente del muro hacia la encimera): genera 1-3 piezas\n"
+                        f"  PEQUEÑAS alrededor del pilar (lados ~150-300mm × fondo + frente ~600mm).\n"
+                        f"  NO confundir con un tramo de encimera grande de 1m+. Si el MGR dice\n"
+                        f"  un tramo lateral 1020×350 pero el operador marcó pilar marrón ahí,\n"
+                        f"  son las piezas de wrap del pilar, NO una encimera lateral.\n\n"
+                        f"⚠ CADA ÁREA AMARILLA distinta = 1 PIEZA de encimera con sus propias cotas.\n"
+                        f"  Si solo hay 1 área amarilla continua → 1 sola encimera.\n"
+                        f"  Si hay 2 áreas amarillas → 2 encimeras.\n"
+                        f"  NO añadas encimeras 'fantasma' que el operador no marcó.\n\n"
+                        f"⚠ REGLA INVERSA — DEFAULT NO-ENCIMERA: Si una zona del plano NO tiene\n"
+                        f"  trazo amarillo del operador, NO HAY encimera ahí, NO IMPORTA qué diga\n"
+                        f"  el MGR o las tablas de nesting previas. Aunque el MGR liste un\n"
+                        f"  'tramo lateral 1020×350', si esa zona está marcada con marrón (pilar),\n"
+                        f"  son las piezas de wrap del pilar, NO una encimera. La diferencia entre\n"
+                        f"  el área amarilla marcada y el bounding del MGR es MERMA cobrada\n"
+                        f"  (zona detrás de pilar, vuelo, cobranza por área no fabricada).\n\n"
+                        f"⚠ CUENTA LAS PIEZAS DE ENCIMERA: emitirás EXACTAMENTE el número de áreas\n"
+                        f"  amarillas distintas marcadas. Si el operador marcó 1 sola área amarilla,\n"
+                        f"  emites 1 encimera. Si marcó 2, emites 2. Sin excepciones.\n")
             if notas:
                 ctx += "\n\nNotas globales del proyecto (texto del operador):"
                 for n in notas:
@@ -478,44 +565,56 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
                             })
                     else:
                         data, media_type = page_data[0], page_data[1]
-                    # Si la página tiene anotación manual, usar la imagen anotada
                     pagina_id = f"pdf::{pdf_path.name}::{i+1}"
-                    anotada = _imagen_anotada_b64(pagina_id)
-                    if anotada:
-                        data, media_type = anotada
-                        tag_extra = " 🖍 CON ANOTACIÓN MANUAL DEL OPERADOR"
-                    else:
-                        tag_extra = ""
+                    overlay_solo = _overlay_solo_b64(pagina_id)
                     tag = _tag(pdf_path.name, pagina=i+1)
-                    if tag or tag_extra:
+                    if overlay_solo:
+                        # Tiene anotación: enviar 2 imágenes — original + overlay solo
                         content.append({"type": "text",
-                                         "text": f"[Página {i+1} de '{pdf_path.name}'] {tag}{tag_extra}"})
-                    content.append({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": data,
-                        }
-                    })
+                                         "text": f"[Página {i+1} de '{pdf_path.name}' — IMAGEN ORIGINAL del plano] {tag}"})
+                        content.append({"type": "image", "source": {
+                            "type": "base64", "media_type": media_type, "data": data}})
+                        content.append({"type": "text",
+                                         "text": (f"[Página {i+1} de '{pdf_path.name}' — OVERLAY DEL OPERADOR sobre fondo blanco]\n"
+                                                  f"Esta imagen muestra ÚNICAMENTE los trazos del rotulador del operador. "
+                                                  f"Las áreas blancas NO ESTÁN MARCADAS y por tanto NO existen como pieza física. "
+                                                  f"Solo emite piezas en zonas con color en esta imagen. Usa la imagen original "
+                                                  f"de arriba para leer las cotas exactas (mm).")})
+                        ov_data, ov_mt = overlay_solo
+                        content.append({"type": "image", "source": {
+                            "type": "base64", "media_type": ov_mt, "data": ov_data}})
+                    else:
+                        if tag:
+                            content.append({"type": "text",
+                                             "text": f"[Página {i+1} de '{pdf_path.name}'] {tag}"})
+                        content.append({"type": "image", "source": {
+                            "type": "base64", "media_type": media_type, "data": data}})
                 archivos.append(pdf_path.name)
 
     # 5. Imágenes directas
     for img_path in files['images']:
         try:
             data, media_type = image_to_base64(img_path)
-            # Si la imagen tiene anotación manual, sustituir
             pagina_id = f"img::{img_path.name}"
-            anotada = _imagen_anotada_b64(pagina_id)
-            if anotada:
-                data, media_type = anotada
-                tag_extra = " 🖍 CON ANOTACIÓN MANUAL DEL OPERADOR"
-            else:
-                tag_extra = ""
+            overlay_solo = _overlay_solo_b64(pagina_id)
             tag = _tag(img_path.name)
+            if overlay_solo:
+                content.append({"type": "text",
+                                 "text": f"\n--- IMAGEN ORIGINAL: {img_path.name} --- {tag}"})
+                content.append({"type": "image", "source": {
+                    "type": "base64", "media_type": media_type, "data": data}})
+                content.append({"type": "text",
+                                 "text": (f"--- OVERLAY DEL OPERADOR ({img_path.name}) sobre fondo blanco ---\n"
+                                          f"Trazos de rotulador del operador SÓLOS. Áreas blancas = no marcadas = no hay pieza ahí. "
+                                          f"Cotas reales: léelas de la imagen original de arriba.")})
+                ov_data, ov_mt = overlay_solo
+                content.append({"type": "image", "source": {
+                    "type": "base64", "media_type": ov_mt, "data": ov_data}})
+                archivos.append(img_path.name)
+                continue
             content.append({
                 "type": "text",
-                "text": f"\n--- IMAGEN: {img_path.name} --- {tag}{tag_extra}"
+                "text": f"\n--- IMAGEN: {img_path.name} --- {tag}"
             })
             content.append({
                 "type": "image",

@@ -181,19 +181,21 @@ LAVAVAJILLAS_ML = 600  # ml de rodapié estándar para hueco de lavavajillas
 
 
 def split_rodapie(largo: float, ancho: float, label: str,
-                   tabla_largo: int, tiene_lavavajillas: bool = True) -> list[tuple[float, float, str]]:
+                   tabla_largo: int, tiene_lavavajillas: bool = True,
+                   forzar_n: Optional[int] = None) -> list[tuple[float, float, str]]:
     """
     Rodapié/zócalo: cortes especiales.
-    - Máximo 3 trozos.
-    - Si hay lavavajillas (default True en cocinas), el rodapié del hueco
-      del lavavajillas (~600mm) va separado → 3 trozos totales si el
-      rodapié es > 4m aproximadamente.
-    - Si no, corte simétrico (mitad) o en 3 si no cabe en 2.
+    - Por defecto, 2-3 trozos (mínimo necesario para que entren en tabla, máximo 3).
+    - Si hay lavavajillas y largo > 4m: izq + lavavajillas (600) + der.
+    - Si no, corte simétrico.
+    - `forzar_n`: si se pasa, parte EXACTAMENTE en N trozos iguales (consolidación).
     """
+    if forzar_n is not None and forzar_n >= 2:
+        chunk = largo / forzar_n
+        return [(chunk, ancho, f"{label} ({i+1}/{forzar_n})") for i in range(forzar_n)]
     if largo <= tabla_largo:
         return [(largo, ancho, label)]
 
-    # Rodapié > tabla_largo → necesita partir
     n_min = math.ceil(largo / tabla_largo)
     n = min(3, max(2, n_min))
 
@@ -281,30 +283,35 @@ def pack_piezas_rectpack(piezas_dim: list[tuple[float, float, str]],
                           rotar: bool) -> list[Tabla]:
     """
     Empaqueta usando rectpack (MaxRects BSSF / Guillotine BSSF-SAS).
-    Prueba varios algoritmos y devuelve el que menos tablas use (desempate
-    por mayor aprovechamiento medio).
+    Prueba varios algoritmos + 2 estrategias de orden:
+      - SORT_AREA: máxima compactación pura (puede romper orden de colocación)
+      - SORT_NONE: respeta el orden de entrada (para veteados — frontales/chapeados
+        del mismo grupo van consecutivos en la tabla)
+    Elige el resultado con menos tablas; en empate, prefiere SORT_NONE para mantener
+    veteado continuo.
     """
     try:
-        from rectpack import newPacker, MaxRectsBssf, MaxRectsBaf, GuillotineBssfSas, PackingMode, PackingBin, SORT_AREA
+        from rectpack import (newPacker, MaxRectsBssf, MaxRectsBaf,
+                               GuillotineBssfSas, PackingMode, PackingBin,
+                               SORT_AREA, SORT_NONE)
     except ImportError:
-        # Fallback al shelf-packing simple (legacy)
         return pack_piezas_shelf(piezas_dim, tabla_ancho, tabla_alto, rotar)
 
     if not piezas_dim:
         return []
 
-    # rectpack trabaja con enteros; redondeamos dimensiones a mm + kerf integrado
     rects = []
     for idx, (w, h, label) in enumerate(piezas_dim):
         w_i = int(round(w)) + KERF_MM
         h_i = int(round(h)) + KERF_MM
-        # rid = índice en piezas_dim para recuperar label
         rects.append((w_i, h_i, idx))
 
     candidatos = []
+    # Probamos cada combinación de algoritmo de empaque × estrategia de orden
     for algo in (MaxRectsBssf, MaxRectsBaf, GuillotineBssfSas):
+     for sort_algo in (SORT_NONE, SORT_AREA):
         packer = newPacker(mode=PackingMode.Offline, bin_algo=PackingBin.BFF,
-                            pack_algo=algo, sort_algo=SORT_AREA, rotation=rotar)
+                            pack_algo=algo, sort_algo=sort_algo, rotation=rotar)
         # Añadir muchos bins (tablas) suficientes — rectpack solo usa los que necesite
         for _ in range(len(rects) + 2):
             packer.add_bin(tabla_ancho + KERF_MM, tabla_alto + KERF_MM)
@@ -347,13 +354,17 @@ def pack_piezas_rectpack(piezas_dim: list[tuple[float, float, str]],
             tablas_result.append(overflow)
 
         aprovechamiento_medio = sum(t.aprovechamiento() for t in tablas_result) / len(tablas_result)
-        candidatos.append((len(tablas_result), -aprovechamiento_medio, tablas_result, algo.__name__))
+        # 3ª clave: prefiere SORT_NONE para mantener orden de colocación (veteado)
+        prefer_orden = 0 if sort_algo == SORT_NONE else 1
+        candidatos.append((len(tablas_result), -aprovechamiento_medio, prefer_orden,
+                            tablas_result, algo.__name__))
 
     if not candidatos:
         return pack_piezas_shelf(piezas_dim, tabla_ancho, tabla_alto, rotar)
 
-    candidatos.sort(key=lambda c: (c[0], c[1]))  # menos tablas, luego mayor aprovechamiento
-    return candidatos[0][2]
+    # menos tablas → mayor aprovechamiento → SORT_NONE para empates
+    candidatos.sort(key=lambda c: (c[0], c[1], c[2]))
+    return candidatos[0][3]
 
 
 def pack_piezas_shelf(piezas_dim: list[tuple[float, float, str]],
@@ -391,13 +402,48 @@ def pack_piezas_shelf(piezas_dim: list[tuple[float, float, str]],
 # Función principal
 # ---------------------------------------------------------------------------
 
-def calcular_tablas(json_path: Path) -> dict:
+def detectar_opciones(datos: dict) -> list[int]:
+    """Devuelve lista de números de opción presentes en los materiales (ej: [1,2]).
+    Lista vacía si no hay opciones (caso material único)."""
+    nums = set()
+    import re as _re
+    for m in datos.get("materiales", []):
+        match = _re.search(r"_opcion(\d+)$", (m.get("rol") or "").lower())
+        if match:
+            nums.add(int(match.group(1)))
+    return sorted(nums)
+
+
+def filtrar_por_opcion(datos: dict, opcion: int) -> dict:
+    """Devuelve una copia de datos con SOLO los materiales/piezas/huecos de esa opción.
+    Las piezas/materiales sin sufijo _opcionN se mantienen (compartidos)."""
+    import re as _re
+    sufijo = f"_opcion{opcion}"
+    def _es_de_otra_opcion(rol: str) -> bool:
+        m = _re.search(r"_opcion(\d+)$", (rol or "").lower())
+        return bool(m) and int(m.group(1)) != opcion
+    nuevos = dict(datos)
+    nuevos["materiales"] = [m for m in datos.get("materiales",[])
+                             if not _es_de_otra_opcion(m.get("rol",""))]
+    nuevos["piezas"] = [p for p in datos.get("piezas",[])
+                         if not _es_de_otra_opcion(p.get("material_rol",""))]
+    nuevos["huecos"] = list(datos.get("huecos", []))
+    return nuevos
+
+
+def calcular_tablas(json_path: Path, datos_override: Optional[dict] = None) -> dict:
     """
     Lee un JSON de extracción y calcula las tablas necesarias por material.
     Devuelve un dict con el informe completo.
+
+    `datos_override`: si se pasa un dict, se usa en lugar de leer json_path
+    (útil para procesar opciones filtradas).
     """
-    with open(json_path, encoding="utf-8") as f:
-        datos = json.load(f)
+    if datos_override is not None:
+        datos = datos_override
+    else:
+        with open(json_path, encoding="utf-8") as f:
+            datos = json.load(f)
 
     job_id = datos.get("job_id", "?")
     cliente = datos.get("cliente", "?")
@@ -407,13 +453,34 @@ def calcular_tablas(json_path: Path) -> dict:
     for m in datos.get("materiales", []):
         mat_index[m["rol"]] = m
 
-    # Resolver material real (es_igual_a)
+    # Resolver material real (es_igual_a). Si no existe el rol referenciado pero
+    # sí existe rol+_opcion1 (caso de varios materiales alternativos), redirigir.
+    # Si el rol viene con sufijo _opcionN pero el material no lo tiene, despojarlo.
+    import re as _re
+
     def resolver_material(rol: str) -> Optional[dict]:
         m = mat_index.get(rol)
         if not m:
-            return None
+            # Si rol viene con sufijo _opcionN pero el material está sin sufijo, despojar
+            base = _re.sub(r"_opcion\d+$", "", rol)
+            if base != rol and base in mat_index:
+                m = mat_index[base]
+            elif rol + "_opcion1" in mat_index:
+                m = mat_index[rol + "_opcion1"]
+            else:
+                return None
         if m.get("es_igual_a"):
-            return mat_index.get(m["es_igual_a"], m)
+            ref = m["es_igual_a"]
+            if ref in mat_index:
+                return mat_index[ref]
+            # Buscar primera opcionN del rol referenciado
+            for k in mat_index:
+                if k == ref + "_opcion1":
+                    return mat_index[k]
+            for k in mat_index:
+                if k.startswith(ref + "_opcion"):
+                    return mat_index[k]
+            return m
         return m
 
     # Agrupar piezas por (marca, color, grosor) — clave de tabla
@@ -459,6 +526,8 @@ def calcular_tablas(json_path: Path) -> dict:
         advertencias_g: list[str] = []
 
         huecos_globales = datos.get("huecos") or []
+        # Mapa: label → info completa (vertices, huecos asociados) para visualización
+        label_info: dict = {}
 
         def huecos_de_pieza(pieza: dict) -> list[dict]:
             """Devuelve los huecos asociados a una pieza por su campo `zona`.
@@ -492,15 +561,22 @@ def calcular_tablas(json_path: Path) -> dict:
                 advertencias_g.append(f"Pieza #{i+1} ({label}) dimensión 0 — ignorada")
                 continue
             tipo_p = (pieza.get("tipo") or "").lower()
+            # Asociar info de polígono y huecos al label (para visualización 2D real)
+            huecos_pza = huecos_de_pieza(pieza) if tipo_p in ("encimera","isla","cascada") else []
+            label_info[label] = {
+                "vertices_mm": pieza.get("vertices_mm"),
+                "forma": pieza.get("forma"),
+                "tipo": tipo_p,
+                "zona": pieza.get("zona"),
+                "huecos": huecos_pza,
+                "bbox_w": w,
+                "bbox_h": h,
+            }
             fits_normal = (w <= tabla_w and h <= tabla_h)
             fits_rotada = rotar and (h <= tabla_w and w <= tabla_h)
             if not (fits_normal or fits_rotada):
-                # Dispatch según tipo de pieza:
-                #   encimera/isla/cascada → partir por huecos (placa > fregadero)
-                #   rodapie/zocalo → regla especial (lavavajillas separado, max 3 trozos)
-                #   resto (frontal, copete, chapeado, etc) → corte libre
                 if tipo_p in ("encimera", "isla", "cascada"):
-                    sub_piezas = split_pieza_por_huecos(w, h, label, huecos_de_pieza(pieza), tabla_w)
+                    sub_piezas = split_pieza_por_huecos(w, h, label, huecos_pza, tabla_w)
                 elif tipo_p in ("rodapie", "zocalo"):
                     sub_piezas = split_rodapie(w, h, label, tabla_w, tiene_lavavajillas=True)
                 else:
@@ -532,19 +608,93 @@ def calcular_tablas(json_path: Path) -> dict:
         tablas = pack_piezas(piezas_dim, tabla_w, tabla_h, rotar)
         n_tablas = len(tablas)
 
+        # CONSOLIDACIÓN: si la última tabla tiene poco aprovechamiento (<40%),
+        # sub-dividir SOLO los rodapiés/zócalos que están en esa tabla (no todos)
+        # para meterlos en las tablas anteriores.
+        def _intentar_consolidar(piezas_dim_actual, tablas_actuales):
+            if len(tablas_actuales) <= 1:
+                return tablas_actuales, piezas_dim_actual
+            ultima = tablas_actuales[-1]
+            if ultima.aprovechamiento() >= 40:
+                return tablas_actuales, piezas_dim_actual
+            # Labels de piezas en la última tabla
+            labels_en_ultima = set()
+            for sh in ultima.shelves:
+                for p in sh.piezas_colocadas:
+                    labels_en_ultima.add(p["label"])
+            # Solo sub-dividir rodapiés/zócalos cuyos sub-trozos están en la última tabla
+            roda_a_dividir = {}
+            for k, info in label_info.items():
+                if info.get("tipo") not in ("rodapie", "zocalo"):
+                    continue
+                en_ultima = any(
+                    (lbl == k) or lbl.startswith(k + " (")
+                    for lbl in labels_en_ultima
+                )
+                if en_ultima:
+                    roda_a_dividir[k] = info
+            if not roda_a_dividir:
+                return tablas_actuales, piezas_dim_actual
+            # Probar incrementando trozos solo en los rodapiés problemáticos
+            mejor_tablas, mejor_dim = tablas_actuales, piezas_dim_actual
+            for incremento in (1, 2, 3, 4):
+                nuevas = []
+                for w, h, lbl in piezas_dim_actual:
+                    pertenece_a_dividir = any(
+                        lbl == k or lbl.startswith(k + " (")
+                        for k in roda_a_dividir
+                    )
+                    if pertenece_a_dividir:
+                        continue
+                    nuevas.append((w, h, lbl))
+                for k, info in roda_a_dividir.items():
+                    largo_orig = info["bbox_w"]
+                    ancho_orig = info["bbox_h"]
+                    n_min = math.ceil(largo_orig / tabla_w)
+                    n_target = max(n_min, 2) + incremento
+                    sub = split_rodapie(largo_orig, ancho_orig, k, tabla_w,
+                                         tiene_lavavajillas=False, forzar_n=n_target)
+                    nuevas.extend(sub)
+                t2 = pack_piezas(nuevas, tabla_w, tabla_h, rotar)
+                if len(t2) < len(mejor_tablas):
+                    mejor_tablas, mejor_dim = t2, nuevas
+                    break
+            return mejor_tablas, mejor_dim
+
+        tablas, piezas_dim = _intentar_consolidar(piezas_dim, tablas)
+        n_tablas = len(tablas)
+
         # Construir info de layout (con x/y para visualización)
         layout = []
         for idx, t in enumerate(tablas):
             piezas_en_tabla = []
             for sh in t.shelves:
                 for p in sh.piezas_colocadas:
-                    piezas_en_tabla.append({
+                    # Buscar label_info por label exacto. Si label es de un sub-trozo
+                    # (ej "encimera xyz (1/2 corte@placa)"), usa el prefijo.
+                    info = label_info.get(p["label"])
+                    if not info:
+                        for k, v in label_info.items():
+                            if p["label"].startswith(k):
+                                info = v; break
+                    bbox_w = (info or {}).get("bbox_w")
+                    sub_trozo = info and bbox_w and abs(p["w"] - bbox_w) > 5
+                    pieza_layout = {
                         "label": p["label"],
                         "x_mm": round(p["x"]),
                         "y_mm": round(p["y"]),
                         "w_mm": round(p["w"]),
                         "h_mm": round(p["h"]),
-                    })
+                    }
+                    if info and not sub_trozo:
+                        # Pieza completa (no partida): incluir polígono y huecos
+                        if info.get("vertices_mm"):
+                            pieza_layout["vertices_mm"] = info["vertices_mm"]
+                        if info.get("huecos"):
+                            pieza_layout["huecos"] = info["huecos"]
+                        if info.get("tipo"):
+                            pieza_layout["tipo"] = info["tipo"]
+                    piezas_en_tabla.append(pieza_layout)
             layout.append({
                 "tabla": idx + 1,
                 "ancho_mm": tabla_w,
@@ -632,9 +782,10 @@ def guardar_resultado(resultado: dict, json_path: Path) -> tuple[Path, Path]:
 
 
 def dibujar_layout_pdf(resultado: dict, pdf_path: Path) -> Path:
-    """Genera un PDF con una página por tabla mostrando el reparto de piezas."""
+    """Genera un PDF con una página por tabla mostrando el reparto de piezas
+    como polígonos 2D reales (con huecos posicionados)."""
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
+    from matplotlib.patches import Rectangle, Polygon as MplPolygon
     from matplotlib.backends.backend_pdf import PdfPages
 
     # Paleta por tipo de pieza (busca palabras clave en el label)
@@ -691,16 +842,42 @@ def dibujar_layout_pdf(resultado: dict, pdf_path: Path) -> Path:
                 for p in t["piezas"]:
                     x, y = p["x_mm"], p["y_mm"]
                     w, h = p["w_mm"], p["h_mm"]
-                    ax.add_patch(Rectangle((x, y), w, h,
-                                           facecolor=color_para(p["label"]),
-                                           edgecolor='black', linewidth=1, alpha=0.9))
-                    # Etiqueta centrada
+                    color = color_para(p["label"])
+                    verts_pieza = p.get("vertices_mm")
+
+                    if verts_pieza and len(verts_pieza) >= 3:
+                        # Dibujar como polígono real, trasladado a (x, y) en la tabla
+                        verts_trans = [(vx + x, vy + y) for (vx, vy) in verts_pieza]
+                        ax.add_patch(MplPolygon(verts_trans, closed=True,
+                                                 facecolor=color, edgecolor='black',
+                                                 linewidth=1.2, alpha=0.9))
+                    else:
+                        # Pieza simple: rectángulo
+                        ax.add_patch(Rectangle((x, y), w, h, facecolor=color,
+                                                edgecolor='black', linewidth=1, alpha=0.9))
+
+                    # Huecos dentro de la pieza (si están)
+                    for hueco in (p.get("huecos") or []):
+                        cx = hueco.get("centro_x_mm")
+                        cy = hueco.get("centro_y_mm")
+                        hw = hueco.get("largo_mm") or 50
+                        hh = hueco.get("ancho_mm") or 50
+                        if cx is None or cy is None:
+                            continue
+                        ax.add_patch(Rectangle((x + cx - hw/2, y + cy - hh/2), hw, hh,
+                                                facecolor='white', edgecolor='red',
+                                                linewidth=0.8, alpha=0.95, zorder=10))
+                        # Etiqueta hueco
+                        ax.text(x + cx, y + cy, hueco.get('tipo','')[:1].upper(),
+                                fontsize=7, ha='center', va='center',
+                                color='red', fontweight='bold', zorder=11)
+
+                    # Etiqueta centrada de la pieza
                     etiq = f"{p['label']}\n{w}×{h}"
-                    # Ajustar fontsize al área
                     area_rel = (w * h) / (tabla_w * tabla_h)
                     fs = max(6, min(10, int(area_rel * 80) + 5))
                     ax.text(x + w/2, y + h/2, etiq,
-                            fontsize=fs, ha='center', va='center', wrap=True)
+                            fontsize=fs, ha='center', va='center', wrap=True, zorder=5)
 
                 ax.set_xlim(-100, tabla_w + 100)
                 ax.set_ylim(-100, tabla_h + 100)
@@ -741,19 +918,53 @@ def main():
         json_path = ruta
 
     print(f"Procesando: {json_path.name}")
-    resultado = calcular_tablas(json_path)
-    print(informe_texto(resultado))
+    with open(json_path, encoding="utf-8") as f:
+        datos_full = json.load(f)
+    opciones = detectar_opciones(datos_full)
+    stem = json_path.stem.replace("_extraccion", "")
+    nombres_opciones: list[str] = []   # nombre legible de cada opción
 
-    if "--guardar" in sys.argv:
-        j, t = guardar_resultado(resultado, json_path)
-        print(f"\nGuardado: {j.name}")
-        print(f"Guardado: {t.name}")
+    if opciones:
+        # Hay varias opciones de material → 1 PDF por opción
+        for n in opciones:
+            datos_op = filtrar_por_opcion(datos_full, n)
+            # Nombre legible: marca+color del rol "encimera_opcionN"
+            nombre_op = f"opcion{n}"
+            for m in datos_op.get("materiales", []):
+                if m.get("rol") == f"encimera_opcion{n}":
+                    partes = [m.get("marca",""), m.get("color","")]
+                    txt = " ".join(p for p in partes if p)
+                    if txt: nombre_op = f"opcion{n}-{txt}"
+                    break
+            nombres_opciones.append(nombre_op)
 
-    if "--pdf" in sys.argv or "--guardar" in sys.argv:
-        stem = json_path.stem.replace("_extraccion", "")
-        pdf_out = json_path.parent / f"{stem}_tablas.pdf"
-        dibujar_layout_pdf(resultado, pdf_out)
-        print(f"Guardado: {pdf_out.name}")
+            print(f"\n=== OPCIÓN {n}: {nombre_op} ===")
+            res = calcular_tablas(json_path, datos_override=datos_op)
+            print(informe_texto(res))
+            stem_op = f"{stem}_{nombre_op.replace(' ','_')}"
+            if "--guardar" in sys.argv:
+                json_out = json_path.parent / f"{stem_op}_tablas.json"
+                txt_out  = json_path.parent / f"{stem_op}_tablas.txt"
+                json_out.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+                txt_out.write_text(informe_texto(res), encoding="utf-8")
+                print(f"Guardado: {json_out.name}")
+                print(f"Guardado: {txt_out.name}")
+            if "--pdf" in sys.argv or "--guardar" in sys.argv:
+                pdf_out = json_path.parent / f"{stem_op}_tablas.pdf"
+                dibujar_layout_pdf(res, pdf_out)
+                print(f"Guardado: {pdf_out.name}")
+    else:
+        # Material único → 1 solo PDF
+        resultado = calcular_tablas(json_path, datos_override=datos_full)
+        print(informe_texto(resultado))
+        if "--guardar" in sys.argv:
+            j, t = guardar_resultado(resultado, json_path)
+            print(f"\nGuardado: {j.name}")
+            print(f"Guardado: {t.name}")
+        if "--pdf" in sys.argv or "--guardar" in sys.argv:
+            pdf_out = json_path.parent / f"{stem}_tablas.pdf"
+            dibujar_layout_pdf(resultado, pdf_out)
+            print(f"Guardado: {pdf_out.name}")
 
 
 if __name__ == "__main__":

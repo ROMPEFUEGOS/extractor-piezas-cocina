@@ -23,45 +23,63 @@ class MaterialSpec:
 @dataclass
 class Pieza:
     """
-    Una pieza individual de piedra a fabricar (rectángulo a cortar de la tabla).
+    Una pieza individual de piedra a fabricar — diseñada como polígono 2D real.
 
     Tipos posibles:
       encimera   — superficie horizontal sobre muebles bajos
       frontal    — panel vertical entre encimera y muebles altos (= chapeado = chapeado pared)
-      copete     — franja estrecha pegada a la pared encima de la encimera (H típica 5cm)
-      zocalo     — franja al pie de los muebles bajos (H típica 10cm), excluye nevera/lavadora/zona banquetas
-      costado    — panel lateral vertical de isla/encimera que cae al suelo (= cascada/waterfall)
+      copete     — franja estrecha pegada a la pared encima de la encimera
+      zocalo     — franja al pie de los muebles bajos
+      costado    — panel lateral vertical de isla/encimera (= cascada/waterfall)
       pilastra   — revestimiento de arista/canto de pilar
       isla       — encimera de isla central independiente
-      paso       — huella de escalón
-      tabica     — tabica de escalón
-      otro       — pieza especial indicada en observaciones
+      paso/tabica — escalón
+      otro       — pieza especial
+
+    REPRESENTACIÓN GEOMÉTRICA:
+    Cada pieza se diseña en 2D como un POLÍGONO. Los vértices van en orden
+    (CCW recomendado, aunque CW también vale). Para piezas rectangulares
+    estándar, son 4 vértices. Para L: 6 vértices. Para U: 8 vértices. Para
+    encimera con entrada de pilar: 6-8 vértices con la muesca.
+
+    Ejemplo encimera en L (3870 largo + 545 saliente al final con fondo 280):
+        vertices_mm = [[0,0], [3870,0], [3870,280], [3325,280], [3325,620], [0,620]]
     """
     tipo: str
-    material_rol: str                  # qué material usa (rol en MaterialSpec)
-    # Dimensiones
-    largo_mm: Optional[float] = None
-    ancho_mm: Optional[float] = None
-    altura_mm: Optional[float] = None  # para piezas verticales
-    area_m2: Optional[float] = None    # calculado o leído directamente
-    longitud_ml: Optional[float] = None  # para copetes, zocalos, ingletados
+    material_rol: str
+    # Forma: 'rectangulo' | 'L' | 'U' | 'poligono' | 'pilar_entry' | 'isla' | etc.
+    forma: Optional[str] = None
+    # Vértices del polígono en mm, relativo a esquina inferior-izquierda (0,0)
+    vertices_mm: Optional[list] = None  # ej: [[0,0],[2700,0],[2700,600],[0,600]]
+    # Bounding box (calculable de vertices, también se admite directo si no hay polígono)
+    largo_mm: Optional[float] = None    # bounding box X
+    ancho_mm: Optional[float] = None    # bounding box Y (fondo)
+    altura_mm: Optional[float] = None   # solo para piezas verticales (frontal/copete/zócalo/costado)
+    area_m2: Optional[float] = None
+    longitud_ml: Optional[float] = None
     # Contexto
-    zona: Optional[str] = None         # "pared norte", "isla", "peninsula"...
-    forma: Optional[str] = None        # rectangular, L, U, irregular, hueco_encimera
+    zona: Optional[str] = None
     notas: Optional[str] = None
 
 
 @dataclass
 class Hueco:
-    """Un hueco o elaboración en la encimera/pieza."""
-    tipo: str          # placa, fregadero, grifo, enchufe, bajo_encimera, enrasado_optico
+    """Un hueco o elaboración en la encimera/pieza, con posición 2D real."""
+    tipo: str          # placa, fregadero, grifo, enchufe, dosificador
     cantidad: int = 1
     pieza_zona: Optional[str] = None       # zona de la pieza a la que pertenece el hueco
-    posicion: Optional[str] = None         # izquierda, derecha, centro (cualitativo)
-    distancia_lado_mm: Optional[float] = None   # distancia desde borde izquierdo al centro del hueco (para nesting)
-    largo_mm: Optional[float] = None            # dimensión del hueco a lo largo de la encimera
-    ancho_mm: Optional[float] = None            # dimensión del hueco a lo ancho (profundidad)
-    subtipo: Optional[str] = None    # bajo_encimera, sobre_encimera, enrasado para fregadero
+    # Posición 2D del centro del hueco, relativa a esquina inferior-izquierda
+    # del bounding box de la pieza a la que pertenece (mm).
+    centro_x_mm: Optional[float] = None
+    centro_y_mm: Optional[float] = None
+    # Dimensiones del hueco
+    largo_mm: Optional[float] = None
+    ancho_mm: Optional[float] = None
+    # Compatibilidad legacy (distancia desde borde izquierdo del frente al centro)
+    posicion: Optional[str] = None
+    distancia_lado_mm: Optional[float] = None
+    # Atributos
+    subtipo: Optional[str] = None    # bajo_encimera, sobre_encimera, enrasado
     notas: Optional[str] = None
 
 
