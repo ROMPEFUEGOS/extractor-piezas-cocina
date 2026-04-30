@@ -60,6 +60,8 @@ PALETA = [
     {"id": "costado",  "color": "#70AD47", "label": "costado/cascada", "tecla": "5"},
     {"id": "pilar",    "color": "#A0522D", "label": "pilar", "tecla": "6"},
     {"id": "hueco",    "color": "#E63946", "label": "hueco", "tecla": "7"},
+    {"id": "pulido",   "color": "#00CED1", "label": "pulido (línea)", "tecla": "8"},
+    {"id": "inglete",  "color": "#FF1493", "label": "inglete (línea)", "tecla": "9"},
 ]
 
 
@@ -289,6 +291,8 @@ def api_guardar_pagina():
     anot["paginas_anotadas"][pagina_id] = {
         "tiene_trazos": tiene_trazos,
         "etiquetas": etiquetas,
+        "canvas_w": body.get("canvas_w"),
+        "canvas_h": body.get("canvas_h"),
         "fecha": datetime.now().isoformat(),
     }
     guardar_anotaciones(folder, anot)
@@ -461,6 +465,7 @@ textarea { width: 100%; background: #2a2a2a; color: #eee; border: 1px solid #555
     <div class="section">
       <h3>Herramienta</h3>
       <button class="tool-btn active" data-tool="pen" title="(P)">Rotulador</button>
+      <button class="tool-btn" data-tool="poly" title="(L) — click para añadir vértice, doble-click o Enter para cerrar, Esc cancela">Polilínea</button>
       <button class="tool-btn" data-tool="erase" title="(E)">Borrador</button>
       <button class="tool-btn" data-tool="undo" title="Cmd+Z">↶ Deshacer</button>
       <div style="margin-top:8px;">
@@ -586,6 +591,7 @@ function pintarTrazoEnCapa(tr) {
     const [x, y] = tr.puntos[i];
     if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
   }
+  if (tr.tipo === 'poly' && tr.cerrado) c.closePath();
   c.stroke();
 }
 
@@ -672,8 +678,113 @@ function ptCanvas(e) {
   return [(e.clientX - rect.left) * sx, (e.clientY - rect.top) * sy];
 }
 
+// === Modo polilínea (vértices exactos por click) ===
+let polyEnConstruccion = null;  // {tipo_pieza,color,grosor,puntos:[[x,y]]}
+let polyCursor = null;           // posición actual del cursor para preview
+
+function pintarPolilineaEnCapa(tipo_pieza, color, puntos, ancho, cerrar=true) {
+  const cap = capas[tipo_pieza];
+  if (!cap || puntos.length < 2) return;
+  const c = cap.getContext('2d', { willReadFrequently: true });
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  c.lineWidth = ancho;
+  c.globalCompositeOperation = 'source-over';
+  c.globalAlpha = 1;
+  c.strokeStyle = color;
+  c.beginPath();
+  c.moveTo(puntos[0][0], puntos[0][1]);
+  for (let i = 1; i < puntos.length; i++) c.lineTo(puntos[i][0], puntos[i][1]);
+  if (cerrar) c.closePath();
+  c.stroke();
+}
+
+function dibujarPreviewPolilinea() {
+  if (!polyEnConstruccion) return;
+  const pts = polyEnConstruccion.puntos;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.lineWidth = polyEnConstruccion.grosor;
+  ctx.globalAlpha = ALPHA;
+  ctx.strokeStyle = polyEnConstruccion.color;
+  // Líneas confirmadas entre vértices
+  if (pts.length >= 2) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.stroke();
+  }
+  // Línea preview desde último vértice al cursor
+  if (pts.length >= 1 && polyCursor) {
+    ctx.setLineDash([10, 10]);
+    ctx.beginPath();
+    ctx.moveTo(pts[pts.length-1][0], pts[pts.length-1][1]);
+    ctx.lineTo(polyCursor[0], polyCursor[1]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // Vértices como puntos rojos
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#000';
+  for (const p of pts) {
+    ctx.beginPath();
+    ctx.arc(p[0], p[1], 5, 0, 2*Math.PI);
+    ctx.fill();
+  }
+}
+
+function cerrarPolilinea(cerrar=true) {
+  if (!polyEnConstruccion || polyEnConstruccion.puntos.length < 2) {
+    polyEnConstruccion = null;
+    polyCursor = null;
+    recomponerVista();
+    return;
+  }
+  // Persistir
+  pintarPolilineaEnCapa(
+    polyEnConstruccion.tipo_pieza,
+    polyEnConstruccion.color,
+    polyEnConstruccion.puntos,
+    polyEnConstruccion.grosor,
+    cerrar
+  );
+  trazos.push({
+    tipo: 'poly',
+    color: polyEnConstruccion.color,
+    tipo_pieza: polyEnConstruccion.tipo_pieza,
+    grosor: polyEnConstruccion.grosor,
+    puntos: polyEnConstruccion.puntos.slice(),
+    cerrado: cerrar,
+  });
+  polyEnConstruccion = null;
+  polyCursor = null;
+  recomponerVista();
+}
+
 canvas.onpointerdown = e => {
   e.preventDefault();
+  if (toolActual === 'poly') {
+    const punto = ptCanvas(e);
+    if (!polyEnConstruccion) {
+      polyEnConstruccion = {
+        tipo_pieza: tipoActual,
+        color: colorActual,
+        grosor: grosor,
+        puntos: [punto],
+      };
+    } else {
+      // Si click cerca del primer vértice (≤15px), cerrar
+      const p0 = polyEnConstruccion.puntos[0];
+      const dx = punto[0] - p0[0], dy = punto[1] - p0[1];
+      if (polyEnConstruccion.puntos.length >= 3 && Math.sqrt(dx*dx + dy*dy) < 15) {
+        cerrarPolilinea(true);
+        return;
+      }
+      polyEnConstruccion.puntos.push(punto);
+    }
+    polyCursor = punto;
+    recomponerVista();
+    dibujarPreviewPolilinea();
+    return;
+  }
   canvas.setPointerCapture(e.pointerId);
   dibujando = true;
   trazoActual = {
@@ -684,7 +795,21 @@ canvas.onpointerdown = e => {
     puntos: [ptCanvas(e)],
   };
 };
+
+canvas.ondblclick = e => {
+  if (toolActual === 'poly' && polyEnConstruccion) {
+    e.preventDefault();
+    cerrarPolilinea(true);
+  }
+};
+
 canvas.onpointermove = e => {
+  if (toolActual === 'poly' && polyEnConstruccion) {
+    polyCursor = ptCanvas(e);
+    recomponerVista();
+    dibujarPreviewPolilinea();
+    return;
+  }
   if (!dibujando) return;
   const punto = ptCanvas(e);
   trazoActual.puntos.push(punto);
@@ -815,6 +940,12 @@ document.addEventListener('keydown', e => {
   }
   if (e.key === 'p' || e.key === 'P') {
     document.querySelector('.tool-btn[data-tool=pen]').click(); e.preventDefault();
+  } else if (e.key === 'l' || e.key === 'L') {
+    document.querySelector('.tool-btn[data-tool=poly]').click(); e.preventDefault();
+  } else if (e.key === 'Enter' && polyEnConstruccion) {
+    cerrarPolilinea(true); e.preventDefault();
+  } else if (e.key === 'Escape' && polyEnConstruccion) {
+    polyEnConstruccion = null; polyCursor = null; recomponerVista(); e.preventDefault();
   } else if (e.key === 'e' || e.key === 'E') {
     document.querySelector('.tool-btn[data-tool=erase]').click(); e.preventDefault();
   } else if (e.key === 'z' && (e.metaKey || e.ctrlKey)) {
@@ -842,10 +973,20 @@ async function guardarPaginaActual(tieneTrazos) {
   // Capturar overlay como PNG (canvas con transparencia)
   const overlay_b64 = canvas.toDataURL('image/png');
   const p = PAGINAS[idxActual];
-  const etiquetas = trazos.map((t, i) => ({
-    idx: i, tipo: t.tipo_pieza, color: t.color,
-    n_puntos: t.puntos.length,
-  }));
+  const etiquetas = trazos.map((t, i) => {
+    const meta = {
+      idx: i, tipo: t.tipo_pieza, color: t.color,
+      n_puntos: t.puntos.length,
+      modo: t.tipo,  // 'pen' o 'poly'
+    };
+    // Solo guardamos los puntos crudos en polilíneas (vértices exactos);
+    // no en mano alzada (demasiados puntos, irrelevantes).
+    if (t.tipo === 'poly') {
+      meta.puntos = t.puntos.map(p => [Math.round(p[0]), Math.round(p[1])]);
+      meta.cerrado = !!t.cerrado;
+    }
+    return meta;
+  });
   const r = await fetch('/api/guardar_pagina', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -855,6 +996,8 @@ async function guardarPaginaActual(tieneTrazos) {
       overlay_png_b64: tieneTrazos ? overlay_b64 : '',
       etiquetas,
       tiene_trazos: tieneTrazos,
+      canvas_w: canvas.width,
+      canvas_h: canvas.height,
     }),
   });
   return r.ok;

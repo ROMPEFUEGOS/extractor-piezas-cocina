@@ -180,6 +180,124 @@ class Tabla:
 LAVAVAJILLAS_ML = 600  # ml de rodapié estándar para hueco de lavavajillas
 
 
+def _decomp_barrido(vertices: list, eje: str) -> list[dict]:
+    """Barrido del polígono por bandas perpendiculares al eje dado.
+    eje='X': bandas verticales (cortes en X). eje='Y': bandas horizontales."""
+    n = len(vertices)
+    def _punto_dentro(x, y):
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = vertices[i]
+            xj, yj = vertices[j]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    xs_u = sorted(set(round(v[0], 3) for v in vertices))
+    ys_u = sorted(set(round(v[1], 3) for v in vertices))
+    rects = []
+    if eje == 'Y':
+        # Bandas horizontales (Y_i → Y_{i+1}); para cada, encontrar rangos en X
+        primario, secundario = ys_u, xs_u
+    else:
+        # Bandas verticales (X_i → X_{i+1}); para cada, encontrar rangos en Y
+        primario, secundario = xs_u, ys_u
+
+    for ip in range(len(primario) - 1):
+        p0, p1 = primario[ip], primario[ip+1]
+        if p1 - p0 < 1: continue
+        pmid = (p0 + p1) / 2
+        rangos = []
+        en_rango = False
+        s_start = None
+        for js in range(len(secundario) - 1):
+            s0, s1 = secundario[js], secundario[js+1]
+            smid = (s0 + s1) / 2
+            if eje == 'Y':
+                dentro = _punto_dentro(smid, pmid)
+            else:
+                dentro = _punto_dentro(pmid, smid)
+            if dentro:
+                if not en_rango:
+                    en_rango = True
+                    s_start = s0
+                s_end = s1
+            else:
+                if en_rango:
+                    rangos.append((s_start, s_end))
+                    en_rango = False
+        if en_rango:
+            rangos.append((s_start, s_end))
+        for rs in rangos:
+            if eje == 'Y':
+                rects.append({"x0": rs[0], "y0": p0, "w": rs[1]-rs[0], "h": p1-p0})
+            else:
+                rects.append({"x0": p0, "y0": rs[0], "w": p1-p0, "h": rs[1]-rs[0]})
+
+    # Fusionar adyacentes con misma alineación
+    fusionados = []
+    rects.sort(key=lambda r: (r["x0"], r["y0"]))
+    consumidos = set()
+    for i, r in enumerate(rects):
+        if i in consumidos: continue
+        x0, y0, w, h = r["x0"], r["y0"], r["w"], r["h"]
+        for j in range(i+1, len(rects)):
+            if j in consumidos: continue
+            r2 = rects[j]
+            # Misma X y pegado por Y
+            if eje == 'Y' and r2["x0"] == x0 and r2["w"] == w and abs(r2["y0"] - (y0 + h)) < 1:
+                h += r2["h"]; consumidos.add(j)
+            # Misma Y y pegado por X (eje X)
+            elif eje == 'X' and r2["y0"] == y0 and r2["h"] == h and abs(r2["x0"] - (x0 + w)) < 1:
+                w += r2["w"]; consumidos.add(j)
+        fusionados.append({"x0": x0, "y0": y0, "w": w, "h": h})
+    return fusionados
+
+
+def decomponer_poligono_en_rects(vertices: list, label: str) -> list[dict]:
+    """
+    Descompone un polígono rectilíneo en rectángulos no solapados.
+    Prueba barrido en Y y en X y devuelve la decomposición con MENOS rects.
+    """
+    if not vertices or len(vertices) < 3:
+        return []
+    if len(vertices) == 4:
+        xs = [v[0] for v in vertices]
+        ys = [v[1] for v in vertices]
+        x0, y0 = min(xs), min(ys)
+        return [{"x0": x0, "y0": y0,
+                  "w": max(xs)-x0, "h": max(ys)-y0,
+                  "label": label,
+                  "vertices_mm": [(x-x0, y-y0) for (x,y) in vertices],
+                  "es_subpieza_de": label}]
+
+    rects_y = _decomp_barrido(vertices, 'Y')
+    rects_x = _decomp_barrido(vertices, 'X')
+
+    # Elige la que tiene menos rects; en empate, la de mayor área en el rect mayor
+    def _score(rs):
+        if not rs: return (999, 0)
+        max_area = max(r["w"] * r["h"] for r in rs)
+        return (len(rs), -max_area)
+
+    elegida = rects_y if _score(rects_y) <= _score(rects_x) else rects_x
+    if not elegida:
+        x0 = min(v[0] for v in vertices); y0 = min(v[1] for v in vertices)
+        return [{"x0": 0, "y0": 0,
+                  "w": max(v[0] for v in vertices) - x0,
+                  "h": max(v[1] for v in vertices) - y0,
+                  "label": label, "vertices_mm": vertices, "es_subpieza_de": label}]
+
+    salida = []
+    for r in elegida:
+        salida.append({**r, "label": label,
+                        "vertices_mm": [(0,0),(r["w"],0),(r["w"],r["h"]),(0,r["h"])],
+                        "es_subpieza_de": label})
+    return salida
+
+
 def split_rodapie(largo: float, ancho: float, label: str,
                    tabla_largo: int, tiene_lavavajillas: bool = True,
                    forzar_n: Optional[int] = None) -> list[tuple[float, float, str]]:
@@ -572,6 +690,40 @@ def calcular_tablas(json_path: Path, datos_override: Optional[dict] = None) -> d
                 "bbox_w": w,
                 "bbox_h": h,
             }
+            # Si la pieza tiene polígono (L, U, etc.), descomponer en sub-rectángulos
+            # naturales antes de cualquier corte adicional (preserva la forma).
+            verts_pieza = pieza.get("vertices_mm")
+            if verts_pieza and len(verts_pieza) > 4 and tipo_p in ("encimera","isla","cascada"):
+                sub_rects = decomponer_poligono_en_rects(verts_pieza, label)
+                if len(sub_rects) > 1:
+                    advertencias_g.append(
+                        f"🔷 {label} (polígono {len(verts_pieza)}v) → {len(sub_rects)} sub-rect: "
+                        + " + ".join(f"{r['w']:.0f}×{r['h']:.0f}" for r in sub_rects)
+                    )
+                    # Guardar info del polígono original + posición de cada sub-rect
+                    label_info[label]["sub_rects"] = sub_rects
+                    for sr in sub_rects:
+                        sr_label = f"{label} (parte L {sr['x0']:.0f},{sr['y0']:.0f})"
+                        label_info[sr_label] = {
+                            "vertices_mm": sr.get("vertices_mm") or [
+                                (0,0),(sr["w"],0),(sr["w"],sr["h"]),(0,sr["h"])
+                            ],
+                            "forma": "rectangulo",
+                            "tipo": tipo_p,
+                            "zona": pieza.get("zona"),
+                            "huecos": [],   # los huecos van a la pieza original
+                            "bbox_w": sr["w"], "bbox_h": sr["h"],
+                            "es_subpieza_de": label,
+                        }
+                        sw, sh = sr["w"], sr["h"]
+                        # Si el sub-rect aún no cabe en tabla, partir más
+                        if sw > tabla_w or sh > tabla_h:
+                            extra = split_pieza_por_huecos(sw, sh, sr_label, huecos_pza, tabla_w)
+                            piezas_dim.extend(extra)
+                        else:
+                            piezas_dim.append((sw, sh, sr_label))
+                    continue   # salta el procesamiento normal
+
             fits_normal = (w <= tabla_w and h <= tabla_h)
             fits_rotada = rotar and (h <= tabla_w and w <= tabla_h)
             if not (fits_normal or fits_rotada):

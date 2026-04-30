@@ -74,6 +74,18 @@ def añadir_rect(msp, x: float, y: float, w: float, h: float, capa: str):
     msp.add_lwpolyline(pts, close=True, dxfattribs={'layer': capa})
 
 
+def añadir_poligono(msp, vertices: list, x_off: float, y_off: float, capa: str,
+                    h_total: float = 0.0):
+    """Dibuja el polígono trasladado por (x_off, y_off) en la capa indicada.
+
+    Invierte Y (h_total - vy) para que la orientación del DXF coincida con la
+    orientación cenital del plano original (Y crece hacia arriba en CAD pero
+    los planos suelen leerse con la pared 'arriba' y el frente 'abajo').
+    """
+    pts = [(v[0] + x_off, (h_total - v[1]) + y_off) for v in vertices]
+    msp.add_lwpolyline(pts, close=True, dxfattribs={'layer': capa})
+
+
 def añadir_etiqueta(msp, cx: float, cy: float, lineas: list[str],
                     altura: float = ALTURA_TEXTO, capa: str = 'TEXTO'):
     """Escribe varias líneas de texto centradas en (cx, cy)."""
@@ -220,6 +232,42 @@ def colocar_piezas(piezas: list[dict], x_origen: float, y_origen: float
     return colocadas
 
 
+HUECOS_DEFAULT = {
+    'placa':     (562, 492),
+    'fregadero': (500, 400),
+    'grifo':     (35, 35),
+    'enchufe':   (68, 68),
+    'dosificador': (35, 35),
+}
+
+
+def _dibujar_huecos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: float, h_total: float):
+    """Dibuja los huecos de una pieza usando centro_x_mm/centro_y_mm reales,
+    con la misma inversión Y que el polígono."""
+    zona_pza = (pieza.get('zona') or '').lower()
+    for h in datos.get('huecos', []):
+        cx = h.get('centro_x_mm')
+        cy = h.get('centro_y_mm')
+        if cx is None or cy is None:
+            continue
+        # Filtrar huecos que pertenezcan a esta pieza si pieza_zona está informado
+        pza_z = (h.get('pieza_zona') or '').lower()
+        if pza_z and zona_pza and pza_z not in zona_pza and zona_pza not in pza_z:
+            continue
+        tipo = h.get('tipo', 'hueco')
+        hw = h.get('largo_mm') or HUECOS_DEFAULT.get(tipo, (100, 100))[0]
+        hh = h.get('ancho_mm') or HUECOS_DEFAULT.get(tipo, (100, 100))[1]
+        # Coords con inversión Y (igual que polígono)
+        cx_dxf = cx + x_off
+        cy_dxf = (h_total - cy) + y_off
+        x0 = cx_dxf - hw / 2
+        y0 = cy_dxf - hh / 2
+        añadir_rect(msp, x0, y0, hw, hh, 'HUECOS')
+        añadir_etiqueta(msp, cx_dxf, cy_dxf,
+                        [tipo.upper(), f'{int(hw)}×{int(hh)}'],
+                        max(20, ALTURA_TEXTO * 0.6))
+
+
 def añadir_huecos_isla(msp, datos: dict, x_isla: float, y_isla: float,
                        w_isla: float, h_isla: float):
     """
@@ -305,7 +353,18 @@ def generar_dxf(json_path: Path, output_path: Path):
             tipo = p.get('tipo', 'encimera')
             capa = TIPO_A_CAPA.get(tipo, 'ENCIMERA')
 
-            añadir_rect(msp, x, y, w, h, capa)
+            verts = p.get('vertices_mm')
+            if verts and len(verts) >= 3:
+                xs = [v[0] for v in verts]
+                ys = [v[1] for v in verts]
+                x_min, y_min, y_max = min(xs), min(ys), max(ys)
+                h_poly = y_max - y_min
+                añadir_poligono(msp, verts, x - x_min, y - y_min, capa, h_total=h_poly + 2 * y_min)
+                # Dibujar huecos pertenecientes a esta pieza con coords reales
+                if tipo == 'encimera':
+                    _dibujar_huecos_pieza(msp, datos, p, x - x_min, y - y_min, h_poly + 2 * y_min)
+            else:
+                añadir_rect(msp, x, y, w, h, capa)
 
             # Etiqueta interior
             zona = p.get('zona', '')

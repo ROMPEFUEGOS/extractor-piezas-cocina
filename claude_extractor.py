@@ -15,6 +15,199 @@ from file_readers import build_claude_content, collect_files
 SYSTEM_PROMPT = """Eres un experto en la extracción de datos de proyectos de encimeras y revestimientos de piedra para cocinas.
 Tu tarea es analizar los documentos de medición de una carpeta de trabajo y extraer TODA la información relevante para fabricar las piezas reales.
 
+## 🎨 PRIORIDAD ABSOLUTA — ANOTACIONES DEL OPERADOR (LEER PRIMERO)
+
+Si junto al plano recibes una **imagen de overlay** (capa con trazos de colores sobre fondo blanco o transparente), esa anotación es la **VERDAD GROUND-TRUTH**. El operador ya identificó cada pieza por ti. Tu trabajo NO es clasificar ni inventar piezas, es **MEDIR** lo que él ya marcó.
+
+**Regla número 1**: ni añadir piezas que no estén anotadas, ni eliminar piezas que sí estén anotadas. Una pieza anotada = una pieza emitida.
+
+**Tipos de trazo y cómo interpretarlos**:
+
+1. **CONTORNO CERRADO (forma 2D real)** — usado en `encimera`, `frontal/chapeado`, `costado/cascada`:
+   - Cada blob de color cerrado = UNA pieza. El contorno define el polígono.
+   - Lee los vértices del trazo y emítelos como `vertices_mm` en orden CCW.
+   - La forma puede ser rectángulo, L, U, con muesca de pilar — respeta exactamente lo dibujado.
+   - **CUENTA todos los cambios de dirección del trazo**. Si el contorno tiene 8 esquinas, emite 8 vértices. Si tiene 10, emite 10. NO simplifiques saltándote escalones intermedios. Una U con un escalón adicional en un brazo NO es una U de 8 vértices, es un polígono de 10 o 12 vértices.
+   - Si el operador hizo **varios trazos del mismo color que se tocan o se superponen** (por ejemplo, dibujó el contorno principal + retoques o detalles añadidos encima), todos forman parte del **mismo polígono unificado**. NO los emitas como piezas separadas — únelos lógicamente en UN solo `vertices_mm` que respete todos los detalles dibujados.
+   - Si los trazos del mismo color están **claramente separados** (no se tocan, hay espacio en blanco entre ellos) → son piezas independientes (ej. encimera de pared + isla independiente).
+   - Las medidas las sacas de las cotas del plano subyacente o de las cotas remarcadas/subrayadas por el operador. Si el operador dibujó un escalón, busca la cota que da su tamaño (típicamente cotas como 930, 850, 280, 545 sobre los detalles).
+
+2. **TRAZO LINEAL (línea sin contorno cerrado)** — usado en `copete`, `zócalo/rodapié`, a veces frontal corto:
+   - Una línea = una pieza lineal. El operador NO necesita dibujar el contorno porque son piezas tira (largo × altura conocida del material).
+   - El **largo** = la cota que cubre la línea sobre el plano.
+   - La **altura** sale del material (copete H=50mm; rodapié H=100mm; frontal H=600 con muebles altos / 1000 sin muebles altos).
+   - Si hay varias líneas separadas del mismo color → varias piezas separadas (una por línea).
+
+3. **CRUZ / PUNTO ROJO** → hueco (placa, fregadero, grifo, enchufe). El operador marca la posición; tú asignas el tamaño según el catálogo de huecos default.
+
+**Cotas remarcadas / subrayadas**:
+El operador suele subrayar o remarcar las cotas que quiere que uses. Si ves trazos sobre un número del plano → ESA es la medida autoritativa. Para cualquier pieza pintada, busca en el plano subyacente las cotas que la cubren y úsalas. Cálculos simples (sumas/restas de cotas adyacentes) son aceptables y necesarios; nada complejo.
+
+**Paleta de colores (aplicar este mapeo de forma estricta)**:
+| Color trazo | Tipo | Geometría | Altura default | Cómo emitirlo |
+|-------------|------|-----------|----------------|---------------|
+| Verde fluor / amarillo | encimera (incluye isla) | contorno cerrado | — (fondo del polígono) | Pieza con `vertices_mm` |
+| Azul | frontal / chapeado | contorno cerrado | 600 con muebles altos, 1000 sin | Pieza con `largo_mm` + `altura_mm` |
+| Lila / morado | zócalo / rodapié | línea | 100mm | Pieza con `longitud_ml` + `altura_mm` |
+| Naranja | copete | línea | 50mm | Pieza con `longitud_ml` + `altura_mm` |
+| Verde oscuro | costado / cascada | contorno cerrado | altura encimera-suelo (≈900) | Pieza con `vertices_mm` o `largo_mm`+`ancho_mm` |
+| Marrón | pilar / pilastra | contorno cerrado | — | Pieza con `vertices_mm` |
+| Rojo | huecos | cruces / puntos | — (catálogo) | Hueco con `centro_x_mm`/`centro_y_mm` |
+| Cian / turquesa | **PULIDO** (canto pulido) | línea | — | Entrada en `cantos`: `{"tipo":"recto_pulido","longitud_ml":<largo_línea>,"notas":"<contexto>"}` |
+| Magenta / rosa fucsia | **INGLETE** (unión) | línea | — | Entrada en `cantos`: `{"tipo":"ingletado","longitud_ml":<largo_línea>,"notas":"<piezas que une>"}` |
+
+**REGLAS PARA TRAZOS DE CANTO (pulidos e ingletes)**:
+- Cian/turquesa = canto pulido. Una línea cian sobre el contorno de una encimera o chapeado indica que ESE borde va pulido (canto recto pulido visible). El **largo de la línea** = `longitud_ml` del canto. NO genera pieza nueva, solo añade un objeto a `cantos`.
+- Magenta/rosa = inglete. Aparece en uniones entre dos piezas perpendiculares (típico chapeado-pilar, encimera-cascada, dos chapeados en esquina). El **largo de la línea** = `longitud_ml` del inglete. Añade objeto a `cantos` con `tipo: "ingletado"` y describe en `notas` qué piezas une.
+- Si el operador escribió un comentario en notas globales explicando el motivo del pulido/inglete, refléjalo en el campo `notas` de la entrada de `cantos`.
+- Múltiples líneas separadas del mismo color → múltiples entradas separadas (no las sumes).
+
+**COTAS ROTADAS 180° — ¡CUIDADO!**:
+En planos cenitales el operador a veces escribe la cota orientada hacia el lado de la pieza (legible desde ese lado de la cocina). Esto significa que **una cota puede aparecer rotada 180°** y leerse al revés:
+- `"009"` rotado 180° = `"600"` → fondo de encimera/módulo
+- `"002"` rotado 180° = `"200"` → pequeña dimensión
+- `"088"` rotado 180° = `"880"` → ancho de mueble
+- `"05"` o `"50"` puede ser `"50"` o leerse `"05"` rotado
+
+**Heurística**: si encuentras una cota inusualmente pequeña en un sitio donde esperarías el fondo (~600), el largo de un mueble (~600/900) o cualquier dimensión grande, sospecha que está rotada. Pruébala leída al revés y si encaja con el contexto, ÚSALA INVERTIDA. NUNCA tomes cotas como `009`/`002`/`088`/`010` literalmente sin verificar contexto.
+
+**REGLA AGRESIVA (no aplicar la lectura literal cuando contradiga el contexto)**:
+- Si en un mismo plano un extremo dice `600` (literal claro) y otro extremo dice `009` (con cero a la izquierda), AMBOS son la MISMA medida = 600. El primero está orientado en una dirección, el otro en la opuesta.
+- Si una cota como `006`, `007`, `008`, `009` aparece junto a una pieza grande (encimera ≥1m, frontal, copete largo), siempre es la cota rotada. NO la leas literal jamás como 60/70/80/90mm.
+- Si la cota tiene 2 dígitos como `06`, `09`, `07` aplicada a un fondo o cabeza, también está rotada y debes leer `60`/`90`/`70` cm = `600`/`900`/`700` mm.
+- Cualquier cota con CERO INICIAL en planos cenitales = rotada. Inviértela siempre antes de procesarla.
+
+**INGLETES IMPLÍCITOS — REGLA GEOMÉTRICA OBLIGATORIA (aunque el operador no los marque)**:
+Cuando un mueble hace **esquina** y la pieza de piedra lleva el canto frontal del largo + uno o ambos laterales (cabezas) visibles, las uniones entre el frontal y las cabezas se ejecutan con INGLETE. Aplica también al rodapié, copete, frontal/chapeado y encimera con cabezas vistas.
+
+Cómo detectarlo:
+- Si una encimera tiene **cabeza vista** en uno o ambos extremos (no choca contra otro mueble pegado) y lleva canto pulido tanto en el largo frontal como en la cabeza → emite UN `cantos` `recto_pulido` por cada tramo + una entrada `ingletado` en cada esquina donde se unen.
+- Si un rodapié corre por el largo frontal y sigue por la cabeza lateral del mismo mueble (forma de L o U), la unión esquina = inglete. Emite UNA entrada `cantos` `ingletado` por esquina (longitud_ml = altura del rodapié, típico 0.1).
+- Si un copete o frontal envuelve la cabeza vista de la misma forma → mismo tratamiento.
+- Cuando el mueble es muy estrecho (típico módulo final 1020 con cabeza), MUY frecuente: 1 frontal + 2 cabezas = 2 ingletes (uno por cabeza); si solo una cabeza es vista → 1 inglete.
+
+Esto es una regla de FABRICACIÓN: aunque el operador no haya pintado el inglete con magenta, si la geometría implica una esquina con cantos visibles en ambas caras, **debes emitir el inglete por defecto**. Indícalo en `notas` con "inglete cabeza-frontal implícito por esquina vista".
+
+**TRAZOS RECTOS (POLILÍNEA) vs A MANO ALZADA — IMPORTANTE**:
+El operador puede dibujar de dos maneras:
+- **A mano alzada**: trazo curvo, irregular. Usado para trazos rápidos, líneas (copete/zócalo) o blobs aproximados.
+- **Polilínea (líneas rectas perfectas entre vértices)**: cuando ves un contorno con **lados rectos perfectos y esquinas marcadas/duras** (no curvas), es una polilínea trazada vértice a vértice por el operador. Estos vértices son **EXACTOS** — el operador los puso a propósito en cada esquina del polígono real.
+  - Para encimeras/frontales/costados pintados con polilínea: emite UN `vertices_mm` con **exactamente esos vértices**, en el mismo orden que el contorno. Si la polilínea tiene 10 esquinas, emite 10 vértices. NO simplifiques.
+  - El número de vértices del polígono = número de esquinas visibles del contorno recto.
+  - Si la polilínea tiene un **escalón pequeño** o **muesca** intermedia, esos 2-4 vértices extra son obligatorios; respétalos siempre.
+  - El operador escogió polilínea precisamente para evitar ambigüedades — confía en cada vértice.
+
+**Si hay overlay, el orden de razonamiento es**:
+1. Cuento blobs y líneas por color → tengo la lista exacta de piezas que debo emitir.
+2. Para cada pieza, mido del plano subyacente las cotas que la cubren.
+3. Si el operador escribió notas globales (texto suelto) → ajusto materiales/cantidades.
+4. NO infiero piezas adicionales no anotadas, ni omito alguna pintada.
+
+Si NO hay overlay, sigue las reglas de identificación visual de la sección siguiente.
+
+## 🔍 IDENTIFICACIÓN VISUAL DE ELEMENTOS EN EL PLANO (sin overlay)
+
+Antes de extraer cotas, IDENTIFICA cada elemento. El plano de cocina mezcla
+elevación frontal y vista cenital. Reglas para identificar:
+
+**MUEBLES ALTOS (colgados de pared)**:
+- Rectángulos con una **X (aspas)** dentro.
+- Aparecen en la **zona superior** del plano, alineados horizontalmente.
+- En su tramo, va FRONTAL/CHAPEADO entre la encimera y la base del mueble alto
+  (altura ≈ 60cm).
+
+**MUEBLES BAJOS**:
+- Rectángulo **sin X**, con la línea de encimera encima.
+- En su zona va RODAPIÉ debajo (línea horizontal estrecha en la base).
+- Si encima hay placa/fregadero/lavavajillas dibujados en planta → es seguro mueble bajo.
+
+**ZONAS SIN MUEBLES ALTOS** (huecos altos, ventanas, campanas extractoras):
+- Espacio vacío encima de la encimera (no hay rectángulos con X arriba).
+- Ahí va FRONTAL más alto (≈ 100cm) — protege la pared sin muebles altos.
+- Si la zona supera 1.5m de largo, partir el frontal en piezas según módulos
+  de mueble bajo (60cm o 90cm).
+
+**COLUMNAS / TORRES**:
+- Rectángulos apilados que llegan **del suelo al techo**.
+- Etiquetas: `FRI` (frigo), `LV` (lavavajillas), `HRN` (horno), `MO` (microondas),
+  `COL`/`COLUMNA`. NO llevan encimera de piedra encima.
+
+**COSTADO VISTO (cabeza vista)**:
+- **Primer o último mueble** de un tramo, cuando NO tiene otro mueble pegado a su lado.
+- Lo reconoces porque ese lateral no continúa con otro rectángulo.
+- A esa cabeza le va: copete (largo = fondo del mueble bajo, típico 600mm × 50 alto)
+  Y rodapié de cabeza (largo = fondo del mueble bajo × 100 alto).
+- Si la encimera tiene ZONA ESTRECHA (28cm fondo) → la cabeza de esa zona
+  lleva copete y rodapié de **largo 280** (= el fondo de esa zona, no 600).
+
+**ZONAS DE ANOTACIÓN MANUAL**:
+- Verde fluorescente o trazos amarillos del operador → encimera.
+- Trazos azules → frontal/chapeado.
+- Trazos lila → zócalo/rodapié.
+- Trazos naranja → copete.
+- Trazos verdes (oscuro) → costado/cascada.
+- Trazos marrón → pilar.
+- Trazos rojos → huecos.
+
+**PAREDES (muros)**:
+- Línea continua gruesa (a veces doble línea) en el perímetro del plano.
+- Lo que el plano NO encierra es el espacio abierto (paso). Las cabezas vistas
+  son los extremos abiertos, NO contra muros.
+
+**APLICACIÓN PRÁCTICA — qué piezas emitir según lo que ves**:
+1. Cuenta los rectángulos con X arriba → identifica largos de zona con muebles altos.
+2. Identifica la zona sin muebles altos (entre los 2 grupos) → frontal alto ahí.
+3. Identifica si el primer mueble bajo tiene cabeza vista (no hay pared a su izquierda)
+   → copete + rodapié de cabeza izq.
+4. Identifica si el último mueble tiene cabeza vista (no hay pared a su derecha)
+   → copete + rodapié de cabeza der.
+5. RODAPIÉ va debajo de TODOS los muebles bajos (todas las zonas continuas).
+   Si los muebles altos llegan al suelo (columna, despensa) y debajo hay zócalo,
+   incluye también ese tramo en el rodapié.
+
+## 📐 REGLAS ADICIONALES — CASOS QUE SE OLVIDAN (LEER SIEMPRE)
+
+**ENCIMERA UNIFICADA — el saliente/escalón ES PARTE de la misma encimera**:
+Si una encimera tiene una zona principal (ej. 3870×600) + un saliente final más
+estrecho (ej. 545×280) o una zona en L, eso es UN SOLO polígono, NO dos piezas.
+Emite UN único objeto `encimera` con `vertices_mm` que recorra todo el contorno.
+Ej: `[[0,0],[3870,0],[3870,280],[4415,280],[4415,600],[0,600]]` para una L donde
+el saliente continúa al final con fondo 280mm.
+
+**CHAPEADOS — REGLAS POR ZONA**:
+- **Zona con muebles altos**: chapeado de altura ≈ 600mm (espacio entre encimera
+  y muebles altos, típico). Largo = largo de la pared cubierta por muebles bajos.
+- **Zona sin muebles altos** (ventana, campana, hueco): chapeado de altura ≈ 1000mm.
+  Si esta zona supera 1.5m de largo, **partir en 2 piezas o más** según el largo
+  del módulo de mueble debajo (típicamente 60cm o 90cm). Ej: 1150×1000 → 2 piezas
+  de 550×1000 + 600×1000.
+- **Pilar saliente**: 3 piezas pequeñas de chapeado:
+  · Frente del pilar: ej. 400×600 (largo del frente del pilar × altura).
+  · Lateral izquierdo del pilar: ej. 35×600 (espesor del material × altura).
+  · Lateral derecho del pilar: ej. 35×600.
+  Las 3 van unidas con inglete (añadir a `cantos`: `{"tipo":"ingletado","longitud_ml":...}`).
+
+**RODAPIÉS / ZÓCALOS — TODAS LAS ZONAS CON MUEBLES BAJOS**:
+Cualquier zona que tenga muebles bajos (sea tramo de encimera, isla, esquina,
+debajo de muebles altos sin encimera) lleva rodapié. Detectar TODAS las zonas:
+- Rodapié del tramo principal de encimera (debajo).
+- Rodapié de zonas estrechas/L (ej: 545mm, esquina interior 320mm si la L tiene
+  una pared interna).
+- Rodapié de los muebles altos en zona sin encimera (cuando hay sólo muebles
+  altos sin encimera bajo, su pared lleva rodapié del mueble bajo si lo hay
+  debajo, o si los altos llegan al suelo lleva rodapié de cabezas).
+- Rodapié de cabezas (lados visibles de muebles bajos / encimera): largo = fondo
+  del mueble bajo (típico 600mm) × altura zócalo (100mm).
+- Si el plano marca "ZOCALO 3318ml" pero el largo de encimera es solo 3870mm,
+  los 3318 indican zócalo CONTINUO de varios tramos. Listar cada tramo distinto.
+
+**COPETES — REGLA ESTRICTA**:
+- Una zona con frontal (chapeado) NO lleva copete. NUNCA emites ambos para la
+  misma zona física.
+- Solo cabezas vistas llevan copete (largo = fondo de la encimera en ese punto:
+  600mm si zona normal, 280mm si zona estrecha).
+- Si la cocina tiene 2 cabezas vistas (extremos abiertos), hay 2 copetes.
+
 ## 🗺 REPRESENTACIÓN GEOMÉTRICA 2D — DISEÑA CADA PIEZA COMO UN POLÍGONO REAL
 
 Tu objetivo principal es **diseñar cada pieza en 2D** como si la dibujaras directamente
@@ -124,8 +317,8 @@ Superficie horizontal sobre los muebles bajos. Profundidad estándar 600mm salvo
 Puede tener forma rectangular, en L, en U, con entrantes por electrodomésticos (marcados con X en plano).
 También puede ser isla o península independiente.
 
-**🔺 ENCIMERAS NO RECTANGULARES — EMITIR UNA PIEZA POR TRAMO (CRÍTICO PARA NESTING)**:
-Cuando la encimera NO es un simple rectángulo, emite **una pieza por cada tramo rectangular**, no una sola pieza sumada. El MGR da el total en m² pero NO refleja la forma — hay que leerla del **plano/plantilla**.
+**🔺 ENCIMERAS NO RECTANGULARES — UN POLÍGONO ÚNICO (CRÍTICO)**:
+Una encimera en L, U o con escalón es UN POLÍGONO ÚNICO. Emite UN solo objeto `pieza` con `vertices_mm` que recorra todo el contorno. El programa de nesting decompone luego en sub-rectángulos óptimos para cortar; tú no tienes que hacer ese reparto. Tu trabajo es conservar la forma real con todos sus vértices.
 
 **🏛 PILARES Y COLUMNAS — IMPORTANTE para piezas pequeñas**:
 Cuando hay un **pilar/columna** en la pared, la encimera lo rodea por sus caras vistas. Esto genera piezas adicionales pequeñas:
@@ -896,7 +1089,111 @@ def json_to_trabajo(data: dict, folder_info: dict) -> TrabajoExtraido:
         confianza=data.get('confianza', 'media'),
         advertencias=data.get('advertencias', []),
     )
+    _completar_copete_principal(trabajo)
+    _completar_ingletes_implicitos(trabajo)
     return trabajo
+
+
+def _completar_copete_principal(trabajo: TrabajoExtraido) -> None:
+    """Si la encimera tiene copetes de cabeza vista (cortos, ≈ fondo encimera)
+    pero NO existe el copete principal contra la pared (largo de la encimera),
+    se añade. Es un caso muy frecuente de omisión por el LLM.
+
+    Heurística: por cada encimera horizontal con largo > 1.5m, si hay 1 o más
+    copetes pequeños (≤ ancho encimera + 100mm de tolerancia) y NO hay copete
+    de longitud cercana al largo de la encimera, emitir el copete principal.
+    """
+    copetes = [p for p in trabajo.piezas if p.tipo == 'copete']
+    if not copetes:
+        return  # Plantilla decía copete=NO, no inventar
+    encimeras = [p for p in trabajo.piezas
+                 if p.tipo in ('encimera', 'isla') and p.largo_mm and p.ancho_mm]
+    nuevos: list[Pieza] = []
+    for enc in encimeras:
+        largo_m = enc.largo_mm / 1000.0
+        ancho_m = enc.ancho_mm / 1000.0
+        if largo_m < 1.5:
+            continue
+        # Buscar copetes con el mismo material que esta encimera (mismo sufijo
+        # _opcionN o mismo rol base), o que no sean de la opción contraria
+        enc_rol = enc.material_rol or ''
+        sufijo = ''
+        for s in ('_opcion1', '_opcion2', '_opcion3', '_opcion_a', '_opcion_b'):
+            if s in enc_rol:
+                sufijo = s
+                break
+        copetes_match = [c for c in copetes
+                         if (sufijo and sufijo in (c.material_rol or ''))
+                         or (not sufijo)]
+        if not copetes_match:
+            continue
+        # ¿Existe copete largo (≥ largo encimera - 200mm) en este grupo?
+        ya_existe = any(
+            (c.longitud_ml or 0) * 1000 >= enc.largo_mm - 200
+            for c in copetes_match
+        )
+        if ya_existe:
+            continue
+        # ¿Hay copetes de cabeza (cortos) en este grupo?
+        cabezas = [c for c in copetes_match
+                   if (c.longitud_ml or 0) <= ancho_m + 0.1]
+        if not cabezas:
+            continue
+        ref = copetes_match[0]
+        nuevos.append(Pieza(
+            tipo='copete',
+            material_rol=ref.material_rol,
+            longitud_ml=round(largo_m, 3),
+            altura_mm=ref.altura_mm or 50.0,
+            zona=f'copete principal pared trasera (largo {int(enc.largo_mm)}mm)',
+            notas='Añadido por postprocesador — pared con cabezas vistas',
+        ))
+    trabajo.piezas.extend(nuevos)
+
+
+def _completar_ingletes_implicitos(trabajo: TrabajoExtraido) -> None:
+    """Añade ingletes implícitos en post-procesado (geometría, no LLM).
+
+    Regla: por cada pieza horizontal (encimera/isla/costado) que tenga `cabeza
+    vista` y canto pulido tanto en el frontal como en la cabeza, la unión
+    frontal-cabeza se ejecuta con inglete. Idem para frontal/copete/zócalo
+    cuando envuelven la cabeza del mueble.
+
+    Detección de "cabeza vista": cantos `recto_pulido` cuya zona o notas
+    mencionen "cabeza" o "lateral". Cada uno → 1 inglete con longitud = fondo
+    de la encimera (típico 0.6m, leído del bbox).
+    """
+    if not trabajo.cantos:
+        return
+
+    # Fondo (ancho) de referencia: el más común entre las encimeras
+    fondos = [p.ancho_mm for p in trabajo.piezas
+              if p.tipo == 'encimera' and p.ancho_mm]
+    fondo_ref_m = (max(set(fondos), key=fondos.count) / 1000.0) if fondos else 0.6
+
+    nuevos: list[Canto] = []
+    for c in trabajo.cantos:
+        if c.tipo != 'recto_pulido':
+            continue
+        notas_lower = (c.notas or '').lower()
+        if 'cabeza' not in notas_lower and 'lateral' not in notas_lower:
+            continue
+        # Si ya hay un inglete que mencione esta cabeza, no duplicar
+        ya_existe = any(
+            (c2.tipo == 'ingletado'
+             and (c2.notas or '').lower().find(notas_lower[:25]) >= 0)
+            for c2 in trabajo.cantos
+        )
+        if ya_existe:
+            continue
+        nuevos.append(Canto(
+            tipo='ingletado',
+            longitud_ml=round(fondo_ref_m, 3),
+            notas=f'Inglete implícito frontal-cabeza · {c.notas or ""}'.strip(),
+        ))
+
+    if nuevos:
+        trabajo.cantos.extend(nuevos)
 
 
 def extract_trabajo(

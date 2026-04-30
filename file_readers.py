@@ -261,15 +261,15 @@ def collect_files(folder: Path, max_pdfs: int = 5,
                    excluir_mgr: bool = True) -> dict:
     """
     Recopila y prioriza los archivos de una carpeta de trabajo.
-    Incluye archivos de subcarpetas "Segundas", "Terceras", etc. (medidas revisadas).
+    Solo lee archivos de la carpeta raíz; las subcarpetas (Segundas, Terceras,
+    Cuartas, Quintas, etc.) corresponden a revisiones posteriores y NO se
+    procesan en este flujo.
 
     `excluir_mgr=True` (default): omite los archivos del presupuesto del
     marmolista (PR*.pdf, F*.pdf, *.xlsx con hojas 'Presupuesto'). El
     extractor solo usa plano + plantilla + anotaciones — la forma de la
     encimera viene SOLO de esas fuentes.
     """
-    MEDIDAS_SUBFOLDERS = ['segundas', 'terceras', 'cuartas', 'segundas medidas', 'terceras medidas']
-
     files = {
         'images': [],
         'pdfs': [],
@@ -283,31 +283,25 @@ def collect_files(folder: Path, max_pdfs: int = 5,
 
     all_pdfs = []
 
-    def scan_dir(directory: Path, label: str):
-        for f in sorted(directory.iterdir()):
-            if f.is_dir():
-                subfolder_name = f.name.lower()
-                if any(s in subfolder_name for s in MEDIDAS_SUBFOLDERS):
-                    scan_dir(f, f.name)
-                elif not should_ignore(f):
-                    files['subfolders'].append(f)
-                continue
-            if not f.is_file() or should_ignore(f):
-                continue
-            if excluir_mgr and _es_mgr_marmolista(f):
-                files['mgr_excluidos'].append(f)
-                continue
-            ext = f.suffix.lower()
-            if ext in IMG_EXTENSIONS:
-                files['images'].append(f)
-            elif ext in PDF_EXTENSIONS:
-                all_pdfs.append((f, label))
-            elif ext in EXCEL_EXTENSIONS:
-                files['excels'].append(f)
-            elif ext in TXT_EXTENSIONS:
-                files['txts'].append(f)
-
-    scan_dir(folder, 'Primeras')
+    for f in sorted(folder.iterdir()):
+        if f.is_dir():
+            if not should_ignore(f):
+                files['subfolders'].append(f)
+            continue
+        if not f.is_file() or should_ignore(f):
+            continue
+        if excluir_mgr and _es_mgr_marmolista(f):
+            files['mgr_excluidos'].append(f)
+            continue
+        ext = f.suffix.lower()
+        if ext in IMG_EXTENSIONS:
+            files['images'].append(f)
+        elif ext in PDF_EXTENSIONS:
+            all_pdfs.append((f, 'Primeras'))
+        elif ext in EXCEL_EXTENSIONS:
+            files['excels'].append(f)
+        elif ext in TXT_EXTENSIONS:
+            files['txts'].append(f)
 
     all_pdfs.sort(key=lambda x: _score_pdf(x[0]), reverse=True)
     files['pdfs'] = all_pdfs[:max_pdfs]
@@ -497,6 +491,47 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
                 ctx += ("\nEstas notas son AUTORITATIVAS. Si dicen 'cascada al suelo' emite una "
                         "pieza costado de la altura indicada. Si dicen 'pilar atrás' emite las "
                         "piezas alrededor del pilar. No las ignores.")
+
+            # ── POLILÍNEAS EXACTAS (vértices crudos del operador) ────────
+            polilineas_text = []
+            for pid, pdata in (anotaciones.get("paginas_anotadas") or {}).items():
+                cw = pdata.get("canvas_w")
+                ch = pdata.get("canvas_h")
+                polys_aqui = []
+                for et in pdata.get("etiquetas", []):
+                    if et.get("modo") == "poly" and et.get("puntos"):
+                        polys_aqui.append({
+                            "tipo": et.get("tipo"),
+                            "color": et.get("color"),
+                            "cerrado": et.get("cerrado", True),
+                            "puntos": et["puntos"],
+                        })
+                if polys_aqui:
+                    polilineas_text.append({"pagina": pid, "canvas": [cw, ch], "polilineas": polys_aqui})
+
+            if polilineas_text:
+                ctx += ("\n\n📐 POLILÍNEAS EXACTAS DEL OPERADOR — VÉRTICES AUTORITATIVOS:\n"
+                        "El operador trazó polilíneas con click vértice a vértice. "
+                        "Estos vértices son la GEOMETRÍA EXACTA de las piezas, en pixel-space del canvas.\n"
+                        "Para emitir `vertices_mm` de cada pieza:\n"
+                        "  1. Identifica las cotas reales del plano (ej: 4750mm de largo, 2635mm de ancho).\n"
+                        "  2. Calcula UN factor de escala uniforme mm/pixel (mismo en X y Y) comparando "
+                        "los lados de la polilínea con cotas conocidas.\n"
+                        "  3. Aplica `vertices_mm[i] = (px[i] * escala, py[i] * escala)` a TODOS los puntos. "
+                        "**NO INVIERTAS ningún eje**: si el pixel x crece hacia la derecha, mm x crece hacia la "
+                        "derecha; si pixel y crece hacia abajo, mm y crece hacia abajo. NO espejes X. NO inviertas Y. "
+                        "El programa de visualización CAD aplicará la inversión Y para CAD por su cuenta.\n"
+                        "  4. NO añadas ni quites vértices — el número de vértices del polígono real es "
+                        "EXACTAMENTE el número de puntos de la polilínea.\n"
+                        "  5. NO reordenes los puntos — emítelos en el MISMO orden recibido.\n"
+                        "  6. Trasláda al origen restando el min(x), min(y) de los vértices escalados, para "
+                        "que el polígono quede en el cuadrante positivo `[0, largo] × [0, ancho]`.\n")
+                for p in polilineas_text:
+                    ctx += f"\nPágina '{p['pagina']}' (canvas {p['canvas'][0]}×{p['canvas'][1]}px):\n"
+                    for poly in p["polilineas"]:
+                        cerr = "cerrada" if poly["cerrado"] else "abierta"
+                        ctx += f"  - {poly['tipo']} ({cerr}, {len(poly['puntos'])}v): {poly['puntos']}\n"
+
     content.append({"type": "text", "text": ctx})
 
     # 2. TXTs
