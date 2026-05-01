@@ -43,6 +43,8 @@ CAPAS = {
     'ZOCALO':    {'color': 2},   # amarillo
     'PILASTRA':  {'color': 30},  # naranja
     'HUECOS':    {'color': 1},   # rojo
+    'PULIDO':    {'color': 4},   # cian (canto pulido visible)
+    'INGLETE':   {'color': 6},   # magenta (unión inglete)
     'TEXTO':     {'color': 7},   # blanco/negro
     'COTAS':     {'color': 3},   # verde (para auto-dim)
     'MARCO':     {'color': 8},   # gris
@@ -268,6 +270,161 @@ def _dibujar_huecos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: fl
                         max(20, ALTURA_TEXTO * 0.6))
 
 
+def _signed_area(verts: list) -> float:
+    s = 0.0
+    n = len(verts)
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return s / 2.0
+
+
+def _aristas_poligono(verts: list, x_off: float, y_off: float, h_total: float) -> list:
+    """Devuelve la lista de aristas (segmentos) del polígono ya transformados al
+    sistema de coordenadas del DXF. Cada arista incluye `frontal` (bool) según si
+    es adyacente a un vértice cóncavo (los frentes de una encimera en L lo son)
+    o si es una arista contigua a una frontal (extremo / cabeza vista)."""
+    n = len(verts)
+    if n < 3:
+        return []
+    # Determina sentido del polígono y vértices cóncavos
+    area = _signed_area(verts)  # >0 = CCW, <0 = CW
+    sentido = 1 if area > 0 else -1
+    concavos = set()
+    for i in range(n):
+        x_prev, y_prev = verts[(i - 1) % n]
+        x_cur, y_cur = verts[i]
+        x_next, y_next = verts[(i + 1) % n]
+        cross = (x_cur - x_prev) * (y_next - y_cur) - (y_cur - y_prev) * (x_next - x_cur)
+        # Cóncavo si el giro va en sentido opuesto al global
+        if cross * sentido < 0:
+            concavos.add(i)
+
+    aristas = []
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        p1 = (x1 + x_off, (h_total - y1) + y_off)
+        p2 = (x2 + x_off, (h_total - y2) + y_off)
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        L = math.hypot(dx, dy)
+        mid = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+        # Arista frontal si toca un vértice cóncavo (lado de la "L")
+        toca_concavo = i in concavos or (i + 1) % n in concavos
+        aristas.append({'p1': p1, 'p2': p2, 'len': L, 'mid': mid, 'idx': i,
+                        'v1': i, 'v2': (i + 1) % n, 'frontal_estricto': toca_concavo})
+
+    # Si el polígono es convexo (sin cóncavos), no podemos distinguir paredes
+    # de frentes geométricamente; marcamos como frontales todas excepto la más
+    # larga (heurística: la pared es habitualmente el lado más largo).
+    if not concavos:
+        i_pared = max(range(n), key=lambda i: aristas[i]['len'])
+        for i, a in enumerate(aristas):
+            a['frontal_estricto'] = (i != i_pared)
+    else:
+        # Caso L: además de las aristas tocando cóncavos, sus vecinas inmediatas
+        # son cabezas vistas (también pulibles). Las que no tocan ningún cóncavo
+        # ni son vecinas de uno son paredes.
+        vecinas_concavo_chain = set()
+        for i in range(n):
+            if i in concavos:
+                vecinas_concavo_chain.add(i)
+        # No expandir más allá: cabezas son aristas que comparten un vértice con
+        # una arista frontal_estricto pero NO tocan otro cóncavo.
+        aristas_concavo = {i for i, a in enumerate(aristas) if a['frontal_estricto']}
+        for i, a in enumerate(aristas):
+            if a['frontal_estricto']:
+                continue
+            # Comparte vértice con una arista cóncava? → cabeza vista
+            v1, v2 = a['v1'], a['v2']
+            for j in aristas_concavo:
+                aj = aristas[j]
+                if v1 in (aj['v1'], aj['v2']) or v2 in (aj['v1'], aj['v2']):
+                    a['frontal_estricto'] = True
+                    break
+    return aristas
+
+
+def _dibujar_cantos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: float, h_total: float):
+    """Dibuja recto_pulido (cian) e ingletado (magenta) como segmentos sobre las
+    aristas del polígono que mejor coinciden por longitud. Heurística simple:
+    para cada canto consume la arista libre más cercana en longitud (tolerancia 50mm).
+    Ingletes se dibujan como segmento corto en una esquina próxima a un pulido marcado."""
+    verts = pieza.get('vertices_mm')
+    if not verts or len(verts) < 3:
+        return
+    aristas = _aristas_poligono(verts, x_off, y_off, h_total)
+    # Solo encimera por ahora
+    if pieza.get('tipo') != 'encimera':
+        return
+    cantos = datos.get('cantos', []) or []
+    # Solo aristas marcadas como frontales (o cabezas) son candidatas a pulido
+    libres = [i for i, a in enumerate(aristas) if a['frontal_estricto']]
+
+    # 1) Pulidos: empareja por longitud (mejor primero los más largos)
+    pulidos = [c for c in cantos if c.get('tipo', '').startswith('recto_pulido')]
+    pulidos.sort(key=lambda c: -(c.get('longitud_ml') or 0))
+    aristas_pulido = []
+    for c in pulidos:
+        L_target = (c.get('longitud_ml') or 0) * 1000.0
+        if L_target <= 0 or not libres:
+            continue
+        # Mejor candidato entre las frontales libres por proximidad de longitud
+        mejor = min(libres, key=lambda i: abs(aristas[i]['len'] - L_target))
+        # Tolerancia laxa (Claude puede emitir longitud cruda 3120 cuando la
+        # arista geométrica real es 2786, etc.). Aceptamos hasta 25% de error.
+        if abs(aristas[mejor]['len'] - L_target) > max(100, L_target * 0.25):
+            # Si no encaja con el target, lo dibujamos en la arista frontal más
+            # larga aún libre (es mejor que no dibujar nada)
+            mejor = max(libres, key=lambda i: aristas[i]['len'])
+        a = aristas[mejor]
+        msp.add_line(a['p1'], a['p2'],
+                     dxfattribs={'layer': 'PULIDO', 'lineweight': 50})
+        añadir_etiqueta(msp, a['mid'][0], a['mid'][1] - ALTURA_TEXTO * 0.6,
+                        [f"PULIDO {c.get('longitud_ml'):.3g}m"],
+                        max(20, ALTURA_TEXTO * 0.5), 'PULIDO')
+        libres.remove(mejor)
+        aristas_pulido.append(mejor)
+
+    # 2) Ingletes: dibuja un trazo corto a 45° en una esquina del polígono junto a una arista pulida
+    ingletes = [c for c in cantos if c.get('tipo') == 'ingletado']
+    n = len(aristas)
+    usados_corner = set()
+    for c in ingletes:
+        if not aristas_pulido:
+            break
+        # Esquina entre dos pulidos consecutivos, o esquina de un pulido aún no marcada
+        candidatos = []
+        for i in aristas_pulido:
+            for v_idx in (aristas[i]['idx'], (aristas[i]['idx'] + 1) % n):
+                if v_idx not in usados_corner:
+                    candidatos.append(v_idx)
+        if not candidatos:
+            break
+        v_idx = candidatos[0]
+        usados_corner.add(v_idx)
+        x_v, y_v = verts[v_idx]
+        cx = x_v + x_off
+        cy = (h_total - y_v) + y_off
+        L_seg = max(60, min(200, (c.get('longitud_ml') or 0.3) * 1000.0 * 0.3))
+        # Línea corta a 45° hacia el interior del polígono (aprox. centro)
+        xs = [v[0] for v in verts]
+        ys = [v[1] for v in verts]
+        cx_poly = sum(xs) / len(xs) + x_off
+        cy_poly = (h_total - sum(ys) / len(ys)) + y_off
+        dx_in = cx_poly - cx
+        dy_in = cy_poly - cy
+        norm = math.hypot(dx_in, dy_in) or 1
+        ux, uy = dx_in / norm, dy_in / norm
+        msp.add_line((cx, cy), (cx + ux * L_seg, cy + uy * L_seg),
+                     dxfattribs={'layer': 'INGLETE', 'lineweight': 50})
+        añadir_etiqueta(msp, cx + ux * L_seg * 1.3, cy + uy * L_seg * 1.3,
+                        [f"INGLETE {c.get('longitud_ml'):.3g}m"],
+                        max(20, ALTURA_TEXTO * 0.5), 'INGLETE')
+
+
 def añadir_huecos_isla(msp, datos: dict, x_isla: float, y_isla: float,
                        w_isla: float, h_isla: float):
     """
@@ -363,6 +520,7 @@ def generar_dxf(json_path: Path, output_path: Path):
                 # Dibujar huecos pertenecientes a esta pieza con coords reales
                 if tipo == 'encimera':
                     _dibujar_huecos_pieza(msp, datos, p, x - x_min, y - y_min, h_poly + 2 * y_min)
+                    _dibujar_cantos_pieza(msp, datos, p, x - x_min, y - y_min, h_poly + 2 * y_min)
             else:
                 añadir_rect(msp, x, y, w, h, capa)
 

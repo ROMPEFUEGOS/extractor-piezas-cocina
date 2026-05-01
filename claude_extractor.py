@@ -1089,6 +1089,7 @@ def json_to_trabajo(data: dict, folder_info: dict) -> TrabajoExtraido:
         confianza=data.get('confianza', 'media'),
         advertencias=data.get('advertencias', []),
     )
+    _reconciliar_geometria_encimera(trabajo)
     _completar_copete_principal(trabajo)
     _completar_ingletes_implicitos(trabajo)
     return trabajo
@@ -1149,6 +1150,301 @@ def _completar_copete_principal(trabajo: TrabajoExtraido) -> None:
             notas='Añadido por postprocesador — pared con cabezas vistas',
         ))
     trabajo.piezas.extend(nuevos)
+
+
+def _recolectar_cotas(trabajo: TrabajoExtraido, encimera_skip) -> set:
+    """Recopila valores en mm que provienen de campos estructurados del JSON
+    (no de texto libre): dimensiones de piezas distintas a la encimera principal
+    y longitudes de cantos. Evitamos parsear advertencias o las notas de la
+    encimera porque suelen contener las mismas medidas erróneas del polígono
+    que estamos intentando corregir.
+    """
+    cotas = set()
+    for p in trabajo.piezas:
+        if p is encimera_skip:
+            continue
+        for v in (p.largo_mm, p.ancho_mm, p.altura_mm):
+            if v and v >= 50:
+                cotas.add(int(round(v)))
+        if p.longitud_ml and p.longitud_ml >= 0.05:
+            cotas.add(int(round(p.longitud_ml * 1000)))
+    for c in trabajo.cantos:
+        if c.longitud_ml and c.longitud_ml >= 0.05:
+            cotas.add(int(round(c.longitud_ml * 1000)))
+    return cotas
+
+
+def _snap_vertices_a_cotas(verts: list, cotas: set,
+                            tol_pct: float = 0.10, tol_min_mm: float = 50) -> tuple:
+    """Snapea las coordenadas únicas (x e y) del polígono a la cota más cercana
+    del set dentro de tolerancia. Preserva topología (no colapsa dos coords
+    originales distintas en el mismo valor). Devuelve (verts_nuevos, snap_log).
+    """
+    if not cotas:
+        return verts, {}
+    cotas_sorted = sorted(cotas)
+
+    def _candidato(c):
+        if c == 0:
+            return c
+        tol = max(tol_min_mm, abs(c) * tol_pct)
+        cands = [k for k in cotas_sorted if abs(k - c) <= tol]
+        if not cands:
+            return c
+        return min(cands, key=lambda k: abs(k - c))
+
+    xs = sorted({v[0] for v in verts})
+    ys = sorted({v[1] for v in verts})
+    map_x = {x: _candidato(x) for x in xs}
+    map_y = {y: _candidato(y) for y in ys}
+
+    # Anti-colapso: si dos orígenes distintos snap-ean al mismo destino,
+    # mantener solo el más cercano y revertir el otro.
+    def _resolver_colisiones(mapeo):
+        inverso = {}
+        for orig, snap in mapeo.items():
+            if snap in inverso and inverso[snap] != orig:
+                a = inverso[snap]
+                b = orig
+                # Mantener el snap del más cercano; revertir el otro
+                if abs(mapeo[a] - a) <= abs(mapeo[b] - b):
+                    mapeo[b] = b
+                else:
+                    mapeo[a] = a
+                    inverso[snap] = b
+            else:
+                inverso[snap] = orig
+
+    _resolver_colisiones(map_x)
+    _resolver_colisiones(map_y)
+
+    nuevos = [[map_x[v[0]], map_y[v[1]]] for v in verts]
+    snap_log = {
+        'x': {orig: dst for orig, dst in map_x.items() if orig != dst},
+        'y': {orig: dst for orig, dst in map_y.items() if orig != dst},
+    }
+    return nuevos, snap_log
+
+
+def _signed_area_2d(verts: list) -> float:
+    s = 0.0
+    n = len(verts)
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return s / 2.0
+
+
+def _clasificar_aristas_encimera(verts: list) -> list:
+    """Clasifica cada arista del polígono como 'frontal' (toca vértice cóncavo),
+    'cabeza' (vecina de una frontal) o 'pared'. Devuelve lista de dicts.
+    Si el polígono es convexo no hay cóncavos: todas las aristas se marcan
+    como 'pared' (el postprocesador no actúa en convexos).
+    """
+    import math as _math
+    n = len(verts)
+    if n < 3:
+        return []
+    area = _signed_area_2d(verts)
+    sentido = 1 if area > 0 else -1
+    concavos = set()
+    for i in range(n):
+        x_prev, y_prev = verts[(i - 1) % n]
+        x_cur, y_cur = verts[i]
+        x_next, y_next = verts[(i + 1) % n]
+        cross = (x_cur - x_prev) * (y_next - y_cur) - (y_cur - y_prev) * (x_next - x_cur)
+        if cross * sentido < 0:
+            concavos.add(i)
+    aristas = []
+    for i in range(n):
+        v1, v2 = i, (i + 1) % n
+        x1, y1 = verts[v1]
+        x2, y2 = verts[v2]
+        L = _math.hypot(x2 - x1, y2 - y1)
+        toca_concavo = v1 in concavos or v2 in concavos
+        aristas.append({'idx': i, 'v1': v1, 'v2': v2, 'len': L,
+                        'tipo': 'frontal' if toca_concavo else 'pared'})
+    if concavos:
+        ids_frontal = {i for i, a in enumerate(aristas) if a['tipo'] == 'frontal'}
+        for i, a in enumerate(aristas):
+            if a['tipo'] == 'frontal':
+                continue
+            for j in ids_frontal:
+                aj = aristas[j]
+                if a['v1'] in (aj['v1'], aj['v2']) or a['v2'] in (aj['v1'], aj['v2']):
+                    a['tipo'] = 'cabeza'
+                    break
+    return aristas
+
+
+def _dedup_frontales(trabajo: TrabajoExtraido) -> None:
+    """Elimina frontales duplicados (largos a ±30mm). Conserva el "más redondo"
+    (múltiplo de 25mm); el otro se considera artefacto de medición."""
+    frontales = [p for p in trabajo.piezas if p.tipo == 'frontal']
+    if len(frontales) < 2:
+        return
+    def _redondez(v):
+        if not v:
+            return 0
+        return 1 if (round(v) % 25 == 0) else 0
+    frontales_ord = sorted(frontales, key=lambda f: -(f.largo_mm or 0))
+    usados = []
+    eliminados = []
+    for f in frontales_ord:
+        L = f.largo_mm or 0
+        duplicado = False
+        for f2 in list(usados):
+            L2 = f2.largo_mm or 0
+            if L > 0 and L2 > 0 and abs(L - L2) <= 30:
+                if _redondez(L) > _redondez(L2):
+                    usados.remove(f2)
+                    usados.append(f)
+                    eliminados.append(f2)
+                else:
+                    eliminados.append(f)
+                duplicado = True
+                break
+        if not duplicado:
+            usados.append(f)
+    if eliminados:
+        ids_eliminados = {id(e) for e in eliminados}
+        trabajo.piezas = [p for p in trabajo.piezas
+                          if not (p.tipo == 'frontal' and id(p) in ids_eliminados)]
+        trabajo.advertencias.append(
+            f"Postproc: dedup frontales — eliminados {len(eliminados)} duplicados "
+            f"({', '.join(f'{e.largo_mm}mm' for e in eliminados)})")
+
+
+def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
+    """Reconcilia frontales (chapeados) y pulidos contra la geometría real
+    del polígono de la encimera principal. Solo actúa cuando la encimera
+    tiene `vertices_mm` con al menos un vértice cóncavo (L, U, formas con
+    muescas), porque ese es el caso donde el LLM se equivoca al usar la
+    longitud bruta de un lado en lugar del tramo libre real.
+
+    Acciones:
+    1. Recalcula los `recto_pulido` como una entrada por arista frontal o
+       cabeza, usando la longitud real del segmento.
+    2. Dedup de frontales: si hay dos chapeados con largos parecidos
+       (±30mm), conserva el "más redondo" (múltiplo de 25mm) — el otro
+       suele ser un artefacto de medición de la polilínea.
+    3. Si la pared larga del polígono no tiene un frontal correspondiente,
+       añade uno con la altura típica del resto.
+    """
+    encimeras = [p for p in trabajo.piezas
+                 if p.tipo == 'encimera' and p.vertices_mm and len(p.vertices_mm) >= 3]
+    if not encimeras:
+        return
+    encimera = max(encimeras, key=lambda p: abs(_signed_area_2d(p.vertices_mm)))
+
+    # ── -1) Dedup frontales (antes del snap) ────────────────────────────
+    # Si dos frontales tienen largos parecidos (±30mm), conserva el "más
+    # redondo" (múltiplo de 25mm). Imprescindible ANTES del snap porque
+    # un frontal artefacto (ej. 576) envenenaría el set de cotas conocidas.
+    _dedup_frontales(trabajo)
+
+    # ── 0) Snap de vértices a cotas conocidas ───────────────────────────
+    # Las polilíneas pixel-traceadas suelen tener ±2-5% de error respecto
+    # a las cotas escritas en el plano. Snap-eamos cada coord a la cota
+    # más cercana dentro de tolerancia para que las longitudes de aristas
+    # coincidan con valores reales (576→600, 334→375, etc.).
+    cotas_conocidas = _recolectar_cotas(trabajo, encimera)
+    if cotas_conocidas:
+        verts_snap, snap_log = _snap_vertices_a_cotas(encimera.vertices_mm, cotas_conocidas)
+        if snap_log['x'] or snap_log['y']:
+            encimera.vertices_mm = verts_snap
+            xs = [v[0] for v in verts_snap]
+            ys = [v[1] for v in verts_snap]
+            encimera.largo_mm = float(max(xs) - min(xs))
+            encimera.ancho_mm = float(max(ys) - min(ys))
+            cambios = []
+            for orig, dst in snap_log['x'].items():
+                cambios.append(f"x:{orig}→{dst}")
+            for orig, dst in snap_log['y'].items():
+                cambios.append(f"y:{orig}→{dst}")
+            trabajo.advertencias.append(
+                f"Postproc: snap vértices a cotas — {', '.join(cambios)}")
+
+    aristas = _clasificar_aristas_encimera(encimera.vertices_mm)
+    if not aristas:
+        return
+    # Solo actuamos si hay al menos un vértice cóncavo (= forma no-rectangular)
+    if not any(a['tipo'] in ('frontal', 'cabeza') for a in aristas):
+        return
+
+    # ── 1) Recalcular pulidos del frente y cabezas ──────────────────────
+    # Notas SIN la palabra 'cabeza' para no disparar _completar_ingletes_implicitos.
+    pulidos_geo = []
+    for a in aristas:
+        if a['tipo'] in ('frontal', 'cabeza') and a['len'] >= 50:
+            etiqueta_geo = 'frente' if a['tipo'] == 'frontal' else 'extremo'
+            pulidos_geo.append(Canto(
+                tipo='recto_pulido',
+                longitud_ml=round(a['len'] / 1000.0, 3),
+                notas=f"arista idx={a['idx']} ({etiqueta_geo} geom)",
+            ))
+    if pulidos_geo:
+        trabajo.cantos = [c for c in trabajo.cantos
+                          if not c.tipo.startswith('recto_pulido')]
+        trabajo.cantos.extend(pulidos_geo)
+        trabajo.advertencias.append(
+            f"Postproc: pulidos recalculados desde polígono ({len(pulidos_geo)} tramos)")
+
+    # ── 1b) Recalcular ingletes geométricos en las esquinas pulido-pulido ─
+    # Borra ingletes con marca "implícito" (auto-generados anteriormente) y
+    # crea uno por cada vértice donde dos aristas pulidas se encuentran.
+    nuevos_ingletes = []
+    n_v = len(encimera.vertices_mm)
+    aristas_pulidas_idx = {a['idx'] for a in aristas if a['tipo'] in ('frontal', 'cabeza')}
+    for v in range(n_v):
+        # Aristas que terminan o empiezan en este vértice: idx (v-1) y idx v
+        e_prev = (v - 1) % n_v
+        e_next = v
+        if e_prev in aristas_pulidas_idx and e_next in aristas_pulidas_idx:
+            # Longitud típica del inglete = grosor del material (no la conocemos
+            # exactamente, así que usamos 0.6 como fondo estándar de cabeza)
+            nuevos_ingletes.append(Canto(
+                tipo='ingletado',
+                longitud_ml=0.6,
+                notas=f"esquina vértice idx={v} (geom auto)",
+            ))
+    if nuevos_ingletes:
+        # Eliminar ingletes auto-generados antes (los del completer viejo)
+        trabajo.cantos = [c for c in trabajo.cantos
+                          if not (c.tipo == 'ingletado'
+                                  and ('implícito' in (c.notas or '').lower()
+                                       or 'auto' in (c.notas or '').lower()))]
+        trabajo.cantos.extend(nuevos_ingletes)
+        trabajo.advertencias.append(
+            f"Postproc: ingletes geométricos {len(nuevos_ingletes)} en esquinas pulido-pulido")
+
+    # (dedup ya ejecutado al inicio antes del snap)
+
+    # ── 3) Asegurar frontal contra la pared más larga ───────────────────
+    paredes = [a for a in aristas if a['tipo'] == 'pared']
+    if paredes:
+        L_pared = max(a['len'] for a in paredes)
+        if L_pared >= 1500:
+            existe = any(
+                p.tipo == 'frontal' and p.largo_mm
+                and abs(p.largo_mm - L_pared) <= max(150, L_pared * 0.10)
+                for p in trabajo.piezas
+            )
+            if not existe:
+                ref = next((p for p in trabajo.piezas if p.tipo == 'frontal'), None)
+                H = (ref.altura_mm if ref and ref.altura_mm else 600)
+                mat_rol = ref.material_rol if ref else 'frontal'
+                trabajo.piezas.append(Pieza(
+                    tipo='frontal',
+                    material_rol=mat_rol,
+                    largo_mm=round(L_pared, 0),
+                    altura_mm=H,
+                    zona='frontal contra pared larga',
+                    notas='Auto-añadido (postproc): pared larga sin chapeado explícito',
+                ))
+                trabajo.advertencias.append(
+                    f"Postproc: añadido frontal {round(L_pared, 0)}×{H}mm contra pared larga")
 
 
 def _completar_ingletes_implicitos(trabajo: TrabajoExtraido) -> None:
