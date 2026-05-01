@@ -1422,8 +1422,11 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
     # (dedup ya ejecutado al inicio antes del snap)
 
     # ── 3) Asegurar frontal contra la pared más larga ───────────────────
+    # Solo si la cocina YA tiene al menos un frontal: si la plantilla dice
+    # FRONTAL=NO la lista de frontales viene vacía y no debemos auto-añadir.
+    ref = next((p for p in trabajo.piezas if p.tipo == 'frontal'), None)
     paredes = [a for a in aristas if a['tipo'] == 'pared']
-    if paredes:
+    if ref and paredes:
         L_pared = max(a['len'] for a in paredes)
         if L_pared >= 1500:
             existe = any(
@@ -1432,9 +1435,8 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                 for p in trabajo.piezas
             )
             if not existe:
-                ref = next((p for p in trabajo.piezas if p.tipo == 'frontal'), None)
-                H = (ref.altura_mm if ref and ref.altura_mm else 600)
-                mat_rol = ref.material_rol if ref else 'frontal'
+                H = (ref.altura_mm if ref.altura_mm else 600)
+                mat_rol = ref.material_rol or 'frontal'
                 trabajo.piezas.append(Pieza(
                     tipo='frontal',
                     material_rol=mat_rol,
