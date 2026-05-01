@@ -509,6 +509,54 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
                 if polys_aqui:
                     polilineas_text.append({"pagina": pid, "canvas": [cw, ch], "polilineas": polys_aqui})
 
+            # ── PAREDES Y MUEBLES ALTOS (ground truth del operador) ──────
+            paredes_por_pagina = []
+            ma_por_pagina = []
+            for pid, pdata in (anotaciones.get("paginas_anotadas") or {}).items():
+                cw = pdata.get("canvas_w")
+                ch = pdata.get("canvas_h")
+                paredes_aqui = []
+                ma_aqui = []
+                for et in pdata.get("etiquetas", []):
+                    pts = et.get("puntos")
+                    if not pts:
+                        continue
+                    tipo = et.get("tipo")
+                    if tipo == "pared":
+                        paredes_aqui.append({"modo": et.get("modo"), "puntos": pts})
+                    elif tipo == "muebles_altos":
+                        ma_aqui.append({"modo": et.get("modo"), "puntos": pts})
+                if paredes_aqui:
+                    paredes_por_pagina.append({"pagina": pid, "canvas": [cw, ch], "trazos": paredes_aqui})
+                if ma_aqui:
+                    ma_por_pagina.append({"pagina": pid, "canvas": [cw, ch], "trazos": ma_aqui})
+
+            if paredes_por_pagina or ma_por_pagina:
+                ctx += ("\n\n🧱 PAREDES Y MUEBLES ALTOS — GROUND TRUTH DEL OPERADOR:\n"
+                        "El operador ha trazado las paredes (gris oscuro) y/o las proyecciones "
+                        "de los muebles altos (gris claro) sobre el plano. Son **autoritativos**.\n\n"
+                        "REGLA DE PULIDOS: Una arista de la encimera que esté pegada a un trazo "
+                        "de PARED o de MUEBLES_ALTOS NO se pule. Solo se pulen las aristas que dan "
+                        "a espacio libre de la cocina. Si un trazo de pared cae sobre/junto a una "
+                        "arista del polígono de la encimera, esa arista NO emite `recto_pulido` ni "
+                        "participa en ingletes.\n\n"
+                        "REGLA DE FRONTAL/CHAPEADO: La pieza FRONTAL (chapeado) sólo va donde haya "
+                        "muebles bajos (espacio entre encimera y suelo) que reciban revestimiento — "
+                        "típicamente bajo la encimera contra una pared. La presencia de MUEBLES_ALTOS "
+                        "en la zona NO implica frontal allí.\n")
+                for p in paredes_por_pagina:
+                    ctx += f"\nPared en página '{p['pagina']}' (canvas {p['canvas'][0]}×{p['canvas'][1]}px):\n"
+                    for tr in p["trazos"]:
+                        n = len(tr["puntos"])
+                        muestra = tr["puntos"][:6] + (["..."] if n > 6 else [])
+                        ctx += f"  - {tr['modo']} ({n}pt): {muestra}\n"
+                for p in ma_por_pagina:
+                    ctx += f"\nMuebles altos en página '{p['pagina']}' (canvas {p['canvas'][0]}×{p['canvas'][1]}px):\n"
+                    for tr in p["trazos"]:
+                        n = len(tr["puntos"])
+                        muestra = tr["puntos"][:6] + (["..."] if n > 6 else [])
+                        ctx += f"  - {tr['modo']} ({n}pt): {muestra}\n"
+
             if polilineas_text:
                 ctx += ("\n\n📐 POLILÍNEAS EXACTAS DEL OPERADOR — VÉRTICES AUTORITATIVOS:\n"
                         "El operador trazó polilíneas con click vértice a vértice. "

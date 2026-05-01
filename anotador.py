@@ -53,15 +53,17 @@ ROOTS = [
 ]
 
 PALETA = [
-    {"id": "encimera", "color": "#FFD966", "label": "encimera", "tecla": "1"},
-    {"id": "frontal",  "color": "#5B9BD5", "label": "frontal/chapeado", "tecla": "2"},
-    {"id": "zocalo",   "color": "#9B7BC9", "label": "zócalo/rodapié", "tecla": "3"},
-    {"id": "copete",   "color": "#F4A460", "label": "copete", "tecla": "4"},
-    {"id": "costado",  "color": "#70AD47", "label": "costado/cascada", "tecla": "5"},
-    {"id": "pilar",    "color": "#A0522D", "label": "pilar", "tecla": "6"},
-    {"id": "hueco",    "color": "#E63946", "label": "hueco", "tecla": "7"},
-    {"id": "pulido",   "color": "#00CED1", "label": "pulido (línea)", "tecla": "8"},
-    {"id": "inglete",  "color": "#FF1493", "label": "inglete (línea)", "tecla": "9"},
+    {"id": "encimera",       "color": "#FFD966", "label": "encimera", "tecla": "1"},
+    {"id": "frontal",        "color": "#5B9BD5", "label": "frontal/chapeado", "tecla": "2"},
+    {"id": "zocalo",         "color": "#9B7BC9", "label": "zócalo/rodapié", "tecla": "3"},
+    {"id": "copete",         "color": "#F4A460", "label": "copete", "tecla": "4"},
+    {"id": "costado",        "color": "#70AD47", "label": "costado/cascada", "tecla": "5"},
+    {"id": "pilar",          "color": "#A0522D", "label": "pilar", "tecla": "6"},
+    {"id": "hueco",          "color": "#E63946", "label": "hueco", "tecla": "7"},
+    {"id": "pulido",         "color": "#00CED1", "label": "pulido (línea)", "tecla": "8"},
+    {"id": "inglete",        "color": "#FF1493", "label": "inglete (línea)", "tecla": "9"},
+    {"id": "pared",          "color": "#444444", "label": "pared (línea/área)", "tecla": "0"},
+    {"id": "muebles_altos",  "color": "#B8B8B8", "label": "muebles altos (área)", "tecla": "Q"},
 ]
 
 
@@ -931,9 +933,10 @@ document.querySelectorAll('.pag-item').forEach((el, i) => {
 // Atajos teclado
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'TEXTAREA') return;
-  // Color por número
+  // Color por tecla (case-insensitive para letras)
   for (let i = 0; i < PALETA.length; i++) {
-    if (e.key === PALETA[i].tecla) {
+    if (e.key === PALETA[i].tecla
+        || e.key.toLowerCase() === PALETA[i].tecla.toLowerCase()) {
       document.querySelectorAll('.color-btn')[i].click();
       e.preventDefault(); return;
     }
@@ -979,11 +982,26 @@ async function guardarPaginaActual(tieneTrazos) {
       n_puntos: t.puntos.length,
       modo: t.tipo,  // 'pen' o 'poly'
     };
-    // Solo guardamos los puntos crudos en polilíneas (vértices exactos);
-    // no en mano alzada (demasiados puntos, irrelevantes).
-    if (t.tipo === 'poly') {
-      meta.puntos = t.puntos.map(p => [Math.round(p[0]), Math.round(p[1])]);
-      meta.cerrado = !!t.cerrado;
+    // Persistimos puntos crudos en polilíneas (vértices exactos) y en
+    // anotaciones de paredes/muebles_altos (necesarias para que el
+    // postprocesador clasifique aristas de la encimera por proximidad).
+    const persistir_puntos = t.tipo === 'poly'
+        || t.tipo_pieza === 'pared'
+        || t.tipo_pieza === 'muebles_altos';
+    if (persistir_puntos) {
+      // Submuestreo: si son demasiados puntos (mano alzada larga), uno cada N
+      const todos = t.puntos.map(p => [Math.round(p[0]), Math.round(p[1])]);
+      const max_puntos = 400;
+      let pts = todos;
+      if (todos.length > max_puntos) {
+        const step = Math.ceil(todos.length / max_puntos);
+        pts = todos.filter((_, k) => k % step === 0);
+        if (pts[pts.length - 1] !== todos[todos.length - 1]) {
+          pts.push(todos[todos.length - 1]);
+        }
+      }
+      meta.puntos = pts;
+      if (t.tipo === 'poly') meta.cerrado = !!t.cerrado;
     }
     return meta;
   });

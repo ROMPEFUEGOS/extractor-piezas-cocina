@@ -986,8 +986,14 @@ def extract_json_from_response(text: str) -> Optional[dict]:
     return None
 
 
-def json_to_trabajo(data: dict, folder_info: dict) -> TrabajoExtraido:
-    """Convierte el dict extraído en un objeto TrabajoExtraido."""
+def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtraido:
+    """Convierte el dict extraído en un objeto TrabajoExtraido.
+
+    Si se proporciona `folder`, además se cargan las anotaciones del operador
+    para paredes y muebles_altos (capas nuevas del anotador) y se inyectan
+    en el objeto antes del postproc para que la reconciliación las use como
+    verdad sobre qué aristas son pared.
+    """
 
     def safe_float(v):
         if v is None:
@@ -1089,6 +1095,11 @@ def json_to_trabajo(data: dict, folder_info: dict) -> TrabajoExtraido:
         confianza=data.get('confianza', 'media'),
         advertencias=data.get('advertencias', []),
     )
+    if folder is not None:
+        try:
+            _cargar_paredes_y_muebles_altos(folder, trabajo)
+        except Exception as e:
+            trabajo.advertencias.append(f"Postproc: error cargando paredes/muebles_altos: {e}")
     _reconciliar_geometria_encimera(trabajo)
     _completar_copete_principal(trabajo)
     _completar_ingletes_implicitos(trabajo)
@@ -1278,6 +1289,128 @@ def _clasificar_aristas_encimera(verts: list) -> list:
     return aristas
 
 
+def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
+    """Lee `anotaciones.json` del proyecto, convierte los trazos del operador
+    para `pared` y `muebles_altos` desde pixel-space del canvas a mm-space del
+    polígono de la encimera (usando la misma escala/traslación que aplicó a la
+    polilínea de encimera), y stash-ea las polilíneas mm en
+    `trabajo._paredes_mm` / `trabajo._muebles_altos_mm` para que el postproc
+    las consuma.
+    """
+    import math as _math
+    anot_path = folder / "anotaciones.json"
+    if not anot_path.exists():
+        return
+    try:
+        anot = json.loads(anot_path.read_text(encoding='utf-8'))
+    except Exception:
+        return
+
+    # Buscar la polilínea cerrada de encimera en píxeles
+    enc_pix = None
+    for pid, pdata in (anot.get("paginas_anotadas") or {}).items():
+        for et in pdata.get("etiquetas", []):
+            if (et.get("modo") == "poly" and et.get("cerrado")
+                    and et.get("tipo") == "encimera" and et.get("puntos")):
+                enc_pix = et["puntos"]
+                break
+        if enc_pix:
+            break
+    if not enc_pix:
+        return
+
+    # Buscar la encimera con vertices_mm coincidente en número de vértices
+    enc = next((p for p in trabajo.piezas
+                if p.tipo == 'encimera' and p.vertices_mm
+                and len(p.vertices_mm) == len(enc_pix)),
+               None)
+    if not enc:
+        return
+
+    # Estimar escala mm/px (uniforme) y signos por eje (Claude no debería invertir,
+    # pero verificamos por si acaso) usando promedio de longitudes de aristas
+    n = len(enc_pix)
+    escalas = []
+    for i in range(n):
+        x1p, y1p = enc_pix[i]
+        x2p, y2p = enc_pix[(i + 1) % n]
+        x1m, y1m = enc.vertices_mm[i]
+        x2m, y2m = enc.vertices_mm[(i + 1) % n]
+        L_px = _math.hypot(x2p - x1p, y2p - y1p)
+        L_mm = _math.hypot(x2m - x1m, y2m - y1m)
+        if L_px > 5:
+            escalas.append(L_mm / L_px)
+    if not escalas:
+        return
+    escala = sum(escalas) / len(escalas)
+
+    def _signo(dp_list, dm_list):
+        # Devuelve +1 si dp y dm tienen mismo signo en promedio, -1 si opuesto
+        suma = 0.0
+        for dp, dm in zip(dp_list, dm_list):
+            if abs(dp) > 5:
+                suma += dm * dp
+        return 1.0 if suma >= 0 else -1.0
+
+    dxs_p, dys_p, dxs_m, dys_m = [], [], [], []
+    for i in range(n):
+        x1p, y1p = enc_pix[i]; x2p, y2p = enc_pix[(i + 1) % n]
+        x1m, y1m = enc.vertices_mm[i]; x2m, y2m = enc.vertices_mm[(i + 1) % n]
+        dxs_p.append(x2p - x1p); dys_p.append(y2p - y1p)
+        dxs_m.append(x2m - x1m); dys_m.append(y2m - y1m)
+    sx = _signo(dxs_p, dxs_m)
+    sy = _signo(dys_p, dys_m)
+
+    # Resolver offset: vertices_mm[0] = sx * enc_pix[0] * escala + ox
+    ox = enc.vertices_mm[0][0] - sx * enc_pix[0][0] * escala
+    oy = enc.vertices_mm[0][1] - sy * enc_pix[0][1] * escala
+
+    def _pix_to_mm(pts):
+        return [(sx * x * escala + ox, sy * y * escala + oy) for x, y in pts]
+
+    paredes_mm = []
+    muebles_altos_mm = []
+    for pid, pdata in (anot.get("paginas_anotadas") or {}).items():
+        for et in pdata.get("etiquetas", []):
+            pts = et.get("puntos")
+            if not pts:
+                continue
+            tipo = et.get("tipo")
+            if tipo == "pared":
+                paredes_mm.append(_pix_to_mm(pts))
+            elif tipo == "muebles_altos":
+                muebles_altos_mm.append(_pix_to_mm(pts))
+
+    if paredes_mm:
+        trabajo._paredes_mm = paredes_mm  # type: ignore[attr-defined]
+    if muebles_altos_mm:
+        trabajo._muebles_altos_mm = muebles_altos_mm  # type: ignore[attr-defined]
+
+
+def _dist_punto_a_segmento(px, py, x1, y1, x2, y2):
+    import math as _math
+    dx = x2 - x1
+    dy = y2 - y1
+    L2 = dx * dx + dy * dy
+    if L2 < 1:
+        return _math.hypot(px - x1, py - y1)
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L2))
+    cx = x1 + t * dx
+    cy = y1 + t * dy
+    return _math.hypot(px - cx, py - cy)
+
+
+def _dist_minima_arista_a_trazos(p1, p2, trazos):
+    """Distancia mínima entre el segmento p1→p2 y todos los puntos de los trazos."""
+    md = float('inf')
+    for trazo in trazos:
+        for pt in trazo:
+            d = _dist_punto_a_segmento(pt[0], pt[1], p1[0], p1[1], p2[0], p2[1])
+            if d < md:
+                md = d
+    return md
+
+
 def _dedup_frontales(trabajo: TrabajoExtraido) -> None:
     """Elimina frontales duplicados (largos a ±30mm). Conserva el "más redondo"
     (múltiplo de 25mm); el otro se considera artefacto de medición."""
@@ -1369,8 +1502,38 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
     aristas = _clasificar_aristas_encimera(encimera.vertices_mm)
     if not aristas:
         return
-    # Solo actuamos si hay al menos un vértice cóncavo (= forma no-rectangular)
-    if not any(a['tipo'] in ('frontal', 'cabeza') for a in aristas):
+
+    # ── 0b) Override por anotaciones del operador ───────────────────────
+    # Si el operador trazó polilíneas de "pared" o "muebles_altos" (capas 0/Q
+    # del anotador), las usamos como verdad: cualquier arista de la encimera
+    # cuyo segmento esté pegado a un trazo de pared o muebles_altos NO se
+    # pule ni participa en ingletes.
+    paredes_mm = getattr(trabajo, '_paredes_mm', None) or []
+    ma_mm = getattr(trabajo, '_muebles_altos_mm', None) or []
+    TOL_PARED_MM = 250
+    if paredes_mm or ma_mm:
+        n_override = 0
+        n_libre = 0
+        for a in aristas:
+            p1 = encimera.vertices_mm[a['v1']]
+            p2 = encimera.vertices_mm[a['v2']]
+            d_p = _dist_minima_arista_a_trazos(p1, p2, paredes_mm) if paredes_mm else float('inf')
+            d_m = _dist_minima_arista_a_trazos(p1, p2, ma_mm) if ma_mm else float('inf')
+            if min(d_p, d_m) <= TOL_PARED_MM:
+                a['tipo'] = 'pared'
+                n_override += 1
+            else:
+                # Aristas no marcadas como pared → frontal (la geometría
+                # interna deja de mandar aquí; la anotación es autoritativa)
+                if a['tipo'] != 'pared':
+                    a['tipo'] = 'frontal'
+                    n_libre += 1
+        trabajo.advertencias.append(
+            f"Postproc: aristas clasificadas por anotación operador "
+            f"(pared:{n_override} frente:{n_libre}, tol={TOL_PARED_MM}mm)")
+    elif not any(a['tipo'] in ('frontal', 'cabeza') for a in aristas):
+        # Sin anotaciones y polígono convexo: no actuamos (no podemos saber
+        # qué es pared sin info adicional).
         return
 
     # ── 1) Recalcular pulidos del frente y cabezas ──────────────────────
@@ -1646,7 +1809,7 @@ def extract_trabajo(
         trabajo.archivos_fuente = archivos
         return trabajo
 
-    trabajo = json_to_trabajo(data, folder_info)
+    trabajo = json_to_trabajo(data, folder_info, folder=folder)
     trabajo = _limpiar_trabajo(trabajo)
 
     # Si materiales vacíos con muchos archivos, reintentar con menos PDFs
@@ -1661,7 +1824,7 @@ def extract_trabajo(
             )
             data2 = extract_json_from_response(msg2.content[0].text)
             if data2 and data2.get('materiales'):
-                trabajo2 = json_to_trabajo(data2, folder_info)
+                trabajo2 = json_to_trabajo(data2, folder_info, folder=folder)
                 trabajo2 = _limpiar_trabajo(trabajo2)
                 trabajo2.archivos_fuente = archivos2
                 trabajo2.advertencias.append(f'Reintento con {len(archivos2)} archivos prioritarios (original tenía {len(archivos)})')
