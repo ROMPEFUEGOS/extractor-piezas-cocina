@@ -142,6 +142,9 @@ class TrabajoExtraido:
 
         d = {}
         for k, v in self.__dict__.items():
+            # Saltar atributos privados (cache de postproc, etc.) — no se serializan.
+            if k.startswith('_'):
+                continue
             converted = _conv(v)
             if converted is not None and converted != [] and converted != {}:
                 d[k] = converted

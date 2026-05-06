@@ -983,11 +983,13 @@ async function guardarPaginaActual(tieneTrazos) {
       modo: t.tipo,  // 'pen' o 'poly'
     };
     // Persistimos puntos crudos en polilíneas (vértices exactos) y en
-    // anotaciones de paredes/muebles_altos (necesarias para que el
-    // postprocesador clasifique aristas de la encimera por proximidad).
+    // anotaciones que el postprocesador necesita para clasificar aristas
+    // y emitir cantos: pared / muebles_altos / copete (descartan pulido)
+    // y pulido / inglete (autoritativos para emitir cantos).
+    const tipos_con_puntos = new Set(
+        ['pared', 'muebles_altos', 'copete', 'pulido', 'inglete']);
     const persistir_puntos = t.tipo === 'poly'
-        || t.tipo_pieza === 'pared'
-        || t.tipo_pieza === 'muebles_altos';
+        || tipos_con_puntos.has(t.tipo_pieza);
     if (persistir_puntos) {
       // Submuestreo: si son demasiados puntos (mano alzada larga), uno cada N
       const todos = t.puntos.map(p => [Math.round(p[0]), Math.round(p[1])]);
