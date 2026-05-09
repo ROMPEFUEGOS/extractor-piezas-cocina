@@ -1115,7 +1115,13 @@ def _completar_copete_principal(trabajo: TrabajoExtraido) -> None:
     Heurística: por cada encimera horizontal con largo > 1.5m, si hay 1 o más
     copetes pequeños (≤ ancho encimera + 100mm de tolerancia) y NO hay copete
     de longitud cercana al largo de la encimera, emitir el copete principal.
+
+    Salvaguarda: si el operador anotó copetes en el plano (capa naranja con
+    puntos persistidos), su anotación es la verdad — no inventamos copetes
+    adicionales para no duplicar las piezas reales.
     """
+    if getattr(trabajo, '_copetes_por_geo', None):
+        return  # Operador ya señaló los copetes; no auto-añadir nada
     copetes = [p for p in trabajo.piezas if p.tipo == 'copete']
     if not copetes:
         return  # Plantilla decía copete=NO, no inventar
@@ -1349,48 +1355,110 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
     pulidos_por_geo = {}
     ingletes_por_geo = {}
 
-    # Para cada encimera del trabajo con vertices_mm, intentar emparejarla con
-    # una polilínea pixel-space del operador (por número de vértices) y derivar
-    # su transformación pixel→mm-local específica. Luego convertir los trazos.
+    # Asociar cada encimera con UNA polilínea pixel del operador. Cuando hay
+    # varias encimeras con el mismo número de vértices, matcheamos por área:
+    # ordenamos ambas listas por tamaño descendente y emparejamos posición a
+    # posición. Para encimeras con # vértices distinto, primero matcheamos
+    # por # vértices exacto si es posible.
+    encimeras_validas = [p for p in trabajo.piezas
+                         if p.tipo in ('encimera', 'isla') and p.vertices_mm
+                         and len(p.vertices_mm) >= 3]
+
+    def _bbox_area_px(poly):
+        xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
+        return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+    polys_disponibles = list(range(len(encimera_polylines_pix)))
+    enc_a_poly = {}  # id(enc) → idx en encimera_polylines_pix
+
+    # Geometrías únicas (dedup opcion1/2 por vertices_mm); mantener orden
+    encs_unicas = []
+    seen_keys = set()
+    for e in encimeras_validas:
+        k = tuple(tuple(v) for v in e.vertices_mm)
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        encs_unicas.append(e)
+
+    # Ordenar por área descendente y emparejar posicionalmente con polilíneas
+    encs_ord = sorted(encs_unicas, key=lambda e: -abs(_signed_area_2d(e.vertices_mm)))
+    polys_ord = sorted(polys_disponibles, key=lambda i: -_bbox_area_px(encimera_polylines_pix[i]))
+    for enc, poly_idx in zip(encs_ord, polys_ord):
+        enc_a_poly[id(enc)] = poly_idx
+
+    def _bbox(pts):
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+
     for enc in trabajo.piezas:
         if enc.tipo not in ('encimera', 'isla') or not enc.vertices_mm:
             continue
+        # Encontrar polilínea asociada por id de objeto, o por geometría
+        # equivalente para opcion1/2 (mismas coordenadas)
+        if id(enc) in enc_a_poly:
+            cand = encimera_polylines_pix[enc_a_poly[id(enc)]]
+        else:
+            k_enc = tuple(tuple(v) for v in enc.vertices_mm)
+            poly_idx = None
+            for e2 in encs_unicas:
+                if tuple(tuple(v) for v in e2.vertices_mm) == k_enc:
+                    poly_idx = enc_a_poly.get(id(e2))
+                    break
+            if poly_idx is None:
+                continue
+            cand = encimera_polylines_pix[poly_idx]
         n_v = len(enc.vertices_mm)
-        # Buscar polilínea pixel con mismo número de vértices
-        cand = next((p for p in encimera_polylines_pix if len(p) == n_v), None)
-        if not cand:
+        if len(cand) != n_v:
             continue
-        # Calcular escala (mm/px uniforme) por longitudes de aristas
-        escalas = []
-        for i in range(n_v):
-            x1p, y1p = cand[i]
-            x2p, y2p = cand[(i + 1) % n_v]
-            x1m, y1m = enc.vertices_mm[i]
-            x2m, y2m = enc.vertices_mm[(i + 1) % n_v]
-            L_px = _math.hypot(x2p - x1p, y2p - y1p)
-            L_mm = _math.hypot(x2m - x1m, y2m - y1m)
-            if L_px > 5:
-                escalas.append(L_mm / L_px)
-        if not escalas:
-            continue
-        escala = sum(escalas) / len(escalas)
-        # Signos por eje (Claude no debería invertir, comprobamos)
-        suma_x = sum((c2[0] - c1[0]) * (m2[0] - m1[0])
-                     for c1, c2, m1, m2 in zip(cand, cand[1:] + [cand[0]],
-                                                enc.vertices_mm,
-                                                enc.vertices_mm[1:] + [enc.vertices_mm[0]]))
-        suma_y = sum((c2[1] - c1[1]) * (m2[1] - m1[1])
-                     for c1, c2, m1, m2 in zip(cand, cand[1:] + [cand[0]],
-                                                enc.vertices_mm,
-                                                enc.vertices_mm[1:] + [enc.vertices_mm[0]]))
-        sx = 1.0 if suma_x >= 0 else -1.0
-        sy = 1.0 if suma_y >= 0 else -1.0
-        # Offset: vertices_mm[0] = sx * cand[0] * escala + ox
-        ox = enc.vertices_mm[0][0] - sx * cand[0][0] * escala
-        oy = enc.vertices_mm[0][1] - sy * cand[0][1] * escala
 
-        def _pix_to_mm(pts, sx=sx, sy=sy, escala=escala, ox=ox, oy=oy):
-            return [(sx * x * escala + ox, sy * y * escala + oy) for x, y in pts]
+        # Transformación pixel→mm-local por bbox: encimera siempre está en
+        # `[0..largo] × [0..ancho]` después de la traslación al origen, así
+        # que mapeamos los rangos del bbox pixel al bbox mm. Esto es robusto
+        # a rotaciones/reordenamientos de vértices entre pixel y mm.
+        x_min_px, y_min_px, x_max_px, y_max_px = _bbox(cand)
+        x_min_mm, y_min_mm, x_max_mm, y_max_mm = _bbox(enc.vertices_mm)
+        W_px = max(x_max_px - x_min_px, 1)
+        H_px = max(y_max_px - y_min_px, 1)
+        W_mm = x_max_mm - x_min_mm
+        H_mm = y_max_mm - y_min_mm
+        if W_mm < 50 or H_mm < 50:
+            continue
+        # Decidir si los ejes pixel→mm están alineados (xpx→xmm, ypx→ymm)
+        # o rotados 90° (xpx→ymm, ypx→xmm). Comparamos aspect ratios.
+        ar_px = W_px / H_px
+        ar_mm = W_mm / H_mm
+        rotado = abs(ar_px - ar_mm) > abs(ar_px - 1.0/ar_mm) if ar_mm > 0 else False
+        if rotado:
+            # x_px ↔ y_mm, y_px ↔ x_mm
+            sx_eje = 'y'  # mm x viene de pixel y
+            sy_eje = 'x'
+            escala_xmm = W_mm / H_px
+            escala_ymm = H_mm / W_px
+        else:
+            sx_eje = 'x'
+            sy_eje = 'y'
+            escala_xmm = W_mm / W_px
+            escala_ymm = H_mm / H_px
+        escala = (escala_xmm + escala_ymm) / 2  # solo informativa
+
+        def _pix_to_mm(pts, sx_eje=sx_eje, sy_eje=sy_eje,
+                       escala_xmm=escala_xmm, escala_ymm=escala_ymm,
+                       x_min_px=x_min_px, y_min_px=y_min_px,
+                       x_min_mm=x_min_mm, y_min_mm=y_min_mm,
+                       x_max_px=x_max_px, y_max_px=y_max_px):
+            res = []
+            for x, y in pts:
+                if sx_eje == 'x':
+                    mm_x = x_min_mm + (x - x_min_px) * escala_xmm
+                else:  # x_mm comes from pixel y
+                    mm_x = x_min_mm + (y - y_min_px) * escala_xmm
+                if sy_eje == 'y':
+                    mm_y = y_min_mm + (y - y_min_px) * escala_ymm
+                else:
+                    mm_y = y_min_mm + (x - x_min_px) * escala_ymm
+                res.append((mm_x, mm_y))
+            return res
 
         geo_key = tuple(tuple(v) for v in enc.vertices_mm)
         paredes_por_geo[geo_key] = [_pix_to_mm(t) for t in paredes_pix]
@@ -1639,25 +1707,98 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # cubierta por un trazo. Si no, fallback geométrico: aristas no-pared.
         pulidos_op_local = pulidos_op_por_geo.get(geo_key, [])
         nuevos_pulidos = 0
+        # Track aristas cubiertas (operador pulido O inglete)
+        aristas_cubiertas = set()  # idx de aristas con algún canto operator
+        TOL_PERTENENCIA_MM = 400
+
         if pulidos_op_local:
-            aristas_op = set()
+            # Cada trazo cian del operador → 1 arista (la más cercana al
+            # CENTROIDE del trazo). El operador debe hacer un trazo separado
+            # por cada arista que quiera pulida.
             for stroke in pulidos_op_local:
+                if not stroke:
+                    continue
+                cx = sum(p[0] for p in stroke) / len(stroke)
+                cy = sum(p[1] for p in stroke) / len(stroke)
+                best_a = None
+                best_d = float('inf')
                 for a in aristas:
                     p1 = encimera.vertices_mm[a['v1']]
                     p2 = encimera.vertices_mm[a['v2']]
-                    if _dist_minima_arista_a_trazos(p1, p2, [stroke]) <= TOL_PULIDO_MM:
-                        aristas_op.add(a['idx'])
+                    d = _dist_punto_a_segmento(cx, cy, p1[0], p1[1], p2[0], p2[1])
+                    if d < best_d:
+                        best_d = d
+                        best_a = a
+                if best_a is None or best_d > TOL_PERTENENCIA_MM:
+                    continue
+                if best_a['idx'] in aristas_cubiertas:
+                    continue
+                aristas_cubiertas.add(best_a['idx'])
+                if best_a['len'] >= 50:
+                    trabajo.cantos.append(Canto(
+                        tipo='recto_pulido',
+                        longitud_ml=round(best_a['len'] / 1000.0, 3),
+                        notas=f"arista idx={best_a['idx']} (operador cian) en {zona_corta}",
+                    ))
+                    nuevos_pulidos += 1
+
+        # Emitir ingletes desde anotación del operador. Cada trazo magenta →
+        # arista más cercana al centroide (pertenecía a esta encimera si
+        # está dentro de tolerancia). Marca la arista como cubierta para que
+        # NO emita un pulido auto sobre la misma esquina.
+        ingletes_op_local = ingletes_op_por_geo.get(geo_key, [])
+        nuevos_ingletes_op = 0
+        for stroke in ingletes_op_local:
+            L_total = _path_length_mm(stroke)
+            if L_total < 50 or not stroke:
+                continue
+            cx = sum(p[0] for p in stroke) / len(stroke)
+            cy = sum(p[1] for p in stroke) / len(stroke)
+            best_a = None
+            best_d = float('inf')
             for a in aristas:
-                if a['idx'] in aristas_op and a['len'] >= 50:
+                p1 = encimera.vertices_mm[a['v1']]
+                p2 = encimera.vertices_mm[a['v2']]
+                d = _dist_punto_a_segmento(cx, cy, p1[0], p1[1], p2[0], p2[1])
+                if d < best_d:
+                    best_d = d
+                    best_a = a
+            if best_a is None or best_d > TOL_PERTENENCIA_MM:
+                continue
+            aristas_cubiertas.add(best_a['idx'])
+            trabajo.cantos.append(Canto(
+                tipo='ingletado',
+                longitud_ml=round(L_total / 1000.0, 3),
+                notas=f"trazo magenta operador en {zona_corta}",
+            ))
+            nuevos_ingletes_op += 1
+
+        # ── Auto-pulido para isla libre ─────────────────────────────────
+        # En islas exentas (sin paredes anotadas) TODOS los lados son visibles
+        # y se pulen, salvo los que ya tienen pulido o inglete. Esto cubre el
+        # caso donde el operador anotó solo 1 trazo pulido + 2 ingletes y dejó
+        # 1 lado sin marcar — debe ser pulido también.
+        n_pared_geo = sum(1 for a in aristas if a['tipo'] == 'pared')
+        es_isla = (encimera.tipo == 'isla'
+                   or 'isla' in (encimera.zona or '').lower())
+        if es_isla and n_pared_geo == 0:
+            for a in aristas:
+                if a['idx'] not in aristas_cubiertas and a['len'] >= 50:
+                    aristas_cubiertas.add(a['idx'])
                     trabajo.cantos.append(Canto(
                         tipo='recto_pulido',
                         longitud_ml=round(a['len'] / 1000.0, 3),
-                        notas=f"arista idx={a['idx']} (operador cian) en {zona_corta}",
+                        notas=f"arista idx={a['idx']} (auto isla libre) en {zona_corta}",
                     ))
                     nuevos_pulidos += 1
-        else:
+        elif not pulidos_op_local:
+            # Encimera convencional sin trazos pulido del operador → fallback
+            # geométrico: todas las aristas que NO son pared van pulidas
             for a in aristas:
-                if a['tipo'] in ('frontal', 'cabeza') and a['len'] >= 50:
+                if (a['tipo'] in ('frontal', 'cabeza')
+                        and a['idx'] not in aristas_cubiertas
+                        and a['len'] >= 50):
+                    aristas_cubiertas.add(a['idx'])
                     etiqueta_geo = 'frente' if a['tipo'] == 'frontal' else 'extremo'
                     trabajo.cantos.append(Canto(
                         tipo='recto_pulido',
@@ -1666,24 +1807,8 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                     ))
                     nuevos_pulidos += 1
 
-        # Emitir ingletes desde anotación del operador (un canto por trazo,
-        # longitud = path length del trazo en mm-local). Solo se emiten cuando
-        # el operador trazó algo; si no, se respetan los ingletes que ya tenga
-        # la lista (Claude o `_completar_ingletes_implicitos`).
-        ingletes_op_local = ingletes_op_por_geo.get(geo_key, [])
-        nuevos_ingletes_op = 0
-        for stroke in ingletes_op_local:
-            L = _path_length_mm(stroke)
-            if L >= 50:
-                trabajo.cantos.append(Canto(
-                    tipo='ingletado',
-                    longitud_ml=round(L / 1000.0, 3),
-                    notas=f"trazo magenta operador en {zona_corta}",
-                ))
-                nuevos_ingletes_op += 1
-
         if nuevos_pulidos or nuevos_ingletes_op:
-            origen = "operador" if pulidos_op_local else "geom"
+            origen = "operador" if pulidos_op_local else ("isla libre" if encimera.tipo == 'isla' else "geom")
             trabajo.advertencias.append(
                 f"Postproc [{zona_corta}]: {nuevos_pulidos} pulidos ({origen}) + {nuevos_ingletes_op} ingletes operador")
 

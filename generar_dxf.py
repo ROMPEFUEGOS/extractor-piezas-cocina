@@ -544,8 +544,14 @@ def generar_dxf(json_path: Path, output_path: Path):
             alt_texto = max(alt_texto, 25)
             añadir_etiqueta(msp, x + w / 2, y + h / 2, lineas_etq, alt_texto)
 
-            # Guardar info de isla para colocar huecos después
-            if tipo == 'encimera' and 'isla' in (zona or '').lower():
+            # (legacy isla_info: solo si NINGÚN hueco tiene centro_mm; en ese
+            # caso el código antiguo `añadir_huecos_isla` coloca placa+fregadero
+            # con posiciones estándar. Si hay centros reales, no lo usamos.)
+            tiene_centros = any(h.get('centro_x_mm') is not None
+                                and h.get('centro_y_mm') is not None
+                                for h in datos.get('huecos', []))
+            if (tipo in ('encimera', 'isla') and 'isla' in (zona or '').lower()
+                    and not tiene_centros):
                 if isla_info is None or w > isla_info['w_isla']:
                     isla_info = {'x_isla': x, 'y_isla': y, 'w_isla': w, 'h_isla': h}
 
