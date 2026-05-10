@@ -1170,14 +1170,20 @@ def _completar_copete_principal(trabajo: TrabajoExtraido) -> None:
     trabajo.piezas.extend(nuevos)
 
 
-def _recolectar_cotas(trabajo: TrabajoExtraido, encimera_skip) -> set:
-    """Recopila valores en mm que provienen de campos estructurados del JSON
-    (no de texto libre): dimensiones de piezas distintas a la encimera principal
-    y longitudes de cantos. Evitamos parsear advertencias o las notas de la
-    encimera porque suelen contener las mismas medidas erróneas del polígono
-    que estamos intentando corregir.
+def _recolectar_cotas(trabajo: TrabajoExtraido, encimera_skip) -> tuple:
+    """Recopila cotas en mm. Devuelve (cotas_globales, cotas_propias):
+      - cotas_globales: del JSON estructurado + texto general (advertencias y
+        notas de otras piezas) con patrón estricto "Nmm".
+      - cotas_propias: cotas mencionadas SOLO en la zona/notas de la encimera
+        siendo snap-eada (señal fuerte de cota explícita para esta pieza).
+
+    Las propias tienen prioridad en el snap: si una coord cae cerca de una
+    propia, snap a esa aunque haya otras candidatas más cercanas en globales.
     """
+    import re as _re
     cotas = set()
+    cotas_propias = set()
+    pat = _re.compile(r'\b(\d{3,4})\s*mm\b', _re.IGNORECASE)
     for p in trabajo.piezas:
         if p is encimera_skip:
             continue
@@ -1189,24 +1195,63 @@ def _recolectar_cotas(trabajo: TrabajoExtraido, encimera_skip) -> set:
     for c in trabajo.cantos:
         if c.longitud_ml and c.longitud_ml >= 0.05:
             cotas.add(int(round(c.longitud_ml * 1000)))
-    return cotas
+    # Texto general (advertencias + zona/notas de OTRAS piezas)
+    for w in (trabajo.advertencias or []):
+        for m in pat.findall(str(w)):
+            v = int(m)
+            if 100 <= v <= 10000:
+                cotas.add(v)
+    for p in trabajo.piezas:
+        if p is encimera_skip:
+            continue
+        for src in (p.zona, p.notas):
+            if src:
+                for m in pat.findall(str(src)):
+                    v = int(m)
+                    if 100 <= v <= 10000:
+                        cotas.add(v)
+    # Cotas propias de la encimera siendo snap-eada (mayor prioridad)
+    if encimera_skip:
+        for src in (encimera_skip.zona, encimera_skip.notas):
+            if src:
+                for m in pat.findall(str(src)):
+                    v = int(m)
+                    if 100 <= v <= 10000:
+                        cotas_propias.add(v)
+                        cotas.add(v)
+    return cotas, cotas_propias
 
 
 def _snap_vertices_a_cotas(verts: list, cotas: set,
+                            cotas_propias: set = None,
                             tol_pct: float = 0.10, tol_min_mm: float = 50) -> tuple:
     """Snapea las coordenadas únicas (x e y) del polígono a la cota más cercana
-    del set dentro de tolerancia. Preserva topología (no colapsa dos coords
-    originales distintas en el mismo valor). Devuelve (verts_nuevos, snap_log).
+    del set dentro de tolerancia. `cotas_propias` (cotas mencionadas
+    explícitamente en la zona/notas de ESTA encimera) tienen prioridad
+    absoluta sobre las globales — si una coord cae dentro de tolerancia
+    de una propia, snap a esa aunque haya una global más cercana.
     """
     if not cotas:
         return verts, {}
     cotas_sorted = sorted(cotas)
+    propias = cotas_propias or set()
 
     def _candidato(c):
         if c == 0:
             return c
         tol = max(tol_min_mm, abs(c) * tol_pct)
+        # 1) Si hay una cota propia dentro de tolerancia, tiene prioridad
+        propias_dentro = [k for k in propias if abs(k - c) <= tol]
+        if propias_dentro:
+            return min(propias_dentro, key=lambda k: abs(k - c))
+        # 2) Cotas globales del JSON
         cands = [k for k in cotas_sorted if abs(k - c) <= tol]
+        # 3) Múltiplos típicos de cocina (tol 5%/40mm)
+        tol_mult = min(tol, max(40, abs(c) * 0.05))
+        for paso in (100, 50, 25):
+            mult = round(c / paso) * paso
+            if mult > 0 and abs(mult - c) <= tol_mult:
+                cands.append(mult)
         if not cands:
             return c
         return min(cands, key=lambda k: abs(k - c))
@@ -1296,6 +1341,49 @@ def _clasificar_aristas_encimera(verts: list) -> list:
     return aristas
 
 
+def _trazos_a_mm_local(trazos_pix: list, cand_pix: list, vertices_mm: list) -> list:
+    """Convierte una lista de trazos en pixel-space a mm-local de una encimera,
+    usando bbox como referencia (robusto a reordenamiento de vértices entre
+    polilínea pixel del operador y vertices_mm de Claude).
+    """
+    if not trazos_pix or not cand_pix or not vertices_mm:
+        return []
+    xs_p = [p[0] for p in cand_pix]; ys_p = [p[1] for p in cand_pix]
+    xs_m = [v[0] for v in vertices_mm]; ys_m = [v[1] for v in vertices_mm]
+    x_min_px, y_min_px = min(xs_p), min(ys_p)
+    x_max_px, y_max_px = max(xs_p), max(ys_p)
+    x_min_mm, y_min_mm = min(xs_m), min(ys_m)
+    x_max_mm, y_max_mm = max(xs_m), max(ys_m)
+    W_px = max(x_max_px - x_min_px, 1)
+    H_px = max(y_max_px - y_min_px, 1)
+    W_mm = x_max_mm - x_min_mm
+    H_mm = y_max_mm - y_min_mm
+    if W_mm < 50 or H_mm < 50:
+        return []
+    ar_px = W_px / H_px
+    ar_mm = W_mm / H_mm
+    rotado = (ar_mm > 0
+              and abs(ar_px - ar_mm) > abs(ar_px - 1.0 / ar_mm))
+    if rotado:
+        # x_mm viene de pixel y, y_mm viene de pixel x
+        escala_xmm = W_mm / H_px
+        escala_ymm = H_mm / W_px
+    else:
+        escala_xmm = W_mm / W_px
+        escala_ymm = H_mm / H_px
+
+    def _pt(x, y):
+        if rotado:
+            mm_x = x_min_mm + (y - y_min_px) * escala_xmm
+            mm_y = y_min_mm + (x - x_min_px) * escala_ymm
+        else:
+            mm_x = x_min_mm + (x - x_min_px) * escala_xmm
+            mm_y = y_min_mm + (y - y_min_px) * escala_ymm
+        return (mm_x, mm_y)
+
+    return [[_pt(x, y) for x, y in t] for t in trazos_pix]
+
+
 def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
     """Lee `anotaciones.json` del proyecto y stashea, para CADA encimera del
     trabajo (cada una con su propio sistema de coords local-mm trasladado a
@@ -1349,17 +1437,9 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
     if not (paredes_pix or ma_pix or copetes_pix or pulidos_pix or ingletes_pix):
         return
 
-    paredes_por_geo = {}
-    ma_por_geo = {}
-    copetes_por_geo = {}
-    pulidos_por_geo = {}
-    ingletes_por_geo = {}
-
-    # Asociar cada encimera con UNA polilínea pixel del operador. Cuando hay
-    # varias encimeras con el mismo número de vértices, matcheamos por área:
-    # ordenamos ambas listas por tamaño descendente y emparejamos posición a
-    # posición. Para encimeras con # vértices distinto, primero matcheamos
-    # por # vértices exacto si es posible.
+    # Match polilínea↔encimera por área (estable, no depende de vertices_mm
+    # snap-eados). Almacenamos en pixel-space; la conversión a mm-local se
+    # hace ON-DEMAND en el reconciliador con los vertices actualizados.
     encimeras_validas = [p for p in trabajo.piezas
                          if p.tipo in ('encimera', 'isla') and p.vertices_mm
                          and len(p.vertices_mm) >= 3]
@@ -1368,10 +1448,6 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
         xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
         return (max(xs) - min(xs)) * (max(ys) - min(ys))
 
-    polys_disponibles = list(range(len(encimera_polylines_pix)))
-    enc_a_poly = {}  # id(enc) → idx en encimera_polylines_pix
-
-    # Geometrías únicas (dedup opcion1/2 por vertices_mm); mantener orden
     encs_unicas = []
     seen_keys = set()
     for e in encimeras_validas:
@@ -1381,102 +1457,37 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
         seen_keys.add(k)
         encs_unicas.append(e)
 
-    # Ordenar por área descendente y emparejar posicionalmente con polilíneas
     encs_ord = sorted(encs_unicas, key=lambda e: -abs(_signed_area_2d(e.vertices_mm)))
-    polys_ord = sorted(polys_disponibles, key=lambda i: -_bbox_area_px(encimera_polylines_pix[i]))
+    polys_ord = sorted(range(len(encimera_polylines_pix)),
+                       key=lambda i: -_bbox_area_px(encimera_polylines_pix[i]))
+
+    # trabajo._anot_pix[id(enc)] = {polilinea_pix, paredes_pix, ma_pix, ...}
+    anot_pix = {}
     for enc, poly_idx in zip(encs_ord, polys_ord):
-        enc_a_poly[id(enc)] = poly_idx
-
-    def _bbox(pts):
-        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-        return (min(xs), min(ys), max(xs), max(ys))
-
-    for enc in trabajo.piezas:
-        if enc.tipo not in ('encimera', 'isla') or not enc.vertices_mm:
+        cand = encimera_polylines_pix[poly_idx]
+        if len(cand) != len(enc.vertices_mm):
             continue
-        # Encontrar polilínea asociada por id de objeto, o por geometría
-        # equivalente para opcion1/2 (mismas coordenadas)
-        if id(enc) in enc_a_poly:
-            cand = encimera_polylines_pix[enc_a_poly[id(enc)]]
-        else:
-            k_enc = tuple(tuple(v) for v in enc.vertices_mm)
-            poly_idx = None
-            for e2 in encs_unicas:
-                if tuple(tuple(v) for v in e2.vertices_mm) == k_enc:
-                    poly_idx = enc_a_poly.get(id(e2))
-                    break
-            if poly_idx is None:
-                continue
-            cand = encimera_polylines_pix[poly_idx]
-        n_v = len(enc.vertices_mm)
-        if len(cand) != n_v:
+        anot_pix[id(enc)] = {
+            'polilinea_pix': cand,
+            'paredes_pix': paredes_pix,
+            'ma_pix': ma_pix,
+            'copetes_pix': copetes_pix,
+            'pulidos_pix': pulidos_pix,
+            'ingletes_pix': ingletes_pix,
+        }
+    # Las encimeras opcion1/opcion2 con misma geometría que una de las únicas
+    # apuntan al mismo registro
+    for enc in encimeras_validas:
+        if id(enc) in anot_pix:
             continue
+        k_enc = tuple(tuple(v) for v in enc.vertices_mm)
+        for e2 in encs_unicas:
+            if tuple(tuple(v) for v in e2.vertices_mm) == k_enc and id(e2) in anot_pix:
+                anot_pix[id(enc)] = anot_pix[id(e2)]
+                break
 
-        # Transformación pixel→mm-local por bbox: encimera siempre está en
-        # `[0..largo] × [0..ancho]` después de la traslación al origen, así
-        # que mapeamos los rangos del bbox pixel al bbox mm. Esto es robusto
-        # a rotaciones/reordenamientos de vértices entre pixel y mm.
-        x_min_px, y_min_px, x_max_px, y_max_px = _bbox(cand)
-        x_min_mm, y_min_mm, x_max_mm, y_max_mm = _bbox(enc.vertices_mm)
-        W_px = max(x_max_px - x_min_px, 1)
-        H_px = max(y_max_px - y_min_px, 1)
-        W_mm = x_max_mm - x_min_mm
-        H_mm = y_max_mm - y_min_mm
-        if W_mm < 50 or H_mm < 50:
-            continue
-        # Decidir si los ejes pixel→mm están alineados (xpx→xmm, ypx→ymm)
-        # o rotados 90° (xpx→ymm, ypx→xmm). Comparamos aspect ratios.
-        ar_px = W_px / H_px
-        ar_mm = W_mm / H_mm
-        rotado = abs(ar_px - ar_mm) > abs(ar_px - 1.0/ar_mm) if ar_mm > 0 else False
-        if rotado:
-            # x_px ↔ y_mm, y_px ↔ x_mm
-            sx_eje = 'y'  # mm x viene de pixel y
-            sy_eje = 'x'
-            escala_xmm = W_mm / H_px
-            escala_ymm = H_mm / W_px
-        else:
-            sx_eje = 'x'
-            sy_eje = 'y'
-            escala_xmm = W_mm / W_px
-            escala_ymm = H_mm / H_px
-        escala = (escala_xmm + escala_ymm) / 2  # solo informativa
-
-        def _pix_to_mm(pts, sx_eje=sx_eje, sy_eje=sy_eje,
-                       escala_xmm=escala_xmm, escala_ymm=escala_ymm,
-                       x_min_px=x_min_px, y_min_px=y_min_px,
-                       x_min_mm=x_min_mm, y_min_mm=y_min_mm,
-                       x_max_px=x_max_px, y_max_px=y_max_px):
-            res = []
-            for x, y in pts:
-                if sx_eje == 'x':
-                    mm_x = x_min_mm + (x - x_min_px) * escala_xmm
-                else:  # x_mm comes from pixel y
-                    mm_x = x_min_mm + (y - y_min_px) * escala_xmm
-                if sy_eje == 'y':
-                    mm_y = y_min_mm + (y - y_min_px) * escala_ymm
-                else:
-                    mm_y = y_min_mm + (x - x_min_px) * escala_ymm
-                res.append((mm_x, mm_y))
-            return res
-
-        geo_key = tuple(tuple(v) for v in enc.vertices_mm)
-        paredes_por_geo[geo_key] = [_pix_to_mm(t) for t in paredes_pix]
-        ma_por_geo[geo_key] = [_pix_to_mm(t) for t in ma_pix]
-        copetes_por_geo[geo_key] = [_pix_to_mm(t) for t in copetes_pix]
-        pulidos_por_geo[geo_key] = [_pix_to_mm(t) for t in pulidos_pix]
-        ingletes_por_geo[geo_key] = [_pix_to_mm(t) for t in ingletes_pix]
-
-    if paredes_por_geo:
-        trabajo._paredes_por_geo = paredes_por_geo  # type: ignore[attr-defined]
-    if ma_por_geo:
-        trabajo._muebles_altos_por_geo = ma_por_geo  # type: ignore[attr-defined]
-    if copetes_por_geo:
-        trabajo._copetes_por_geo = copetes_por_geo  # type: ignore[attr-defined]
-    if pulidos_por_geo:
-        trabajo._pulidos_por_geo = pulidos_por_geo  # type: ignore[attr-defined]
-    if ingletes_por_geo:
-        trabajo._ingletes_por_geo = ingletes_por_geo  # type: ignore[attr-defined]
+    if anot_pix:
+        trabajo._anot_pix = anot_pix  # type: ignore[attr-defined]
 
 
 def _dist_punto_a_segmento(px, py, x1, y1, x2, y2):
@@ -1624,15 +1635,13 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
 
     _dedup_frontales(trabajo)
 
-    paredes_por_geo = getattr(trabajo, '_paredes_por_geo', None) or {}
-    ma_por_geo = getattr(trabajo, '_muebles_altos_por_geo', None) or {}
-    copetes_por_geo = getattr(trabajo, '_copetes_por_geo', None) or {}
-    pulidos_op_por_geo = getattr(trabajo, '_pulidos_por_geo', None) or {}
-    ingletes_op_por_geo = getattr(trabajo, '_ingletes_por_geo', None) or {}
+    anot_pix = getattr(trabajo, '_anot_pix', None) or {}
     TOL_PARED_MM = 250
-    TOL_PULIDO_MM = 200  # tolerancia para emparejar trazo pulido con arista
-    hay_anotacion_pulido_global = any(pulidos_op_por_geo.get(k) for k in pulidos_op_por_geo)
-    hay_anotacion_inglete_global = any(ingletes_op_por_geo.get(k) for k in ingletes_op_por_geo)
+    TOL_PULIDO_MM = 200
+    hay_anotacion_pulido_global = any(
+        anot_pix[k].get('pulidos_pix') for k in anot_pix)
+    hay_anotacion_inglete_global = any(
+        anot_pix[k].get('ingletes_pix') for k in anot_pix)
 
     # Limpiar pulidos viejos antes de regenerar (siempre los recalculamos)
     trabajo.cantos = [c for c in trabajo.cantos
@@ -1654,9 +1663,10 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
 
     for encimera in encimeras:
         # Snap a cotas conocidas
-        cotas = _recolectar_cotas(trabajo, encimera)
+        cotas, cotas_propias = _recolectar_cotas(trabajo, encimera)
         if cotas:
-            verts_snap, snap_log = _snap_vertices_a_cotas(encimera.vertices_mm, cotas)
+            verts_snap, snap_log = _snap_vertices_a_cotas(
+                encimera.vertices_mm, cotas, cotas_propias)
             if snap_log['x'] or snap_log['y']:
                 encimera.vertices_mm = verts_snap
                 xs = [v[0] for v in verts_snap]
@@ -1676,11 +1686,20 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
 
         zona_corta = (encimera.zona or '?').split('(')[0].strip()[:35]
 
-        # Override por anotaciones del operador. "Pared" = arista contra muro,
-        # mueble alto o copete (los 3 implican "no pulir aquí").
-        paredes_mm_local = paredes_por_geo.get(geo_key, [])
-        ma_mm_local = ma_por_geo.get(geo_key, [])
-        copetes_mm_local = copetes_por_geo.get(geo_key, [])
+        # Convertir trazos pixel → mm-local de ESTA encimera con los vertices
+        # actualizados (post-snap). El cargador almacenó en pixel-space para
+        # que el snap pueda mover los vertices sin invalidar las claves.
+        regs = anot_pix.get(id(encimera))
+        if regs:
+            cand_pix = regs['polilinea_pix']
+            paredes_mm_local = _trazos_a_mm_local(regs['paredes_pix'], cand_pix, encimera.vertices_mm)
+            ma_mm_local = _trazos_a_mm_local(regs['ma_pix'], cand_pix, encimera.vertices_mm)
+            copetes_mm_local = _trazos_a_mm_local(regs['copetes_pix'], cand_pix, encimera.vertices_mm)
+            pulidos_op_local = _trazos_a_mm_local(regs['pulidos_pix'], cand_pix, encimera.vertices_mm)
+            ingletes_op_local = _trazos_a_mm_local(regs['ingletes_pix'], cand_pix, encimera.vertices_mm)
+        else:
+            paredes_mm_local = ma_mm_local = copetes_mm_local = []
+            pulidos_op_local = ingletes_op_local = []
         trazos_no_pulir = paredes_mm_local + ma_mm_local + copetes_mm_local
         if trazos_no_pulir:
             n_override = 0
@@ -1705,7 +1724,6 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # Emitir pulidos. Si el operador anotó trazos de pulido cian para
         # ESTA encimera, son autoritativos: emitimos un canto por cada arista
         # cubierta por un trazo. Si no, fallback geométrico: aristas no-pared.
-        pulidos_op_local = pulidos_op_por_geo.get(geo_key, [])
         nuevos_pulidos = 0
         # Track aristas cubiertas (operador pulido O inglete)
         aristas_cubiertas = set()  # idx de aristas con algún canto operator
@@ -1746,7 +1764,6 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # arista más cercana al centroide (pertenecía a esta encimera si
         # está dentro de tolerancia). Marca la arista como cubierta para que
         # NO emita un pulido auto sobre la misma esquina.
-        ingletes_op_local = ingletes_op_por_geo.get(geo_key, [])
         nuevos_ingletes_op = 0
         for stroke in ingletes_op_local:
             L_total = _path_length_mm(stroke)

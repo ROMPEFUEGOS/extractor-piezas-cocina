@@ -348,59 +348,93 @@ def _aristas_poligono(verts: list, x_off: float, y_off: float, h_total: float) -
 
 
 def _dibujar_cantos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: float, h_total: float):
-    """Dibuja recto_pulido (cian) e ingletado (magenta) como segmentos sobre las
-    aristas del polígono que mejor coinciden por longitud. Heurística simple:
-    para cada canto consume la arista libre más cercana en longitud (tolerancia 50mm).
-    Ingletes se dibujan como segmento corto en una esquina próxima a un pulido marcado."""
+    """Dibuja recto_pulido (cian) e ingletado (magenta) sobre las aristas del
+    polígono. Filtra los cantos por zona (cada canto que emitió el postproc
+    lleva en `notas` el zona de la pieza al que pertenece). Para los pulidos,
+    intenta extraer el `idx` exacto de las notas; si no, cae a matching por
+    longitud entre las aristas no usadas. Los ingletes se distribuyen en las
+    esquinas adyacentes a aristas pulidas, una a una.
+    """
+    import re as _re
     verts = pieza.get('vertices_mm')
     if not verts or len(verts) < 3:
         return
     aristas = _aristas_poligono(verts, x_off, y_off, h_total)
-    # Solo encimera por ahora
-    if pieza.get('tipo') != 'encimera':
+    if pieza.get('tipo') not in ('encimera', 'isla'):
         return
+    n = len(aristas)
     cantos = datos.get('cantos', []) or []
-    # Solo aristas marcadas como frontales (o cabezas) son candidatas a pulido
-    libres = [i for i, a in enumerate(aristas) if a['frontal_estricto']]
 
-    # 1) Pulidos: empareja por longitud (mejor primero los más largos)
-    pulidos = [c for c in cantos if c.get('tipo', '').startswith('recto_pulido')]
-    pulidos.sort(key=lambda c: -(c.get('longitud_ml') or 0))
+    # Filtrar cantos que pertenecen a ESTA pieza por zona en las notas
+    zona_pza = (pieza.get('zona') or '').lower().strip()
+    def _del_pieza(c):
+        notas = (c.get('notas') or '').lower()
+        if not zona_pza or not notas:
+            return False
+        # comparación robusta: prefijo significativo de la zona
+        zk = zona_pza.split('(')[0].strip()[:35]
+        return zk in notas
+
+    pulidos = [c for c in cantos if c.get('tipo', '').startswith('recto_pulido') and _del_pieza(c)]
+    ingletes = [c for c in cantos if c.get('tipo') == 'ingletado' and _del_pieza(c)]
+
+    # 1) Pulidos: si el canto trae "arista idx=N" en sus notas, usa esa arista
+    # directamente (la fuente más fiable, ya que el postproc emite así). Si
+    # no, cae a matching por longitud entre las aristas no usadas.
     aristas_pulido = []
+    libres = list(range(n))
+    re_idx = _re.compile(r'arista\s+idx\s*=\s*(\d+)', _re.IGNORECASE)
     for c in pulidos:
-        L_target = (c.get('longitud_ml') or 0) * 1000.0
-        if L_target <= 0 or not libres:
-            continue
-        # Mejor candidato entre las frontales libres por proximidad de longitud
-        mejor = min(libres, key=lambda i: abs(aristas[i]['len'] - L_target))
-        # Tolerancia laxa (Claude puede emitir longitud cruda 3120 cuando la
-        # arista geométrica real es 2786, etc.). Aceptamos hasta 25% de error.
-        if abs(aristas[mejor]['len'] - L_target) > max(100, L_target * 0.25):
-            # Si no encaja con el target, lo dibujamos en la arista frontal más
-            # larga aún libre (es mejor que no dibujar nada)
-            mejor = max(libres, key=lambda i: aristas[i]['len'])
-        a = aristas[mejor]
+        m = re_idx.search(c.get('notas') or '')
+        idx = None
+        if m:
+            try:
+                ii = int(m.group(1))
+                if 0 <= ii < n and ii in libres:
+                    idx = ii
+            except ValueError:
+                pass
+        if idx is None:
+            # Fallback por longitud
+            L_target = (c.get('longitud_ml') or 0) * 1000.0
+            if L_target <= 0 or not libres:
+                continue
+            idx = min(libres, key=lambda i: abs(aristas[i]['len'] - L_target))
+        a = aristas[idx]
         msp.add_line(a['p1'], a['p2'],
                      dxfattribs={'layer': 'PULIDO', 'lineweight': 50})
         añadir_etiqueta(msp, a['mid'][0], a['mid'][1] - ALTURA_TEXTO * 0.6,
                         [f"PULIDO {c.get('longitud_ml'):.3g}m"],
                         max(20, ALTURA_TEXTO * 0.5), 'PULIDO')
-        libres.remove(mejor)
-        aristas_pulido.append(mejor)
+        if idx in libres:
+            libres.remove(idx)
+        aristas_pulido.append(idx)
 
-    # 2) Ingletes: dibuja un trazo corto a 45° en una esquina del polígono junto a una arista pulida
-    ingletes = [c for c in cantos if c.get('tipo') == 'ingletado']
-    n = len(aristas)
+    # 2) Ingletes: trazo corto a 45° en una esquina adyacente a un pulido.
+    # Solo emitimos en esquinas reales (entre dos aristas pulidas) cuando hay
+    # ingletes para esta pieza.
     usados_corner = set()
     for c in ingletes:
         if not aristas_pulido:
             break
-        # Esquina entre dos pulidos consecutivos, o esquina de un pulido aún no marcada
-        candidatos = []
+        # Preferimos esquinas entre dos aristas pulidas (= unión típica
+        # cabeza-frontal); si no hay, cualquier esquina de pulido libre.
+        esquinas_pulido_pulido = []
+        esquinas_simples = []
         for i in aristas_pulido:
-            for v_idx in (aristas[i]['idx'], (aristas[i]['idx'] + 1) % n):
-                if v_idx not in usados_corner:
-                    candidatos.append(v_idx)
+            v_left = aristas[i]['idx']
+            v_right = (aristas[i]['idx'] + 1) % n
+            for v_idx in (v_left, v_right):
+                if v_idx in usados_corner:
+                    continue
+                # Las dos aristas que tocan v_idx
+                a_prev = (v_idx - 1) % n
+                a_next = v_idx
+                if a_prev in aristas_pulido and a_next in aristas_pulido:
+                    esquinas_pulido_pulido.append(v_idx)
+                else:
+                    esquinas_simples.append(v_idx)
+        candidatos = esquinas_pulido_pulido or esquinas_simples
         if not candidatos:
             break
         v_idx = candidatos[0]
@@ -409,7 +443,6 @@ def _dibujar_cantos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: fl
         cx = x_v + x_off
         cy = (h_total - y_v) + y_off
         L_seg = max(60, min(200, (c.get('longitud_ml') or 0.3) * 1000.0 * 0.3))
-        # Línea corta a 45° hacia el interior del polígono (aprox. centro)
         xs = [v[0] for v in verts]
         ys = [v[1] for v in verts]
         cx_poly = sum(xs) / len(xs) + x_off
@@ -517,8 +550,8 @@ def generar_dxf(json_path: Path, output_path: Path):
                 x_min, y_min, y_max = min(xs), min(ys), max(ys)
                 h_poly = y_max - y_min
                 añadir_poligono(msp, verts, x - x_min, y - y_min, capa, h_total=h_poly + 2 * y_min)
-                # Dibujar huecos pertenecientes a esta pieza con coords reales
-                if tipo == 'encimera':
+                # Dibujar huecos y cantos pertenecientes a esta pieza
+                if tipo in ('encimera', 'isla'):
                     _dibujar_huecos_pieza(msp, datos, p, x - x_min, y - y_min, h_poly + 2 * y_min)
                     _dibujar_cantos_pieza(msp, datos, p, x - x_min, y - y_min, h_poly + 2 * y_min)
             else:
