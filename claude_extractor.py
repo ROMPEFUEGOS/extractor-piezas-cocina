@@ -1102,6 +1102,7 @@ def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtrai
             trabajo.advertencias.append(f"Postproc: error cargando paredes/muebles_altos: {e}")
     _ajustar_costado_cascada(trabajo)
     _reconciliar_geometria_encimera(trabajo)
+    _completar_pulidos_pata(trabajo)
     _completar_copete_principal(trabajo)
     _completar_ingletes_implicitos(trabajo)
     return trabajo
@@ -1524,6 +1525,92 @@ def _path_length_mm(trazo):
         total += _math.hypot(trazo[i + 1][0] - trazo[i][0],
                              trazo[i + 1][1] - trazo[i][1])
     return total
+
+
+def _completar_pulidos_pata(trabajo: TrabajoExtraido) -> None:
+    """Por cada pata (costado/cascada que cae desde encimera al suelo), emite
+    automáticamente los pulidos de los "2 largos verticales" de la caída:
+
+      - Pata sobre isla libre (sin paredes anotadas): 2 verticales pulidos
+        (la pata se ve por ambas caras laterales).
+      - Pata sobre encimera con un lado contra pared: 1 vertical pulido (el
+        otro vertical queda contra muro, sin pulido).
+
+    Se evita emitir si el operador ya marcó el pulido de la pata con un trazo
+    cian en el plano (cuyo canto ya estaría en la lista con la nota
+    «operador cian»).
+    """
+    costados = [p for p in trabajo.piezas if p.tipo == 'costado']
+    if not costados:
+        return
+    anot_pix = getattr(trabajo, '_anot_pix', None) or {}
+    for costado in costados:
+        # Altura/caída: preferimos altura_mm; fallback al menor de largo/ancho
+        altura = costado.altura_mm
+        if not altura:
+            largo = costado.largo_mm or 0
+            ancho = costado.ancho_mm or 0
+            if largo and ancho:
+                altura = min(largo, ancho)
+            else:
+                altura = largo or ancho
+        if not altura or altura < 50:
+            continue
+        L_ml = round(altura / 1000.0, 3)
+
+        # ¿La pieza asociada (encimera/isla) tiene paredes CERCA de sus
+        # aristas? Comprobamos por proximidad real, no solo por presencia
+        # global de trazos pared en el canvas.
+        zona_costado = (costado.zona or '').lower()
+        es_isla_libre = False
+        if 'isla' in zona_costado:
+            islas = [p for p in trabajo.piezas
+                     if p.tipo in ('encimera', 'isla')
+                     and 'isla' in (p.zona or '').lower()
+                     and p.vertices_mm]
+            es_isla_libre = True  # asumimos libre y comprobamos
+            for isla in islas:
+                regs = anot_pix.get(id(isla))
+                if not regs or not regs.get('paredes_pix'):
+                    continue
+                paredes_mm = _trazos_a_mm_local(
+                    regs['paredes_pix'], regs['polilinea_pix'], isla.vertices_mm)
+                if not paredes_mm:
+                    continue
+                n_v = len(isla.vertices_mm)
+                tiene_pared_cerca = False
+                for i in range(n_v):
+                    p1 = isla.vertices_mm[i]
+                    p2 = isla.vertices_mm[(i + 1) % n_v]
+                    if _dist_minima_arista_a_trazos(p1, p2, paredes_mm) <= 250:
+                        tiene_pared_cerca = True
+                        break
+                if tiene_pared_cerca:
+                    es_isla_libre = False
+                    break
+        n_pulidos = 2 if es_isla_libre else 1
+
+        # Evitar duplicar si el operador ya emitió pulido para esta pata
+        zona_corta = zona_costado.split('(')[0].strip()[:35]
+        ya_marcado = any(
+            c.tipo.startswith('recto_pulido')
+            and abs((c.longitud_ml or 0) - L_ml) < 0.05
+            and zona_corta and zona_corta in (c.notas or '').lower()
+            for c in trabajo.cantos
+        )
+        if ya_marcado:
+            continue
+
+        for _ in range(n_pulidos):
+            trabajo.cantos.append(Canto(
+                tipo='recto_pulido',
+                longitud_ml=L_ml,
+                notas=f"vertical pata (auto, caída {altura:.0f}mm) en {zona_corta}",
+            ))
+        trabajo.advertencias.append(
+            f"Postproc pata [{zona_corta}]: {n_pulidos} pulido(s) vertical(es) "
+            f"de {altura:.0f}mm"
+        )
 
 
 def _ajustar_costado_cascada(trabajo: TrabajoExtraido) -> None:
