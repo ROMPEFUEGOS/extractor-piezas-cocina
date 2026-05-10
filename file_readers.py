@@ -509,14 +509,16 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
                 if polys_aqui:
                     polilineas_text.append({"pagina": pid, "canvas": [cw, ch], "polilineas": polys_aqui})
 
-            # ── PAREDES Y MUEBLES ALTOS (ground truth del operador) ──────
+            # ── PAREDES, MUEBLES ALTOS Y PILARES (ground truth del operador) ──
             paredes_por_pagina = []
             ma_por_pagina = []
+            pilares_por_pagina = []
             for pid, pdata in (anotaciones.get("paginas_anotadas") or {}).items():
                 cw = pdata.get("canvas_w")
                 ch = pdata.get("canvas_h")
                 paredes_aqui = []
                 ma_aqui = []
+                pilares_aqui = []
                 for et in pdata.get("etiquetas", []):
                     pts = et.get("puntos")
                     if not pts:
@@ -526,10 +528,33 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
                         paredes_aqui.append({"modo": et.get("modo"), "puntos": pts})
                     elif tipo == "muebles_altos":
                         ma_aqui.append({"modo": et.get("modo"), "puntos": pts})
+                    elif tipo == "pilar":
+                        pilares_aqui.append({"modo": et.get("modo"), "puntos": pts})
                 if paredes_aqui:
                     paredes_por_pagina.append({"pagina": pid, "canvas": [cw, ch], "trazos": paredes_aqui})
                 if ma_aqui:
                     ma_por_pagina.append({"pagina": pid, "canvas": [cw, ch], "trazos": ma_aqui})
+                if pilares_aqui:
+                    pilares_por_pagina.append({"pagina": pid, "canvas": [cw, ch], "trazos": pilares_aqui})
+
+            if pilares_por_pagina:
+                ctx += ("\n\n🏛️ PILARES — OBSTÁCULOS DEL EDIFICIO:\n"
+                        "El operador ha marcado pilares estructurales (marrón). Un pilar NO "
+                        "es una pieza a fabricar — es un OBSTÁCULO en el plano. La encimera "
+                        "debe tener un HUECO o una MUESCA (forma L/U) que rodee el pilar para "
+                        "esquivarlo en la instalación.\n\n"
+                        "ACCIÓN OBLIGATORIA: Cuando hay un pilar marcado, los `vertices_mm` "
+                        "de la encimera tienen que reflejar la muesca alrededor del pilar (no "
+                        "puede ser un rectángulo plano que solape el pilar). Detalla en `notas` "
+                        "que la muesca esquiva un pilar de las dimensiones aproximadas leídas.\n"
+                        "PROHIBIDO: emitir piezas tipo 'pilar' o 'pilastra'. El pilar NUNCA es "
+                        "una pieza de piedra, sólo afecta la geometría de la encimera.\n")
+                for p in pilares_por_pagina:
+                    ctx += f"\nPilar en página '{p['pagina']}' (canvas {p['canvas'][0]}×{p['canvas'][1]}px):\n"
+                    for tr in p["trazos"]:
+                        n = len(tr["puntos"])
+                        muestra = tr["puntos"][:6] + (["..."] if n > 6 else [])
+                        ctx += f"  - {tr['modo']} ({n}pt): {muestra}\n"
 
             if paredes_por_pagina or ma_por_pagina:
                 ctx += ("\n\n🧱 PAREDES Y MUEBLES ALTOS — GROUND TRUTH DEL OPERADOR:\n"

@@ -1103,6 +1103,7 @@ def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtrai
     _ajustar_costado_cascada(trabajo)
     _reconciliar_geometria_encimera(trabajo)
     _completar_pulidos_pata(trabajo)
+    _completar_inglete_pata(trabajo)
     _completar_copete_principal(trabajo)
     _completar_ingletes_implicitos(trabajo)
     return trabajo
@@ -1405,13 +1406,17 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
         return
 
     # Recolectar polilíneas cerradas de encimera (en píxeles) y trazos del
-    # operador (pared, muebles_altos, copete, pulido, inglete) en píxeles
+    # operador en píxeles (todo lo que afecta a la clasificación de aristas
+    # o a la generación de cantos)
     encimera_polylines_pix = []
     paredes_pix = []
     ma_pix = []
     copetes_pix = []
     pulidos_pix = []
     ingletes_pix = []
+    frontales_pix = []
+    zocalos_pix = []
+    pilares_pix = []
     for pid, pdata in (anot.get("paginas_anotadas") or {}).items():
         for et in pdata.get("etiquetas", []):
             pts = et.get("puntos")
@@ -1431,11 +1436,18 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
                 pulidos_pix.append(pts)
             elif tipo == "inglete":
                 ingletes_pix.append(pts)
+            elif tipo == "frontal":
+                frontales_pix.append(pts)
+            elif tipo == "zocalo":
+                zocalos_pix.append(pts)
+            elif tipo == "pilar":
+                pilares_pix.append(pts)
 
     if not encimera_polylines_pix:
         return
     # Si no hay ningún tipo de trazo guía, no hay nada que stashear
-    if not (paredes_pix or ma_pix or copetes_pix or pulidos_pix or ingletes_pix):
+    if not (paredes_pix or ma_pix or copetes_pix or pulidos_pix or ingletes_pix
+            or frontales_pix or zocalos_pix or pilares_pix):
         return
 
     # Match polilínea↔encimera por área (estable, no depende de vertices_mm
@@ -1475,6 +1487,9 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
             'copetes_pix': copetes_pix,
             'pulidos_pix': pulidos_pix,
             'ingletes_pix': ingletes_pix,
+            'frontales_pix': frontales_pix,
+            'zocalos_pix': zocalos_pix,
+            'pilares_pix': pilares_pix,
         }
     # Las encimeras opcion1/opcion2 con misma geometría que una de las únicas
     # apuntan al mismo registro
@@ -1525,6 +1540,56 @@ def _path_length_mm(trazo):
         total += _math.hypot(trazo[i + 1][0] - trazo[i][0],
                              trazo[i + 1][1] - trazo[i][1])
     return total
+
+
+def _completar_inglete_pata(trabajo: TrabajoExtraido) -> None:
+    """Por cada pata (costado/cascada), genera automáticamente un canto
+    `ingletado` con la cabeza de la encimera/isla a la que se une — ese
+    inglete está implícito por la presencia de la pata y no requiere
+    anotación magenta del operador.
+
+    Longitud del inglete = largo de la pata (que coincide con el ancho de
+    la cabeza de la encimera donde se une).
+
+    Si el operador ya emitió un inglete con un trazo magenta cerca de la
+    cabeza correspondiente, NO se duplica.
+    """
+    costados = [p for p in trabajo.piezas if p.tipo == 'costado']
+    if not costados:
+        return
+    nuevos = 0
+    for costado in costados:
+        # Largo de la pata = cabeza encimera = mayor de las dos dimensiones
+        # típicas (la otra es la altura de caída ~900mm).
+        largo = costado.largo_mm or 0
+        ancho = costado.ancho_mm or 0
+        cabeza_mm = max(largo, ancho)
+        if not cabeza_mm or cabeza_mm < 50:
+            continue
+        L_ml = round(cabeza_mm / 1000.0, 3)
+        zona_corta = (costado.zona or '').split('(')[0].strip()[:35]
+
+        # Evitar duplicar si ya hay un ingletado en la MISMA zona del costado
+        # (caso típico: el operador ya marcó el inglete con un trazo magenta
+        # cerca de esa cabeza). Dedup por zona en notas, no por longitud — dos
+        # patas pueden tener el mismo tamaño y son ingletes independientes.
+        ya = any(
+            c.tipo == 'ingletado'
+            and zona_corta and zona_corta in (c.notas or '').lower()
+            for c in trabajo.cantos
+        )
+        if ya:
+            continue
+
+        trabajo.cantos.append(Canto(
+            tipo='ingletado',
+            longitud_ml=L_ml,
+            notas=f"unión cabeza pata-encimera (auto) en {zona_corta}",
+        ))
+        nuevos += 1
+    if nuevos:
+        trabajo.advertencias.append(
+            f"Postproc: {nuevos} inglete(s) pata-encimera auto-generados")
 
 
 def _completar_pulidos_pata(trabajo: TrabajoExtraido) -> None:
@@ -1784,10 +1849,16 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             copetes_mm_local = _trazos_a_mm_local(regs['copetes_pix'], cand_pix, encimera.vertices_mm)
             pulidos_op_local = _trazos_a_mm_local(regs['pulidos_pix'], cand_pix, encimera.vertices_mm)
             ingletes_op_local = _trazos_a_mm_local(regs['ingletes_pix'], cand_pix, encimera.vertices_mm)
+            frontales_mm_local = _trazos_a_mm_local(regs.get('frontales_pix', []), cand_pix, encimera.vertices_mm)
+            zocalos_mm_local = _trazos_a_mm_local(regs.get('zocalos_pix', []), cand_pix, encimera.vertices_mm)
         else:
             paredes_mm_local = ma_mm_local = copetes_mm_local = []
             pulidos_op_local = ingletes_op_local = []
-        trazos_no_pulir = paredes_mm_local + ma_mm_local + copetes_mm_local
+            frontales_mm_local = zocalos_mm_local = []
+        # Una arista NO se pule si está cubierta por: pared, mueble alto,
+        # copete, frontal/chapeado o zócalo. El pulido es lo COMPLEMENTARIO.
+        trazos_no_pulir = (paredes_mm_local + ma_mm_local + copetes_mm_local
+                           + frontales_mm_local + zocalos_mm_local)
         if trazos_no_pulir:
             n_override = 0
             n_libre = 0
@@ -1877,44 +1948,32 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             ))
             nuevos_ingletes_op += 1
 
-        # ── Auto-pulido para isla libre ─────────────────────────────────
-        # En islas exentas (sin paredes anotadas) TODOS los lados son visibles
-        # y se pulen, salvo los que ya tienen pulido o inglete. Esto cubre el
-        # caso donde el operador anotó solo 1 trazo pulido + 2 ingletes y dejó
-        # 1 lado sin marcar — debe ser pulido también.
-        n_pared_geo = sum(1 for a in aristas if a['tipo'] == 'pared')
-        es_isla = (encimera.tipo == 'isla'
-                   or 'isla' in (encimera.zona or '').lower())
-        if es_isla and n_pared_geo == 0:
-            for a in aristas:
-                if a['idx'] not in aristas_cubiertas and a['len'] >= 50:
-                    aristas_cubiertas.add(a['idx'])
-                    trabajo.cantos.append(Canto(
-                        tipo='recto_pulido',
-                        longitud_ml=round(a['len'] / 1000.0, 3),
-                        notas=f"arista idx={a['idx']} (auto isla libre) en {zona_corta}",
-                    ))
-                    nuevos_pulidos += 1
-        elif not pulidos_op_local:
-            # Encimera convencional sin trazos pulido del operador → fallback
-            # geométrico: todas las aristas que NO son pared van pulidas
-            for a in aristas:
-                if (a['tipo'] in ('frontal', 'cabeza')
-                        and a['idx'] not in aristas_cubiertas
-                        and a['len'] >= 50):
-                    aristas_cubiertas.add(a['idx'])
-                    etiqueta_geo = 'frente' if a['tipo'] == 'frontal' else 'extremo'
-                    trabajo.cantos.append(Canto(
-                        tipo='recto_pulido',
-                        longitud_ml=round(a['len'] / 1000.0, 3),
-                        notas=f"arista idx={a['idx']} ({etiqueta_geo} geom) en {zona_corta}",
-                    ))
-                    nuevos_pulidos += 1
+        # ── Pulido por exclusión (regla universal) ──────────────────────
+        # Una arista que NO ha sido marcada por trazo del operador (cyan
+        # pulido, magenta inglete, ni clasificada como 'pared' por trazos
+        # de pared/MA/copete/frontal/zocalo) → va vista → se pule. Es la
+        # regla complementaria que el usuario describe: pulido = lo que
+        # queda cuando se han excluido todos los demás tratamientos.
+        for a in aristas:
+            if a['idx'] in aristas_cubiertas:
+                continue
+            if a['tipo'] == 'pared':
+                # Cubierta por algún trazo de no-pulir → no se pule
+                continue
+            if a['len'] < 50:
+                continue
+            aristas_cubiertas.add(a['idx'])
+            trabajo.cantos.append(Canto(
+                tipo='recto_pulido',
+                longitud_ml=round(a['len'] / 1000.0, 3),
+                notas=f"arista idx={a['idx']} (auto exclusión) en {zona_corta}",
+            ))
+            nuevos_pulidos += 1
 
         if nuevos_pulidos or nuevos_ingletes_op:
-            origen = "operador" if pulidos_op_local else ("isla libre" if encimera.tipo == 'isla' else "geom")
             trabajo.advertencias.append(
-                f"Postproc [{zona_corta}]: {nuevos_pulidos} pulidos ({origen}) + {nuevos_ingletes_op} ingletes operador")
+                f"Postproc [{zona_corta}]: {nuevos_pulidos} pulidos + "
+                f"{nuevos_ingletes_op} ingletes operador")
 
         # Guardar las paredes de la encimera principal para el auto-frontal
         if encimera is encimera_principal:
@@ -2186,11 +2245,23 @@ def _limpiar_trabajo(trabajo: TrabajoExtraido) -> TrabajoExtraido:
             else:
                 p.notas = '[material_rol simplificado de opción múltiple]'
 
-    # 3. Eliminar piezas sin tipo o sin material_rol
-    trabajo.piezas = [
-        p for p in trabajo.piezas
-        if p.tipo and p.tipo != 'desconocido' and p.material_rol
-    ]
+    # 3. Eliminar piezas sin tipo, sin material_rol, o tipo 'pilar'/'pilastra'
+    # (el pilar es un obstáculo del edificio, no una pieza a fabricar — la
+    # encimera lleva una muesca alrededor; no se emite pieza separada).
+    descartados_pilar = []
+    piezas_filtradas = []
+    for p in trabajo.piezas:
+        if not p.tipo or p.tipo == 'desconocido' or not p.material_rol:
+            continue
+        if p.tipo.lower().strip() in ('pilar', 'pilastra'):
+            descartados_pilar.append(p)
+            continue
+        piezas_filtradas.append(p)
+    trabajo.piezas = piezas_filtradas
+    if descartados_pilar:
+        trabajo.advertencias.append(
+            f"Postproc: descartadas {len(descartados_pilar)} pieza(s) pilar/pilastra "
+            "(obstáculos, no se fabrican; la encimera debe llevar muesca)")
 
     # 4. Normalizar tipo de pieza (chapeado → frontal)
     tipo_map = {
