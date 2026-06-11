@@ -431,6 +431,9 @@ def pack_piezas_rectpack(piezas_dim: list[tuple[float, float, str]],
                                GuillotineBssfSas, PackingMode, PackingBin,
                                SORT_AREA, SORT_NONE)
     except ImportError:
+        import sys as _sys
+        print("  [WARN] rectpack no instalado — nesting subóptimo (shelf). "
+              "Instala con: pip install rectpack", file=_sys.stderr)
         return pack_piezas_shelf(piezas_dim, tabla_ancho, tabla_alto, rotar)
 
     if not piezas_dim:

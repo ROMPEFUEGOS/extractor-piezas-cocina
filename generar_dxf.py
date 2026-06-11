@@ -213,6 +213,9 @@ def colocar_piezas(piezas: list[dict], x_origen: float, y_origen: float
         w, h = dimensiones_pieza(p)
         if w > 0 and h > 0:
             piezas_dims.append({'pieza': p, 'w': w, 'h': h})
+        else:
+            print(f"  [WARN] Pieza SIN dimensiones, no se dibuja en el DXF: "
+                  f"{p.get('tipo', '?')} · {p.get('zona', '?')}", file=sys.stderr)
     piezas_dims.sort(key=lambda x: x['w'] * x['h'], reverse=True)
 
     colocadas = []
@@ -340,69 +343,23 @@ def _signed_area(verts: list) -> float:
 
 
 def _aristas_poligono(verts: list, x_off: float, y_off: float, h_total: float) -> list:
-    """Devuelve la lista de aristas (segmentos) del polígono ya transformados al
-    sistema de coordenadas del DXF. Cada arista incluye `frontal` (bool) según si
-    es adyacente a un vértice cóncavo (los frentes de una encimera en L lo son)
-    o si es una arista contigua a una frontal (extremo / cabeza vista)."""
+    """Devuelve la lista de aristas (segmentos) del polígono ya transformados
+    al sistema de coordenadas del DXF. La clasificación pared/frontal la hace
+    el postprocesador del extractor (con las anotaciones del operador); aquí
+    solo se necesita la geometría para dibujar los cantos por idx/longitud."""
     n = len(verts)
     if n < 3:
         return []
-    # Determina sentido del polígono y vértices cóncavos
-    area = _signed_area(verts)  # >0 = CCW, <0 = CW
-    sentido = 1 if area > 0 else -1
-    concavos = set()
-    for i in range(n):
-        x_prev, y_prev = verts[(i - 1) % n]
-        x_cur, y_cur = verts[i]
-        x_next, y_next = verts[(i + 1) % n]
-        cross = (x_cur - x_prev) * (y_next - y_cur) - (y_cur - y_prev) * (x_next - x_cur)
-        # Cóncavo si el giro va en sentido opuesto al global
-        if cross * sentido < 0:
-            concavos.add(i)
-
     aristas = []
     for i in range(n):
         x1, y1 = verts[i]
         x2, y2 = verts[(i + 1) % n]
         p1 = (x1 + x_off, (h_total - y1) + y_off)
         p2 = (x2 + x_off, (h_total - y2) + y_off)
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        L = math.hypot(dx, dy)
+        L = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
         mid = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
-        # Arista frontal si toca un vértice cóncavo (lado de la "L")
-        toca_concavo = i in concavos or (i + 1) % n in concavos
         aristas.append({'p1': p1, 'p2': p2, 'len': L, 'mid': mid, 'idx': i,
-                        'v1': i, 'v2': (i + 1) % n, 'frontal_estricto': toca_concavo})
-
-    # Si el polígono es convexo (sin cóncavos), no podemos distinguir paredes
-    # de frentes geométricamente; marcamos como frontales todas excepto la más
-    # larga (heurística: la pared es habitualmente el lado más largo).
-    if not concavos:
-        i_pared = max(range(n), key=lambda i: aristas[i]['len'])
-        for i, a in enumerate(aristas):
-            a['frontal_estricto'] = (i != i_pared)
-    else:
-        # Caso L: además de las aristas tocando cóncavos, sus vecinas inmediatas
-        # son cabezas vistas (también pulibles). Las que no tocan ningún cóncavo
-        # ni son vecinas de uno son paredes.
-        vecinas_concavo_chain = set()
-        for i in range(n):
-            if i in concavos:
-                vecinas_concavo_chain.add(i)
-        # No expandir más allá: cabezas son aristas que comparten un vértice con
-        # una arista frontal_estricto pero NO tocan otro cóncavo.
-        aristas_concavo = {i for i, a in enumerate(aristas) if a['frontal_estricto']}
-        for i, a in enumerate(aristas):
-            if a['frontal_estricto']:
-                continue
-            # Comparte vértice con una arista cóncava? → cabeza vista
-            v1, v2 = a['v1'], a['v2']
-            for j in aristas_concavo:
-                aj = aristas[j]
-                if v1 in (aj['v1'], aj['v2']) or v2 in (aj['v1'], aj['v2']):
-                    a['frontal_estricto'] = True
-                    break
+                        'v1': i, 'v2': (i + 1) % n})
     return aristas
 
 

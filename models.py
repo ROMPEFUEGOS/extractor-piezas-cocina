@@ -140,7 +140,10 @@ class TrabajoExtraido:
                 return {k: _conv(v) for k, v in obj.__dict__.items()
                         if v is not None and not k.startswith('_')}
             elif isinstance(obj, list):
-                return [_conv(i) for i in obj]
+                # Filtrar None y contenedores vacíos dentro de listas
+                # (robustez del round-trip JSON)
+                convertidos = [_conv(i) for i in obj]
+                return [x for x in convertidos if x is not None and x != {}]
             return obj
 
         d = {}

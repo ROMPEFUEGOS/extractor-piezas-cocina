@@ -177,9 +177,19 @@ def cargar_anotaciones(folder: Path) -> dict:
     f = folder / "anotaciones.json"
     if f.exists():
         try:
-            return json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+            datos = json.loads(f.read_text(encoding="utf-8"))
+            # Validación de esquema mínimo — un JSON de otra versión o
+            # corrupto NO debe pasar en silencio (perdería trazos del operador)
+            if not isinstance(datos, dict) or \
+                    not isinstance(datos.get("paginas_anotadas"), dict):
+                print(f"  [WARN] anotaciones.json con esquema inesperado en "
+                      f"{folder.name} — se ignora y se empieza de cero",
+                      file=sys.stderr)
+            else:
+                return datos
+        except Exception as e:
+            print(f"  [WARN] anotaciones.json corrupto en {folder.name}: {e} "
+                  f"— se ignora y se empieza de cero", file=sys.stderr)
     return {
         "proyecto": folder.name,
         "version": 1,
@@ -483,7 +493,7 @@ Otra nota..."></textarea>
     </div>
     <div class="section atajos">
       <h3>Atajos</h3>
-      <kbd>1-7</kbd> color · <kbd>P</kbd> pluma · <kbd>E</kbd> borrador<br>
+      <kbd>1-9</kbd> <kbd>0</kbd> pared <kbd>Q</kbd> m.altos · <kbd>P</kbd> pluma · <kbd>E</kbd> borrador<br>
       <kbd>Cmd+Z</kbd> deshacer · <kbd>←/→</kbd> ant/sig<br>
       <kbd>Espacio</kbd> guardar+sig · <kbd>Backspace</kbd> limpiar
     </div>

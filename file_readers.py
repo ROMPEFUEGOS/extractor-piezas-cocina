@@ -192,13 +192,14 @@ def read_excel_as_text(path: Path) -> str:
 
 
 def read_txt(path: Path) -> str:
-    """Lee un TXT con detección de encoding."""
-    for enc in ['utf-8', 'latin-1', 'cp1252']:
+    """Lee un TXT con detección de encoding (incluye BOM e iso-8859-15,
+    habituales en archivos del taller)."""
+    for enc in ['utf-8', 'utf-8-sig', 'iso-8859-15', 'latin-1', 'cp1252']:
         try:
             return path.read_text(encoding=enc)
         except Exception:
             continue
-    return "[Error leyendo TXT]"
+    return f"[Error leyendo TXT {path.name}: ningún encoding estándar funcionó]"
 
 
 def _score_pdf(path: Path) -> int:
@@ -343,7 +344,12 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
         try:
             import json as _json
             anotaciones = _json.loads(anot_path.read_text(encoding="utf-8"))
-        except Exception:
+            if not isinstance(anotaciones.get("paginas_anotadas"), dict):
+                print(f"  ⚠ anotaciones.json con esquema inesperado en "
+                      f"{folder.name} — los trazos del operador NO se usarán")
+        except Exception as e:
+            print(f"  ⚠ anotaciones.json corrupto en {folder.name}: {e} — "
+                  f"los trazos del operador NO se usarán")
             anotaciones = {}
 
     def _safe_pagina_filename(pid: str) -> str:

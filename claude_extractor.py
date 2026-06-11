@@ -932,13 +932,14 @@ def parse_folder_name(folder_name: str) -> dict:
 
 def extract_json_from_response(text: str) -> Optional[dict]:
     """Extrae el JSON de la respuesta de Claude, con múltiples estrategias."""
-    # 1. Bloque ```json ... ```
-    match = re.search(r'```json\s*([\s\S]+?)\s*```', text, re.IGNORECASE)
-    if match:
+    # 1. Bloques ```json ... ``` — el ÚLTIMO suele ser el resultado final
+    # (si hay varios, los primeros pueden ser análisis intermedios)
+    bloques = re.findall(r'```json\s*([\s\S]+?)\s*```', text, re.IGNORECASE)
+    for bloque in reversed(bloques):
         try:
-            return json.loads(match.group(1))
+            return json.loads(bloque)
         except json.JSONDecodeError:
-            pass
+            continue
 
     # 2. JSON puro desde el primer { hasta el último }
     first = text.find('{')
@@ -1289,11 +1290,15 @@ def _snap_vertices_a_cotas(verts: list, cotas: set,
             if snap in inverso and inverso[snap] != orig:
                 a = inverso[snap]
                 b = orig
-                # Mantener el snap del más cercano; revertir el otro
+                # Mantener el snap del más cercano; revertir el otro.
+                # El revertido se registra también en `inverso` para que
+                # colisiones posteriores contra su valor original se detecten.
                 if abs(mapeo[a] - a) <= abs(mapeo[b] - b):
                     mapeo[b] = b
+                    inverso.setdefault(b, b)
                 else:
                     mapeo[a] = a
+                    inverso.setdefault(a, a)
                     inverso[snap] = b
             else:
                 inverso[snap] = orig
@@ -1420,7 +1425,15 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
         return
     try:
         anot = json.loads(anot_path.read_text(encoding='utf-8'))
-    except Exception:
+    except Exception as e:
+        trabajo.advertencias.append(
+            f"Postproc: anotaciones.json corrupto ({e}) — trazos del "
+            f"operador NO disponibles")
+        return
+    if not isinstance(anot.get("paginas_anotadas"), dict):
+        trabajo.advertencias.append(
+            "Postproc: anotaciones.json con esquema inesperado — trazos del "
+            "operador NO disponibles")
         return
 
     # Recolectar polilíneas cerradas de encimera (en píxeles) y trazos del

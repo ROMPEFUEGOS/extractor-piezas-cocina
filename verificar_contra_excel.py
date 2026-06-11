@@ -109,7 +109,20 @@ def parse_excel_mgr(xlsx_path: Path) -> dict:
         "BASIC", "ABSOLUTO", "IBERICO", "NERO", "BLANCO", "NEGRO", "GRIS",
     )
 
-    for r in range(15, min(ws.max_row + 1, 120)):
+    # Detección de columnas por encabezado (LONGO/ANCHO) con fallback a las
+    # posiciones fijas conocidas (col 6/7). Cubre Excels con columnas movidas.
+    col_longo, col_ancho = 6, 7
+    for r_h in range(1, 17):
+        for c_h in range(1, 13):
+            v = str(ws.cell(r_h, c_h).value or "").strip().upper()
+            if v in ("LONGO", "LARGO"):
+                col_longo = c_h
+            elif v == "ANCHO":
+                col_ancho = c_h
+
+    # Sin tope fijo de 120 filas: presupuestos grandes superaban el límite y
+    # se perdían líneas en silencio (cap de seguridad amplio).
+    for r in range(15, min(ws.max_row + 1, 500)):
         # Dos formatos conocidos:
         #   Nuevo (Cocimoble2026): col1=desc, col9=m²/cantid
         #   Viejo (ACyC/Cocimoble2025 antiguos): col1=None, col4=desc, col8=Unid
@@ -129,8 +142,8 @@ def parse_excel_mgr(xlsx_path: Path) -> dict:
         desc_u = str(desc).upper().strip()
         if not desc_u or desc_u.startswith("#N/A"):
             continue
-        longo = ws.cell(r, 6).value
-        ancho = ws.cell(r, 7).value
+        longo = ws.cell(r, col_longo).value
+        ancho = ws.cell(r, col_ancho).value
         c8    = ws.cell(r, 8).value
         c9    = ws.cell(r, 9).value
         # En formato nuevo la cantidad está en col 9 ("m²/Cantid.").
