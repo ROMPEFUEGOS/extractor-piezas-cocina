@@ -1146,6 +1146,7 @@ def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtrai
     _ajustar_costado_cascada(trabajo)
     _reconciliar_geometria_encimera(trabajo)
     _completar_piezas_desde_trazos(trabajo)
+    _reposicionar_huecos_desde_trazos(trabajo)
     _completar_pulidos_pata(trabajo)
     _completar_inglete_pata(trabajo)
     _completar_copete_principal(trabajo)
@@ -1500,6 +1501,7 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
     frontales_pix = []
     zocalos_pix = []
     pilares_pix = []
+    huecos_pix = []
     for pid, pdata in (anot.get("paginas_anotadas") or {}).items():
         for et in pdata.get("etiquetas", []):
             pts = et.get("puntos")
@@ -1525,12 +1527,14 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
                 zocalos_pix.append(pts)
             elif tipo == "pilar":
                 pilares_pix.append(pts)
+            elif tipo == "hueco":
+                huecos_pix.append(pts)
 
     if not encimera_polylines_pix:
         return
     # Si no hay ningún tipo de trazo guía, no hay nada que stashear
     if not (paredes_pix or ma_pix or copetes_pix or pulidos_pix or ingletes_pix
-            or frontales_pix or zocalos_pix or pilares_pix):
+            or frontales_pix or zocalos_pix or pilares_pix or huecos_pix):
         return
 
     # Match polilínea↔encimera por área (estable, no depende de vertices_mm
@@ -1568,6 +1572,7 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
             'frontales_pix': frontales_pix,
             'zocalos_pix': zocalos_pix,
             'pilares_pix': pilares_pix,
+            'huecos_pix': huecos_pix,
         }
 
     # Matching por mejor pareja (greedy): se puntúa cada par encimera↔polilínea
@@ -1983,6 +1988,9 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # que el snap pueda mover los vertices sin invalidar las claves.
         regs = getattr(encimera, '_anot_reg', None)
         if regs:
+            # Validar la FORMA del polígono contra la polilínea del operador
+            # (caza escalones con cotas intercambiadas, p.ej. 600/300 J0020)
+            _validar_forma_contra_polilinea(encimera, regs, trabajo, zona_corta)
             cand_pix = regs['polilinea_pix']
             paredes_mm_local = _trazos_a_mm_local(regs['paredes_pix'], cand_pix, encimera.vertices_mm)
             ma_mm_local = _trazos_a_mm_local(regs['ma_pix'], cand_pix, encimera.vertices_mm)
@@ -2283,6 +2291,139 @@ def _completar_ingletes_implicitos(trabajo: TrabajoExtraido) -> None:
         trabajo.cantos.extend(nuevos)
 
 
+def _punto_en_poligono(px, py, verts) -> bool:
+    """Ray casting estándar."""
+    n = len(verts)
+    dentro = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = verts[i]
+        xj, yj = verts[j]
+        if ((yi > py) != (yj > py)) and \
+                (px < (xj - xi) * (py - yi) / ((yj - yi) or 1e-9) + xi):
+            dentro = not dentro
+        j = i
+    return dentro
+
+
+def _validar_forma_contra_polilinea(encimera, regs, trabajo, zona_corta) -> None:
+    """Compara el polígono emitido por Claude con la polilínea de contorno
+    que dibujó el operador (misma cantidad de vértices). Ambos se normalizan
+    al bbox unitario y se prueba toda alineación cíclica, sentido y volteo
+    vertical; si NI la mejor alineación encaja, la forma es sospechosa —
+    típicamente un escalón con las cotas intercambiadas (600/300), que las
+    comprobaciones de cotas no pueden detectar porque ambas asignaciones
+    producen los mismos números."""
+    import math as _math
+    poly = regs.get('polilinea_pix')
+    verts = encimera.vertices_mm
+    if not poly or not verts or len(poly) != len(verts) or len(verts) < 4:
+        return
+
+    def _norm(pts):
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        w = (max(xs) - min(xs)) or 1
+        h = (max(ys) - min(ys)) or 1
+        return [((p[0] - min(xs)) / w, (p[1] - min(ys)) / h) for p in pts]
+
+    # OJO: NO se permite volteo (espejo) en la comparación — intercambiar
+    # las dos cotas de un escalón equivale exactamente a un espejo vertical,
+    # que es el error que queremos cazar. Solo alineación cíclica y sentido
+    # de recorrido (invertir el orden de los puntos no cambia la forma).
+    a = _norm(verts)
+    n = len(a)
+    d_min = float('inf')
+    b0 = _norm(poly)
+    for b in (b0, list(reversed(b0))):
+        for off in range(n):
+            d = max(_math.hypot(a[i][0] - b[(i + off) % n][0],
+                                a[i][1] - b[(i + off) % n][1])
+                    for i in range(n))
+            d_min = min(d_min, d)
+    if d_min > 0.15:
+        trabajo.advertencias.append(
+            f"⚠ GEOMETRÍA DUDOSA [{zona_corta}]: el polígono no encaja con la "
+            f"polilínea del operador (desviación {d_min * 100:.0f}% del bbox) "
+            f"— posible escalón/entrada con cotas intercambiadas; revisar "
+            f"vértices contra el plano")
+
+
+def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
+    """Las marcas rojas del operador (cruces/contornos de hueco) son la
+    posición AUTORITATIVA: cada trazo rojo se convierte a mm-local de su
+    encimera y reposiciona el hueco correspondiente (Claude tiende a
+    recolocarlos o centrarlos pese a la marca)."""
+    geometrias = set()
+    for enc in trabajo.piezas:
+        if enc.tipo not in ('encimera', 'isla') or not enc.vertices_mm \
+                or len(enc.vertices_mm) < 3:
+            continue
+        geo = tuple(tuple(v) for v in enc.vertices_mm)
+        if geo in geometrias:
+            continue
+        geometrias.add(geo)
+        regs = getattr(enc, '_anot_reg', None)
+        if not regs or not regs.get('huecos_pix'):
+            continue
+        zona_tokens = ' '.join((enc.zona or '').lower().split()[:2])
+        huecos_enc = [h for h in trabajo.huecos
+                      if zona_tokens and zona_tokens in (h.pieza_zona or '').lower()]
+        if not huecos_enc:
+            continue
+        trazos_mm = _trazos_a_mm_local(regs['huecos_pix'],
+                                       regs['polilinea_pix'],
+                                       enc.vertices_mm)
+        usados = set()
+        n_v = len(enc.vertices_mm)
+        for trazo in trazos_mm:
+            if not trazo:
+                continue
+            cx = sum(p[0] for p in trazo) / len(trazo)
+            cy = sum(p[1] for p in trazo) / len(trazo)
+            # Los trazos rojos se comparten entre encimeras: solo los que
+            # caen DENTRO de este polígono (o pegados, ≤200mm del borde)
+            # reposicionan huecos de esta pieza — los demás son de otra.
+            if not _punto_en_poligono(cx, cy, enc.vertices_mm):
+                d_borde = min(
+                    _dist_punto_a_segmento(cx, cy,
+                                           enc.vertices_mm[i][0],
+                                           enc.vertices_mm[i][1],
+                                           enc.vertices_mm[(i + 1) % n_v][0],
+                                           enc.vertices_mm[(i + 1) % n_v][1])
+                    for i in range(n_v))
+                if d_borde > 200:
+                    continue
+
+            def _dist(h):
+                if h.centro_x_mm is None or h.centro_y_mm is None:
+                    return 1e9  # sin posición previa: se asigna el último
+                import math as _math
+                return _math.hypot(h.centro_x_mm - cx, h.centro_y_mm - cy)
+
+            libres = [h for h in huecos_enc if id(h) not in usados]
+            if not libres:
+                break
+            h = min(libres, key=_dist)
+            usados.add(id(h))
+            old = (h.centro_x_mm, h.centro_y_mm)
+            h.centro_x_mm = round(cx, 0)
+            h.centro_y_mm = round(cy, 0)
+            xs = [p[0] for p in trazo]
+            ys = [p[1] for p in trazo]
+            if not h.largo_mm and (max(xs) - min(xs)) >= 50:
+                h.largo_mm = round(max(xs) - min(xs), 0)
+            if not h.ancho_mm and (max(ys) - min(ys)) >= 50:
+                h.ancho_mm = round(max(ys) - min(ys), 0)
+            h.notas = ((h.notas or '')
+                       + ' [posición desde trazo rojo del operador]').strip()
+            if old[0] is not None and abs(old[0] - cx) > 100:
+                trabajo.advertencias.append(
+                    f"Postproc: hueco {h.tipo} reposicionado por trazo del "
+                    f"operador ({old[0]:.0f},{old[1]:.0f})→({cx:.0f},{cy:.0f}) "
+                    f"en {enc.zona or '?'}")
+
+
 def _espejar_opciones(trabajo: TrabajoExtraido) -> None:
     """Cuando hay varias opciones de material (_opcion1/_opcion2…), las
     piezas físicas son LAS MISMAS en todas (misma cocina) — solo cambia el
@@ -2480,20 +2621,6 @@ def _verificar_muesca_pilar(trabajo: TrabajoExtraido) -> None:
                 out.append((xc, yc))
         return out
 
-    def _dentro(px, py, verts):
-        # Ray casting
-        n = len(verts)
-        dentro = False
-        j = n - 1
-        for i in range(n):
-            xi, yi = verts[i]
-            xj, yj = verts[j]
-            if ((yi > py) != (yj > py)) and \
-                    (px < (xj - xi) * (py - yi) / ((yj - yi) or 1e-9) + xi):
-                dentro = not dentro
-            j = i
-        return dentro
-
     geometrias = set()
     for enc in trabajo.piezas:
         if enc.tipo not in ('encimera', 'isla') or not enc.vertices_mm \
@@ -2521,7 +2648,7 @@ def _verificar_muesca_pilar(trabajo: TrabajoExtraido) -> None:
                                        enc.vertices_mm[(i + 1) % n_v][0],
                                        enc.vertices_mm[(i + 1) % n_v][1])
                 for i in range(n_v))
-            if not (_dentro(cx, cy, enc.vertices_mm) or d_borde <= 200):
+            if not (_punto_en_poligono(cx, cy, enc.vertices_mm) or d_borde <= 200):
                 continue  # el pilar no afecta a esta encimera
             tiene_muesca = any(
                 _math.hypot(vx - px, vy - py) <= 300
