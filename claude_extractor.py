@@ -1493,7 +1493,9 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
     # Un desajuste de nº de vértices (Claude emite L de 6 y el operador dibujó
     # 4 puntos) ya NO deja a la encimera sin anotaciones: la conversión
     # píxel→mm es por bbox, no por vértice, así que sigue siendo válida.
-    anot_pix = {}
+    # El registro se guarda como atributo privado de la propia pieza
+    # (pieza._anot_reg): viaja con el objeto, inmune al snap de vértices y a
+    # filtrados/reordenados de trabajo.piezas. to_dict() ignora atributos «_».
     max_a_enc = max(abs(_signed_area_2d(e.vertices_mm)) for e in encs_ord) or 1
     max_a_pix = max(_bbox_area_px(encimera_polylines_pix[i]) for i in polys_ord) or 1
     pares = []
@@ -1511,25 +1513,23 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
             continue
         usadas_e.add(eid)
         usadas_p.add(pi)
-        anot_pix[eid] = _registro(pi)
+        e._anot_reg = _registro(pi)  # type: ignore[attr-defined]
         if not match_v:
             trabajo.advertencias.append(
                 f"Anotaciones: polilínea de {len(encimera_polylines_pix[pi])} "
                 f"puntos asignada por área a encimera de {len(e.vertices_mm)} "
                 f"vértices ({e.zona or '?'})")
     # Las encimeras opcion1/opcion2 con misma geometría que una de las únicas
-    # apuntan al mismo registro
+    # comparten el mismo registro
     for enc in encimeras_validas:
-        if id(enc) in anot_pix:
+        if getattr(enc, '_anot_reg', None) is not None:
             continue
         k_enc = tuple(tuple(v) for v in enc.vertices_mm)
         for e2 in encs_unicas:
-            if tuple(tuple(v) for v in e2.vertices_mm) == k_enc and id(e2) in anot_pix:
-                anot_pix[id(enc)] = anot_pix[id(e2)]
+            if (tuple(tuple(v) for v in e2.vertices_mm) == k_enc
+                    and getattr(e2, '_anot_reg', None) is not None):
+                enc._anot_reg = e2._anot_reg  # type: ignore[attr-defined]
                 break
-
-    if anot_pix:
-        trabajo._anot_pix = anot_pix  # type: ignore[attr-defined]
 
 
 def _dist_punto_a_segmento(px, py, x1, y1, x2, y2):
@@ -1634,7 +1634,6 @@ def _completar_pulidos_pata(trabajo: TrabajoExtraido) -> None:
     costados = [p for p in trabajo.piezas if p.tipo == 'costado']
     if not costados:
         return
-    anot_pix = getattr(trabajo, '_anot_pix', None) or {}
     for costado in costados:
         # Altura/caída: preferimos altura_mm; fallback al menor de largo/ancho
         altura = costado.altura_mm
@@ -1661,7 +1660,7 @@ def _completar_pulidos_pata(trabajo: TrabajoExtraido) -> None:
                      and p.vertices_mm]
             es_isla_libre = True  # asumimos libre y comprobamos
             for isla in islas:
-                regs = anot_pix.get(id(isla))
+                regs = getattr(isla, '_anot_reg', None)
                 if not regs or not regs.get('paredes_pix'):
                     continue
                 paredes_mm = _trazos_a_mm_local(
@@ -1752,8 +1751,10 @@ def _ajustar_costado_cascada(trabajo: TrabajoExtraido) -> None:
 
 
 def _dedup_frontales(trabajo: TrabajoExtraido) -> None:
-    """Elimina frontales duplicados (largos a ±30mm). Conserva el "más redondo"
-    (múltiplo de 25mm); el otro se considera artefacto de medición."""
+    """Elimina frontales duplicados (largos a ±30mm Y alturas a ±50mm —
+    dos frontales del mismo largo con alturas distintas son piezas DISTINTAS).
+    Conserva el "más redondo" (múltiplo de 25mm); el otro se considera
+    artefacto de medición."""
     frontales = [p for p in trabajo.piezas if p.tipo == 'frontal']
     if len(frontales) < 2:
         return
@@ -1761,6 +1762,8 @@ def _dedup_frontales(trabajo: TrabajoExtraido) -> None:
         if not v:
             return 0
         return 1 if (round(v) % 25 == 0) else 0
+    def _alt(f):
+        return f.altura_mm or f.ancho_mm or 0
     frontales_ord = sorted(frontales, key=lambda f: -(f.largo_mm or 0))
     usados = []
     eliminados = []
@@ -1769,6 +1772,10 @@ def _dedup_frontales(trabajo: TrabajoExtraido) -> None:
         duplicado = False
         for f2 in list(usados):
             L2 = f2.largo_mm or 0
+            # Alturas distintas conocidas → piezas distintas, no dedup
+            h1, h2 = _alt(f), _alt(f2)
+            if h1 and h2 and abs(h1 - h2) > 50:
+                continue
             if L > 0 and L2 > 0 and abs(L - L2) <= 30:
                 if _redondez(L) > _redondez(L2):
                     usados.remove(f2)
@@ -1813,13 +1820,13 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
 
     _dedup_frontales(trabajo)
 
-    anot_pix = getattr(trabajo, '_anot_pix', None) or {}
     TOL_PARED_MM = 250
     TOL_PULIDO_MM = 200
+    regs_todos = [getattr(p, '_anot_reg', None) for p in trabajo.piezas]
     hay_anotacion_pulido_global = any(
-        anot_pix[k].get('pulidos_pix') for k in anot_pix)
+        r.get('pulidos_pix') for r in regs_todos if r)
     hay_anotacion_inglete_global = any(
-        anot_pix[k].get('ingletes_pix') for k in anot_pix)
+        r.get('ingletes_pix') for r in regs_todos if r)
 
     # Limpiar pulidos viejos antes de regenerar (siempre los recalculamos)
     trabajo.cantos = [c for c in trabajo.cantos
@@ -1846,11 +1853,29 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             verts_snap, snap_log = _snap_vertices_a_cotas(
                 encimera.vertices_mm, cotas, cotas_propias)
             if snap_log['x'] or snap_log['y']:
-                encimera.vertices_mm = verts_snap
-                xs = [v[0] for v in verts_snap]
-                ys = [v[1] for v in verts_snap]
-                encimera.largo_mm = float(max(xs) - min(xs))
-                encimera.ancho_mm = float(max(ys) - min(ys))
+                # Validación: el snap no puede degenerar el polígono.
+                # Eliminar vértices duplicados consecutivos y comprobar que
+                # el área se conserva razonablemente; si no, revertir.
+                limpios = []
+                for v in verts_snap:
+                    if not limpios or (v[0] != limpios[-1][0] or v[1] != limpios[-1][1]):
+                        limpios.append(v)
+                if (len(limpios) > 1 and limpios[0][0] == limpios[-1][0]
+                        and limpios[0][1] == limpios[-1][1]):
+                    limpios.pop()
+                area_orig = abs(_signed_area_2d(encimera.vertices_mm))
+                area_snap = abs(_signed_area_2d(limpios)) if len(limpios) >= 3 else 0.0
+                if len(limpios) < 3 or (area_orig > 0 and area_snap < 0.5 * area_orig):
+                    trabajo.advertencias.append(
+                        f"Postproc: snap revertido en {encimera.zona or '?'} — "
+                        f"polígono degenerado ({len(limpios)} vértices, "
+                        f"área {area_snap / 1e6:.2f}m² vs {area_orig / 1e6:.2f}m²)")
+                else:
+                    encimera.vertices_mm = limpios
+                    xs = [v[0] for v in limpios]
+                    ys = [v[1] for v in limpios]
+                    encimera.largo_mm = float(max(xs) - min(xs))
+                    encimera.ancho_mm = float(max(ys) - min(ys))
 
         # Dedup por geometría (opcion1/opcion2 misma forma → solo procesar una)
         geo_key = tuple(tuple(v) for v in encimera.vertices_mm)
@@ -1867,7 +1892,7 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # Convertir trazos pixel → mm-local de ESTA encimera con los vertices
         # actualizados (post-snap). El cargador almacenó en pixel-space para
         # que el snap pueda mover los vertices sin invalidar las claves.
-        regs = anot_pix.get(id(encimera))
+        regs = getattr(encimera, '_anot_reg', None)
         if regs:
             cand_pix = regs['polilinea_pix']
             paredes_mm_local = _trazos_a_mm_local(regs['paredes_pix'], cand_pix, encimera.vertices_mm)
@@ -2057,11 +2082,19 @@ def _completar_ingletes_implicitos(trabajo: TrabajoExtraido) -> None:
         notas_lower = (c.notas or '').lower()
         if 'cabeza' not in notas_lower and 'lateral' not in notas_lower:
             continue
-        # Si ya hay un inglete que mencione esta cabeza, no duplicar
+        # Los pulidos por exclusión cubren TODAS las aristas vistas; generar
+        # un inglete por cada uno fabricaba ingletes fantasma (J0017/J0018).
+        # Solo los pulidos del operador o con cabeza explícita de Claude
+        # implican unión ingletada frontal-cabeza.
+        if 'auto exclusión' in notas_lower or 'auto exclusion' in notas_lower:
+            continue
+        # Dedup estructural: el inglete embebe las notas completas del pulido
+        # que lo originó — buscar la nota ÍNTEGRA, no un prefijo de 25 chars
+        # (dos cabezas distintas pueden compartir prefijo).
         ya_existe = any(
             (c2.tipo == 'ingletado'
-             and (c2.notas or '').lower().find(notas_lower[:25]) >= 0)
-            for c2 in trabajo.cantos
+             and notas_lower and notas_lower in (c2.notas or '').lower())
+            for c2 in trabajo.cantos + nuevos
         )
         if ya_existe:
             continue

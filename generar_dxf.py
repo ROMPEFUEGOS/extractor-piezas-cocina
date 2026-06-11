@@ -448,12 +448,20 @@ def _dibujar_cantos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: fl
                 ii = int(m.group(1))
                 if 0 <= ii < n and ii in libres:
                     idx = ii
+                elif ii >= n:
+                    print(f"  [WARN] Canto con arista idx={ii} pero el polígono "
+                          f"de '{pieza.get('zona', '?')}' tiene {n} aristas",
+                          file=sys.stderr)
             except ValueError:
                 pass
         if idx is None:
             # Fallback por longitud
             L_target = (c.get('longitud_ml') or 0) * 1000.0
             if L_target <= 0 or not libres:
+                print(f"  [WARN] Canto NO dibujado en '{pieza.get('zona', '?')}' "
+                      f"(sin arista libre ni longitud): {c.get('tipo')} "
+                      f"{c.get('longitud_ml')}ml · {(c.get('notas') or '')[:60]}",
+                      file=sys.stderr)
                 continue
             idx = min(libres, key=lambda i: abs(aristas[i]['len'] - L_target))
         a = aristas[idx]

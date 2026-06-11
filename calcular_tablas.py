@@ -43,6 +43,13 @@ TABLAS_ESTANDAR = {
     "default":      [(3000, 1800)],
 }
 
+# Formatos específicos por grosor — clave "marca@grosor_mm". Tienen prioridad
+# sobre TABLAS_ESTANDAR cuando el material trae grosor conocido.
+# Laminam 12mm: tabla grande 3240×1620 (confirmado por el usuario 2026-06-11).
+TABLAS_POR_GROSOR = {
+    "laminam@12": [(3240, 1620)],
+}
+
 # Marcas que se pueden rotar (engineered / porcelánico)
 ROTAR_OK = {
     "dekton", "neolith", "coverlam", "laminam", "ceratop", "lapitec",
@@ -85,10 +92,21 @@ def dimensiones_pieza(pieza: dict) -> Optional[tuple[float, float]]:
 # ---------------------------------------------------------------------------
 # Lookup de medidas de tabla para un material
 # ---------------------------------------------------------------------------
-def tabla_para_material(marca: Optional[str]) -> list[tuple[int, int]]:
+def tabla_para_material(marca: Optional[str],
+                        grosor_cm=None) -> list[tuple[int, int]]:
     if not marca:
         return TABLAS_ESTANDAR["default"]
     key = marca.lower().strip()
+    # 0) Formato específico por grosor (p.ej. Laminam 12mm → 3240×1620)
+    if grosor_cm not in (None, "", "?"):
+        try:
+            g_mm = int(round(float(grosor_cm) * 10))
+            for k, formatos in TABLAS_POR_GROSOR.items():
+                base, _, gg = k.partition('@')
+                if int(gg) == g_mm and (base in key or key in base):
+                    return formatos
+        except (ValueError, TypeError):
+            pass
     # Búsqueda directa
     if key in TABLAS_ESTANDAR:
         return TABLAS_ESTANDAR[key]
@@ -635,7 +653,7 @@ def calcular_tablas(json_path: Path, datos_override: Optional[dict] = None) -> d
 
     for clave, grupo in grupos.items():
         marca = grupo["marca"]
-        formatos = tabla_para_material(marca)
+        formatos = tabla_para_material(marca, grupo.get("grosor_cm"))
         rotar = puede_rotar(marca)
         # Usar el formato estándar principal (el primero)
         tabla_w, tabla_h = formatos[0]

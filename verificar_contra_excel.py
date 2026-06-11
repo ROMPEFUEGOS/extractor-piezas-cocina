@@ -447,11 +447,13 @@ def comparar(excel_data: dict, json_data: dict) -> list[dict]:
     # NOTA: encimera_m2 NO se compara — el Excel cobra colocación en UND (no m²),
     # así que su valor sería siempre 0 y no es ground truth. Solo comparamos
     # chapeado_m2 y ml de tiras (copete/rodapié/zócalo) cuando ambos lados tienen valor.
+    # Tolerancias según feedback usuario 2026-04: <10cm copete (=0.1ml),
+    # <0.5m² chapeado. 0.5ml en tiras era demasiado laxo (falsos MATCH).
     for concepto, a_ex, a_js, tol_abs, tol_rel, sev in [
         ("chapeado_m2", excel_data.get("chapeado_m2", 0), json_data.get("chapeado_m2", 0), 0.5, 0.15, "alta"),
-        ("copete_ml",   excel_data.get("copete_ml",   0), json_data.get("copete_ml",   0), 0.5, 0.15, "media"),
-        ("rodapie_ml",  excel_data.get("rodapie_ml",  0), json_data.get("rodapie_ml",  0), 0.5, 0.15, "media"),
-        ("zocalo_ml",   excel_data.get("zocalo_ml",   0), json_data.get("zocalo_ml",   0), 0.5, 0.15, "baja"),
+        ("copete_ml",   excel_data.get("copete_ml",   0), json_data.get("copete_ml",   0), 0.1, 0.15, "media"),
+        ("rodapie_ml",  excel_data.get("rodapie_ml",  0), json_data.get("rodapie_ml",  0), 0.1, 0.15, "media"),
+        ("zocalo_ml",   excel_data.get("zocalo_ml",   0), json_data.get("zocalo_ml",   0), 0.1, 0.15, "baja"),
     ]:
         # Si una de las fuentes da 0 y la otra >0, puede ser por falta de línea en el
         # Excel (pricing UND vs m²), no un error real. Solo comparamos si Excel > 0.

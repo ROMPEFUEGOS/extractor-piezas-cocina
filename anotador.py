@@ -1007,20 +1007,34 @@ async function guardarPaginaActual(tieneTrazos) {
     }
     return meta;
   });
-  const r = await fetch('/api/guardar_pagina', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      ruta: RUTA_PROYECTO,
-      pagina_id: p.id,
-      overlay_png_b64: tieneTrazos ? overlay_b64 : '',
-      etiquetas,
-      tiene_trazos: tieneTrazos,
-      canvas_w: canvas.width,
-      canvas_h: canvas.height,
-    }),
-  });
-  return r.ok;
+  let r;
+  try {
+    r = await fetch('/api/guardar_pagina', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        ruta: RUTA_PROYECTO,
+        pagina_id: p.id,
+        overlay_png_b64: tieneTrazos ? overlay_b64 : '',
+        etiquetas,
+        tiene_trazos: tieneTrazos,
+        canvas_w: canvas.width,
+        canvas_h: canvas.height,
+      }),
+    });
+  } catch (err) {
+    alert('ERROR al guardar la página (servidor caído o red): ' + err +
+          '\nLas anotaciones de esta página NO se han guardado.');
+    return false;
+  }
+  if (!r.ok) {
+    let detalle = '';
+    try { detalle = (await r.json()).error || ''; } catch (_) {}
+    alert('ERROR al guardar la página (HTTP ' + r.status + '): ' + detalle +
+          '\nLas anotaciones de esta página NO se han guardado.');
+    return false;
+  }
+  return true;
 }
 
 async function guardarNotas() {
@@ -1034,7 +1048,8 @@ async function guardarNotas() {
 
 document.getElementById('btnSkip').onclick = async () => {
   await guardarNotas();
-  await guardarPaginaActual(false);
+  const ok = await guardarPaginaActual(false);
+  if (!ok) return;  // no avanzar si falló el guardado
   cargarPagina(idxActual + 1);
 };
 
@@ -1042,7 +1057,8 @@ document.getElementById('btnSave').onclick = async () => {
   const tiene = trazos.length > 0;
   await guardarNotas();
   if (tiene) {
-    await guardarPaginaActual(true);
+    const ok = await guardarPaginaActual(true);
+    if (!ok) return;  // no avanzar si falló el guardado
     document.querySelectorAll('.pag-item')[idxActual].classList.add('anotada');
   }
   cargarPagina(idxActual + 1);

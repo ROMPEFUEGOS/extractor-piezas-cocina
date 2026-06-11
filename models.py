@@ -135,7 +135,10 @@ class TrabajoExtraido:
     def to_dict(self) -> dict:
         def _conv(obj):
             if hasattr(obj, '__dataclass_fields__'):
-                return {k: _conv(v) for k, v in obj.__dict__.items() if v is not None}
+                # Saltar atributos privados también en dataclasses anidadas
+                # (p.ej. Pieza._anot_reg con datos píxel del anotador)
+                return {k: _conv(v) for k, v in obj.__dict__.items()
+                        if v is not None and not k.startswith('_')}
             elif isinstance(obj, list):
                 return [_conv(i) for i in obj]
             return obj
