@@ -585,6 +585,7 @@ Para CADA hueco de **placa** y **fregadero** (también recomendable para grifo),
 **Cómo determinar estos valores** (en orden de prioridad):
 1. **Si la plantilla/plano muestra la medida exacta** (anotación manuscrita con cotas) → usar esa medida.
 2. **Si la plantilla muestra la posición gráficamente pero sin cota** → estimar proporcionalmente a la medida total de la encimera. **NUNCA "centres" el hueco por defecto**: mide en el dibujo la distancia relativa del hueco a cada extremo (p.ej. "el centro de la placa está a ~1/3 del extremo izquierdo") y traduce ESA proporción a mm. Declara la proporción observada en `notas`.
+2b. **PROFUNDIDAD por defecto (regla de taller)**: si no hay cota de profundidad, el borde delantero del hueco (placa/fregadero) queda a **80mm del FRENTE** de la encimera (la arista vista/pulida). Calcula la coordenada perpendicular en consecuencia.
 3. **Si la plantilla NO da ninguna pista** → estimar:
    - **Posición**: cada hueco va **centrado en el módulo de mueble** que lo aloja (típicamente 60cm o 90cm de ancho). Si conoces la posición del módulo en la encimera, usa el centro de ese módulo. Si no, asume:
      - placa: cerca del centro (40-60% del largo de la encimera)
@@ -1170,6 +1171,7 @@ def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtrai
     _reconciliar_geometria_encimera(trabajo)
     _completar_piezas_desde_trazos(trabajo)
     _reposicionar_huecos_desde_trazos(trabajo)
+    _ajustar_profundidad_huecos(trabajo)
     _completar_pulidos_pata(trabajo)
     _completar_inglete_pata(trabajo)
     _completar_copete_principal(trabajo)
@@ -3324,6 +3326,66 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
                         grifo.notas = ((grifo.notas or '')
                                        + ' [recolocado detrás del fregadero '
                                          'hacia la pared clasificada]').strip()
+
+
+def _ajustar_profundidad_huecos(trabajo: TrabajoExtraido) -> None:
+    """Regla de taller (operador, 2026-06-11): si no hay posición EXACTA
+    (marca roja del operador o cota), el borde delantero de placa/fregadero
+    queda a 80mm del FRENTE de la encimera (la arista vista). Solo se ajusta
+    la coordenada perpendicular al frente; la lateral se conserva."""
+    import math as _math
+    MARGEN = 80.0
+    for enc in trabajo.piezas:
+        if enc.tipo not in ('encimera', 'isla') or not enc.vertices_mm:
+            continue
+        tipos_ar = getattr(enc, '_aristas_tipos', None)
+        if not tipos_ar:
+            continue
+        max_len = max(a['len'] for a in tipos_ar)
+        frentes = [a for a in tipos_ar
+                   if a['tipo'] != 'pared' and a['len'] >= 0.5 * max_len]
+        if not frentes:
+            continue
+        zona_tokens = ' '.join((enc.zona or '').lower().split()[:2])
+        for h in trabajo.huecos:
+            if h.tipo not in ('placa', 'fregadero'):
+                continue
+            if 'trazo rojo' in (h.notas or ''):
+                continue  # la marca del operador es exacta — no tocar
+            if not (zona_tokens and zona_tokens in (h.pieza_zona or '').lower()):
+                continue
+            if h.centro_x_mm is None or h.centro_y_mm is None:
+                continue
+            cx, cy = h.centro_x_mm, h.centro_y_mm
+            mejor = None
+            for a in frentes:
+                p1 = enc.vertices_mm[a['v1']]
+                p2 = enc.vertices_mm[a['v2']]
+                d = _dist_punto_a_segmento(cx, cy, p1[0], p1[1], p2[0], p2[1])
+                if mejor is None or d < mejor[0]:
+                    mejor = (d, p1, p2)
+            if mejor is None:
+                continue
+            _, p1, p2 = mejor
+            dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+            L2 = dx * dx + dy * dy or 1
+            t = max(0.0, min(1.0, ((cx - p1[0]) * dx + (cy - p1[1]) * dy) / L2))
+            px_, py_ = p1[0] + t * dx, p1[1] + t * dy
+            nx, ny = cx - px_, cy - py_
+            nn = _math.hypot(nx, ny) or 1.0
+            # Dimensión del hueco a lo largo de la normal al frente
+            profundidad = (h.ancho_mm if abs(ny) >= abs(nx) else h.largo_mm) or 400.0
+            objetivo = MARGEN + profundidad / 2.0
+            nuevo_x = round(px_ + nx / nn * objetivo, 0)
+            nuevo_y = round(py_ + ny / nn * objetivo, 0)
+            if abs(nuevo_x - cx) < 5 and abs(nuevo_y - cy) < 5:
+                continue
+            h.centro_x_mm, h.centro_y_mm = nuevo_x, nuevo_y
+            h.notas = ((h.notas or '')
+                       + ' [profundidad default: 80mm del frente]').strip()
+            trabajo.advertencias.append(
+                f"Postproc: hueco {h.tipo} llevado a 80mm del frente "
+                f"({cx:.0f},{cy:.0f})→({nuevo_x:.0f},{nuevo_y:.0f})")
 
 
 def _espejar_opciones(trabajo: TrabajoExtraido) -> None:
