@@ -1174,6 +1174,16 @@ def _completar_copete_principal(trabajo: TrabajoExtraido) -> None:
         )
         if ya_existe:
             continue
+        # Regla de dominio: el copete va donde la encimera toca pared SIN
+        # chapeado. Si ya hay un frontal (chapeado) de largo ≈ esta encimera,
+        # la pared trasera está cubierta → NO añadir copete principal.
+        pared_con_chapeado = any(
+            p.tipo == 'frontal' and p.largo_mm
+            and abs(p.largo_mm - enc.largo_mm) <= max(200, enc.largo_mm * 0.1)
+            for p in trabajo.piezas
+        )
+        if pared_con_chapeado:
+            continue
         # ¿Hay copetes de cabeza (cortos) en este grupo?
         cabezas = [c for c in copetes_match
                    if (c.longitud_ml or 0) <= ancho_m + 0.1]

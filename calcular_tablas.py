@@ -507,6 +507,69 @@ def pack_piezas_rectpack(piezas_dim: list[tuple[float, float, str]],
     return candidatos[0][3]
 
 
+def pack_piezas_mixto(piezas_dim: list[tuple[float, float, str]],
+                      formatos: list[tuple[int, int]],
+                      rotar: bool) -> Optional[list[Tabla]]:
+    """Empaqueta permitiendo MEZCLAR formatos de tabla en el mismo trabajo
+    (p.ej. 1 estándar + 1 Jumbo). Ofrece a rectpack bins de TODOS los
+    formatos (los pequeños primero, para preferir el barato cuando cabe) y
+    se queda con la mejor combinación: menos tablas, luego menos m².
+
+    Devuelve None si rectpack no está disponible (el shelf legacy no
+    soporta bins heterogéneos) o si ninguna combinación colocó todo.
+    """
+    try:
+        from rectpack import (newPacker, MaxRectsBssf, MaxRectsBaf,
+                               GuillotineBssfSas, PackingMode, PackingBin,
+                               SORT_AREA, SORT_NONE)
+    except ImportError:
+        return None
+    if not piezas_dim:
+        return []
+
+    rects = [(int(round(w)) + KERF_MM, int(round(h)) + KERF_MM, i)
+             for i, (w, h, _) in enumerate(piezas_dim)]
+    n_max = len(rects) + 2
+    candidatos = []
+    for algo in (MaxRectsBssf, MaxRectsBaf, GuillotineBssfSas):
+     for sort_algo in (SORT_NONE, SORT_AREA):
+      for bin_algo in (PackingBin.BBF, PackingBin.BFF):
+        packer = newPacker(mode=PackingMode.Offline, bin_algo=bin_algo,
+                           pack_algo=algo, sort_algo=sort_algo, rotation=rotar)
+        for fw, fh in sorted(formatos, key=lambda f: f[0] * f[1]):
+            for _ in range(n_max):
+                packer.add_bin(fw + KERF_MM, fh + KERF_MM)
+        for w_i, h_i, rid in rects:
+            packer.add_rect(w_i, h_i, rid=rid)
+        packer.pack()
+
+        bins_usados = [b for b in packer if len(b) > 0]
+        if not bins_usados:
+            continue
+        if sum(len(b) for b in bins_usados) < len(rects):
+            continue  # esta combinación no colocó todas las piezas
+
+        tablas_result = []
+        for b in bins_usados:
+            bw = b.width - KERF_MM
+            bh = b.height - KERF_MM
+            t = Tabla(bw, bh)
+            for rect in b:
+                sh = Shelf(rect.y, bw)
+                sh.x_usado = rect.x
+                sh.añadir(rect.width - KERF_MM, rect.height - KERF_MM,
+                          piezas_dim[rect.rid][2])
+                t.shelves.append(sh)
+            tablas_result.append(t)
+        area = sum(t.ancho * t.alto for t in tablas_result)
+        candidatos.append((len(tablas_result), area, tablas_result))
+
+    if not candidatos:
+        return None
+    candidatos.sort(key=lambda c: (c[0], c[1]))
+    return candidatos[0][2]
+
+
 def pack_piezas_shelf(piezas_dim: list[tuple[float, float, str]],
                        tabla_ancho: int, tabla_alto: int,
                        rotar: bool) -> list[Tabla]:
@@ -840,30 +903,57 @@ def calcular_tablas(json_path: Path, datos_override: Optional[dict] = None) -> d
             if not p_dim:
                 candidatos.append({"fw": fw, "fh": fh, "tablas": [],
                                    "piezas": [], "advs": advs_f,
-                                   "linfo": linfo_f, "cortes": 0})
+                                   "linfo": linfo_f, "cortes": 0,
+                                   "area": 0, "mixto": False})
                 continue
             tablas_f = pack_piezas(p_dim, fw, fh, rotar)
             tablas_f, p_dim = _intentar_consolidar(p_dim, tablas_f, linfo_f, fw, fh)
             candidatos.append({"fw": fw, "fh": fh, "tablas": tablas_f,
                                "piezas": p_dim, "advs": advs_f,
-                               "linfo": linfo_f, "cortes": cortes_f})
+                               "linfo": linfo_f, "cortes": cortes_f,
+                               "area": fw * fh * len(tablas_f), "mixto": False})
 
-        mejor = min(candidatos, key=lambda c: (
-            c["cortes"],
-            len(c["tablas"]),
-            c["fw"] * c["fh"] * len(c["tablas"]),
-        ))
-        tabla_w, tabla_h = mejor["fw"], mejor["fh"]
+        def _clave(c):
+            return (c["cortes"], len(c["tablas"]), c["area"])
+
+        # Candidato MIXTO: si hay varios formatos y la mejor opción de formato
+        # único necesita ≥2 tablas, probar a mezclarlos (1 estándar + 1 Jumbo,
+        # etc.) — las piezas se cortan respecto al formato MÁS GRANDE para
+        # minimizar cortes; rectpack coloca cada pieza en el bin donde quepa.
+        if len(formatos) > 1 and min(len(c["tablas"]) for c in candidatos) >= 2:
+            base = max(candidatos, key=lambda c: c["fw"] * c["fh"])
+            if base["piezas"]:
+                tablas_mx = pack_piezas_mixto(base["piezas"], formatos, rotar)
+                if tablas_mx:
+                    candidatos.append({
+                        "fw": None, "fh": None, "tablas": tablas_mx,
+                        "piezas": base["piezas"], "advs": list(base["advs"]),
+                        "linfo": base["linfo"], "cortes": base["cortes"],
+                        "area": sum(t.ancho * t.alto for t in tablas_mx),
+                        "mixto": True,
+                    })
+
+        mejor = min(candidatos, key=_clave)
+        es_mixto = mejor["mixto"]
         tablas = mejor["tablas"]
         piezas_dim = mejor["piezas"]
         advertencias_g = mejor["advs"]
         label_info = mejor["linfo"]
+        if es_mixto:
+            tabla_w, tabla_h = formatos[0]
+            formato_str = "mixto: " + " + ".join(
+                f"{int(t.ancho)}×{int(t.alto)}" for t in tablas)
+        else:
+            tabla_w, tabla_h = mejor["fw"], mejor["fh"]
+            formato_str = f"{tabla_w}×{tabla_h}"
         if len(candidatos) > 1:
-            resumen = ", ".join(
-                f"{c['fw']}×{c['fh']}→{len(c['tablas'])}tablas/{c['cortes']}cortes"
-                for c in candidatos)
+            def _desc(c):
+                etiqueta = "mixto" if c["mixto"] else f"{c['fw']}×{c['fh']}"
+                return (f"{etiqueta}→{len(c['tablas'])}tablas/"
+                        f"{c['cortes']}cortes/{c['area'] / 1e6:.1f}m²")
             advertencias_g.append(
-                f"📐 Formato de tabla elegido {tabla_w}×{tabla_h} entre: {resumen}")
+                f"📐 Formato de tabla elegido {formato_str} entre: "
+                + ", ".join(_desc(c) for c in candidatos))
 
         if not piezas_dim:
             resultado["por_material"][clave] = {
@@ -910,8 +1000,8 @@ def calcular_tablas(json_path: Path, datos_override: Optional[dict] = None) -> d
                     piezas_en_tabla.append(pieza_layout)
             layout.append({
                 "tabla": idx + 1,
-                "ancho_mm": tabla_w,
-                "alto_mm": tabla_h,
+                "ancho_mm": int(t.ancho),
+                "alto_mm": int(t.alto),
                 "aprovechamiento_pct": round(t.aprovechamiento(), 1),
                 "area_usada_m2": round(t.area_usada() / 1e6, 3),
                 "piezas": piezas_en_tabla,
@@ -919,8 +1009,9 @@ def calcular_tablas(json_path: Path, datos_override: Optional[dict] = None) -> d
 
         resultado["por_material"][clave] = {
             "tablas_necesarias": n_tablas,
-            "formato_tabla_mm": f"{tabla_w}×{tabla_h}",
-            "area_tabla_m2": round(tabla_w * tabla_h / 1e6, 3),
+            "formato_tabla_mm": formato_str,
+            "area_tabla_m2": round(sum(t.ancho * t.alto for t in tablas)
+                                   / 1e6 / max(1, n_tablas), 3),
             "piezas_totales": len(piezas_dim),
             "layout": layout,
             "advertencias": advertencias_g,
