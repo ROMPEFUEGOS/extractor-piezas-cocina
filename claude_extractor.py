@@ -2578,7 +2578,7 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                 ref_copete = next((p for p in trabajo.piezas
                                    if p.tipo == 'copete' and _de_opcion(p)),
                                   None)
-                for a in aristas_pared:
+                for a in sorted(aristas_pared, key=lambda x: -x['len']):
                     tol = max(150, a['len'] * 0.2)
                     cubierta = False
                     for pool in (pool_copetes, pool_copetes_global,
@@ -2586,51 +2586,63 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                         match = next(((L, p) for L, p in pool
                                       if abs(L - a['len']) <= tol), None)
                         if match is not None:
-                            pool.remove(match)
-                            if match[1].tipo == 'copete':
-                                copetes_consumidos_global.add(id(match[1]))
-                                # La longitud del copete ES la de la arista
-                                # de pared que cubre (la cota leída por
-                                # Claude puede diferir: J0024 2650 vs 2635)
-                                L_arista = round(a['len'] / 1000.0, 3)
-                                if abs((match[1].longitud_ml or 0)
-                                       - L_arista) > 0.005:
-                                    match[1].longitud_ml = L_arista
-                                    match[1].notas = ((match[1].notas or '')
-                                                      + f' [ajustado a arista '
-                                                        f'{L_arista}ml]').strip()
-                            cubierta = True
-                            break
+                            # Solo el match individual EXACTO (≤5mm) gana
+                            # directamente; los aproximados se deciden abajo
+                            # con subset-sum (J0025: la trasera 2760 casaba
+                            # con el frontal 2680 d=80 cuando 2312+448 era
+                            # exacta)
+                            if abs(match[0] - a['len']) > 5:
+                                match = None
+                            if match is not None:
+                                pool.remove(match)
+                                if match[1].tipo == 'copete':
+                                    copetes_consumidos_global.add(id(match[1]))
+                                cubierta = True
+                                break
                     if cubierta:
                         continue
-                    # Cobertura por TRAMOS: una arista larga puede estar
-                    # cubierta por la SUMA de varias piezas (J0024: trasera
-                    # de 4725 = copete 2650 + frontal 2100). Greedy de mayor
-                    # a menor hasta aproximar la longitud.
-                    candidatas_suma = sorted(
-                        [(L, p, pool) for pool in (pool_copetes,
-                                                   pool_copetes_global,
-                                                   pool_frontales)
-                         for (L, p) in pool if L <= a['len'] * 1.1],
-                        key=lambda x: -x[0])
-                    suma = 0.0
-                    usadas_suma = []
-                    for L, p, pool in candidatas_suma:
-                        if suma >= a['len'] * 0.95:
-                            break
-                        if suma + L <= a['len'] * 1.1:
-                            suma += L
-                            usadas_suma.append((L, p, pool))
-                    if usadas_suma and abs(suma - a['len']) <= max(150, a['len'] * 0.1):
-                        for L, p, pool in usadas_suma:
+                    # Cobertura por TRAMOS (subset-sum): el MEJOR subconjunto
+                    # de piezas cuya suma aproxima la arista (no greedy: el
+                    # primer casi-acierto puede robarle la pieza a otra
+                    # arista — J0025)
+                    candidatas_suma = [
+                        (L, p, pool) for pool in (pool_copetes,
+                                                  pool_copetes_global,
+                                                  pool_frontales)
+                        for (L, p) in pool if L <= a['len'] * 1.1][:12]
+                    mejor_sub = None  # (|d|, n_piezas, subset)
+                    nc = len(candidatas_suma)
+                    for mask in range(1, 1 << nc):
+                        suma = 0.0
+                        items = []
+                        for b in range(nc):
+                            if mask & (1 << b):
+                                suma += candidatas_suma[b][0]
+                                items.append(candidatas_suma[b])
+                        if suma > a['len'] * 1.1:
+                            continue
+                        d = abs(suma - a['len'])
+                        clave = (d, len(items))
+                        if mejor_sub is None or clave < mejor_sub[0]:
+                            mejor_sub = (clave, items)
+                    if mejor_sub and mejor_sub[0][0] <= max(150, a['len'] * 0.1):
+                        for L, p, pool in mejor_sub[1]:
                             pool.remove((L, p))
                             if p.tipo == 'copete':
                                 copetes_consumidos_global.add(id(p))
+                                if len(mejor_sub[1]) == 1:
+                                    L_arista = round(a['len'] / 1000.0, 3)
+                                    if abs((p.longitud_ml or 0) - L_arista) > 0.005:
+                                        p.longitud_ml = L_arista
+                                        p.notas = ((p.notas or '')
+                                                   + f' [ajustado a arista '
+                                                     f'{L_arista}ml]').strip()
                         continue
                     # La cobertura PARCIAL solo con FRONTALES: un chapeado
                     # por tramos es habitual (pilar), pero un copete de
                     # cabeza nunca es "tramo" de la trasera (J0021)
-                    usadas_suma = [(L, p, pool) for (L, p, pool) in usadas_suma
+                    usadas_suma = [(L, p, pool) for (L, p, pool)
+                                   in (mejor_sub[1] if mejor_sub else [])
                                    if p.tipo == 'frontal']
                     suma = sum(L for L, _, _ in usadas_suma)
                     if usadas_suma and suma >= 300:
