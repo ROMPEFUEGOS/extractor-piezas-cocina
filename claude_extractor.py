@@ -2239,6 +2239,18 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                             f"se pudo reconstruir — revisar vértices contra "
                             f"el plano")
                     mapa_aristas = None
+                    if d_forma > 0.45:
+                        # Desajuste catastrófico: proyectar los trazos sobre
+                        # esta geometría produce basura (pulidos de 80mm,
+                        # huecos recolocados a ciegas — J0025). Los trazos
+                        # NO se aplican; se usa aristas_contacto o heurística
+                        # y se avisa para revisión manual.
+                        encimera._anot_no_fiable = True  # type: ignore[attr-defined]
+                        regs = None
+                        trabajo.advertencias.append(
+                            f"⚠ Postproc [{zona_corta}]: trazos del operador "
+                            f"NO aplicados (geometría no casa) — revisar "
+                            f"manualmente o re-anotar el contorno")
             else:
                 # Forma OK: derivar el mapa con la MISMA transformación que
                 # los demás trazos (la alineación normalizada es ambigua en
@@ -2982,7 +2994,8 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
             continue
         geometrias.add(geo)
         regs = getattr(enc, '_anot_reg', None)
-        if not regs or not regs.get('huecos_pix'):
+        if (not regs or not regs.get('huecos_pix')
+                or getattr(enc, '_anot_no_fiable', False)):
             continue
         zona_tokens = ' '.join((enc.zona or '').lower().split()[:2])
         huecos_enc = [h for h in trabajo.huecos
@@ -3248,7 +3261,7 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
             continue
         geometrias.add(geo)
         regs = getattr(enc, '_anot_reg', None)
-        if not regs:
+        if not regs or getattr(enc, '_anot_no_fiable', False):
             continue
         zona_corta = (enc.zona or '?').split('(')[0].strip()[:35]
         verts = enc.vertices_mm
@@ -3436,7 +3449,8 @@ def _verificar_muesca_pilar(trabajo: TrabajoExtraido) -> None:
             continue
         geometrias.add(geo)
         regs = getattr(enc, '_anot_reg', None)
-        if not regs or not regs.get('pilares_pix'):
+        if (not regs or not regs.get('pilares_pix')
+                or getattr(enc, '_anot_no_fiable', False)):
             continue
         pilares_mm = _trazos_a_mm_local(
             regs['pilares_pix'], regs['polilinea_pix'], enc.vertices_mm)
