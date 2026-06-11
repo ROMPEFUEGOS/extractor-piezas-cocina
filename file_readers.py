@@ -397,7 +397,7 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
             for p in info["paginas"]:
                 if p.get("pagina") == pagina:
                     cat = p.get("categoria", "?")
-                    cotas = ", ".join(p.get("cotas_visibles_mm", [])[:8])
+                    cotas = ", ".join(str(c) for c in (p.get("cotas_visibles_mm") or [])[:8])
                     cotas_s = f" cotas:[{cotas}]" if cotas else ""
                     return f"[TIPO:{cat}{cotas_s}]"
         elif "categoria" in info:

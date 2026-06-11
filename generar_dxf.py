@@ -243,18 +243,77 @@ HUECOS_DEFAULT = {
 }
 
 
-def _dibujar_huecos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: float, h_total: float):
+def _zona_key(zona: str) -> str:
+    """Prefijo significativo de la zona usado como clase de equivalencia para
+    asignar cantos/huecos a piezas (las opciones de material con la misma
+    geometría comparten clave y reciben los mismos cantos)."""
+    return (zona or '').lower().split('(')[0].strip()[:35]
+
+
+def _asignar_cantos_y_huecos(datos: dict) -> tuple:
+    """Asigna cada canto y cada hueco a UNA sola zona de pieza.
+
+    Para cada canto, entre todas las piezas encimera/isla cuya zona-clave
+    aparece en sus notas, gana la clave MÁS LARGA (la más específica): así
+    "encimera" no absorbe los cantos de "encimera derecha". Huecos: ídem por
+    `pieza_zona`; si viene vacío se asignan a la encimera de mayor área con
+    aviso. Devuelve (canto_owner, hueco_owner) mapeando id(obj) → zona_key.
+    """
+    piezas_cand = [p for p in datos.get('piezas', [])
+                   if p.get('tipo') in ('encimera', 'isla')
+                   and p.get('vertices_mm') and len(p['vertices_mm']) >= 3]
+    claves = {_zona_key(p.get('zona')) for p in piezas_cand if _zona_key(p.get('zona'))}
+
+    canto_owner = {}
+    for c in datos.get('cantos', []) or []:
+        notas = (c.get('notas') or '').lower()
+        if not notas:
+            continue
+        match = [k for k in claves if k in notas]
+        if match:
+            canto_owner[id(c)] = max(match, key=len)
+        else:
+            print(f"  [WARN] Canto sin pieza asignable (zona no reconocida): "
+                  f"{c.get('tipo')} {c.get('longitud_ml')}ml · {c.get('notas', '')[:60]}",
+                  file=sys.stderr)
+
+    def _area_pieza(p):
+        vs = p['vertices_mm']
+        return abs(_signed_area(vs))
+
+    mayor = max(piezas_cand, key=_area_pieza) if piezas_cand else None
+    hueco_owner = {}
+    for h in datos.get('huecos', []) or []:
+        if h.get('centro_x_mm') is None or h.get('centro_y_mm') is None:
+            continue
+        pza_z = (h.get('pieza_zona') or '').lower().strip()
+        if pza_z:
+            match = [k for k in claves if k in pza_z or pza_z in k]
+            if match:
+                hueco_owner[id(h)] = max(match, key=len)
+            else:
+                print(f"  [WARN] Hueco '{h.get('tipo')}' con pieza_zona "
+                      f"'{pza_z}' que no matchea ninguna pieza — no se dibuja",
+                      file=sys.stderr)
+        elif mayor is not None:
+            hueco_owner[id(h)] = _zona_key(mayor.get('zona'))
+            print(f"  [WARN] Hueco '{h.get('tipo')}' sin pieza_zona — asignado "
+                  f"a la encimera mayor ({mayor.get('zona', '?')})", file=sys.stderr)
+    return canto_owner, hueco_owner
+
+
+def _dibujar_huecos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: float,
+                          h_total: float, hueco_owner: dict = None):
     """Dibuja los huecos de una pieza usando centro_x_mm/centro_y_mm reales,
-    con la misma inversión Y que el polígono."""
-    zona_pza = (pieza.get('zona') or '').lower()
+    con la misma inversión Y que el polígono. Cada hueco se dibuja SOLO en la
+    pieza a la que fue asignado por _asignar_cantos_y_huecos."""
+    zona_pza = _zona_key(pieza.get('zona'))
     for h in datos.get('huecos', []):
         cx = h.get('centro_x_mm')
         cy = h.get('centro_y_mm')
         if cx is None or cy is None:
             continue
-        # Filtrar huecos que pertenezcan a esta pieza si pieza_zona está informado
-        pza_z = (h.get('pieza_zona') or '').lower()
-        if pza_z and zona_pza and pza_z not in zona_pza and zona_pza not in pza_z:
+        if hueco_owner is not None and hueco_owner.get(id(h)) != zona_pza:
             continue
         tipo = h.get('tipo', 'hueco')
         hw = h.get('largo_mm') or HUECOS_DEFAULT.get(tipo, (100, 100))[0]
@@ -347,13 +406,14 @@ def _aristas_poligono(verts: list, x_off: float, y_off: float, h_total: float) -
     return aristas
 
 
-def _dibujar_cantos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: float, h_total: float):
+def _dibujar_cantos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: float,
+                          h_total: float, canto_owner: dict = None):
     """Dibuja recto_pulido (cian) e ingletado (magenta) sobre las aristas del
-    polígono. Filtra los cantos por zona (cada canto que emitió el postproc
-    lleva en `notas` el zona de la pieza al que pertenece). Para los pulidos,
-    intenta extraer el `idx` exacto de las notas; si no, cae a matching por
-    longitud entre las aristas no usadas. Los ingletes se distribuyen en las
-    esquinas adyacentes a aristas pulidas, una a una.
+    polígono. Cada canto se dibuja SOLO en la pieza a la que fue asignado por
+    _asignar_cantos_y_huecos (el match de zona más específico gana). Para los
+    pulidos, intenta extraer el `idx` exacto de las notas; si no, cae a
+    matching por longitud entre las aristas no usadas. Los ingletes se
+    distribuyen en las esquinas adyacentes a aristas pulidas, una a una.
     """
     import re as _re
     verts = pieza.get('vertices_mm')
@@ -365,15 +425,11 @@ def _dibujar_cantos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: fl
     n = len(aristas)
     cantos = datos.get('cantos', []) or []
 
-    # Filtrar cantos que pertenecen a ESTA pieza por zona en las notas
-    zona_pza = (pieza.get('zona') or '').lower().strip()
+    zona_pza = _zona_key(pieza.get('zona'))
     def _del_pieza(c):
-        notas = (c.get('notas') or '').lower()
-        if not zona_pza or not notas:
+        if canto_owner is None:
             return False
-        # comparación robusta: prefijo significativo de la zona
-        zk = zona_pza.split('(')[0].strip()[:35]
-        return zk in notas
+        return canto_owner.get(id(c)) == zona_pza
 
     pulidos = [c for c in cantos if c.get('tipo', '').startswith('recto_pulido') and _del_pieza(c)]
     ingletes = [c for c in cantos if c.get('tipo') == 'ingletado' and _del_pieza(c)]
@@ -525,6 +581,10 @@ def generar_dxf(json_path: Path, output_path: Path):
     # ── Agrupar piezas por material ──────────────────────────────────────
     grupos = agrupar_piezas_por_material(datos)
 
+    # Asignación única canto→pieza y hueco→pieza (evita duplicados entre
+    # piezas con zonas que son prefijo unas de otras)
+    canto_owner, hueco_owner = _asignar_cantos_y_huecos(datos)
+
     y_grupo = MARGEN
     isla_info = None  # guardar info de la isla para huecos
 
@@ -552,8 +612,10 @@ def generar_dxf(json_path: Path, output_path: Path):
                 añadir_poligono(msp, verts, x - x_min, y - y_min, capa, h_total=h_poly + 2 * y_min)
                 # Dibujar huecos y cantos pertenecientes a esta pieza
                 if tipo in ('encimera', 'isla'):
-                    _dibujar_huecos_pieza(msp, datos, p, x - x_min, y - y_min, h_poly + 2 * y_min)
-                    _dibujar_cantos_pieza(msp, datos, p, x - x_min, y - y_min, h_poly + 2 * y_min)
+                    _dibujar_huecos_pieza(msp, datos, p, x - x_min, y - y_min,
+                                          h_poly + 2 * y_min, hueco_owner)
+                    _dibujar_cantos_pieza(msp, datos, p, x - x_min, y - y_min,
+                                          h_poly + 2 * y_min, canto_owner)
             else:
                 añadir_rect(msp, x, y, w, h, capa)
 

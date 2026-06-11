@@ -1474,14 +1474,9 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
     polys_ord = sorted(range(len(encimera_polylines_pix)),
                        key=lambda i: -_bbox_area_px(encimera_polylines_pix[i]))
 
-    # trabajo._anot_pix[id(enc)] = {polilinea_pix, paredes_pix, ma_pix, ...}
-    anot_pix = {}
-    for enc, poly_idx in zip(encs_ord, polys_ord):
-        cand = encimera_polylines_pix[poly_idx]
-        if len(cand) != len(enc.vertices_mm):
-            continue
-        anot_pix[id(enc)] = {
-            'polilinea_pix': cand,
+    def _registro(poly_idx):
+        return {
+            'polilinea_pix': encimera_polylines_pix[poly_idx],
             'paredes_pix': paredes_pix,
             'ma_pix': ma_pix,
             'copetes_pix': copetes_pix,
@@ -1491,6 +1486,37 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
             'zocalos_pix': zocalos_pix,
             'pilares_pix': pilares_pix,
         }
+
+    # Matching por mejor pareja (greedy): se puntúa cada par encimera↔polilínea
+    # por similitud de área NORMALIZADA (cada lado relativo a su máximo, para
+    # poder comparar mm² con px²) con un bonus si coincide el nº de vértices.
+    # Un desajuste de nº de vértices (Claude emite L de 6 y el operador dibujó
+    # 4 puntos) ya NO deja a la encimera sin anotaciones: la conversión
+    # píxel→mm es por bbox, no por vértice, así que sigue siendo válida.
+    anot_pix = {}
+    max_a_enc = max(abs(_signed_area_2d(e.vertices_mm)) for e in encs_ord) or 1
+    max_a_pix = max(_bbox_area_px(encimera_polylines_pix[i]) for i in polys_ord) or 1
+    pares = []
+    for e in encs_ord:
+        na_e = abs(_signed_area_2d(e.vertices_mm)) / max_a_enc
+        for pi in polys_ord:
+            na_p = _bbox_area_px(encimera_polylines_pix[pi]) / max_a_pix
+            match_v = len(encimera_polylines_pix[pi]) == len(e.vertices_mm)
+            score = abs(na_e - na_p) - (0.15 if match_v else 0.0)
+            pares.append((score, id(e), e, pi, match_v))
+    pares.sort(key=lambda t: (t[0], t[1], t[3]))
+    usadas_e, usadas_p = set(), set()
+    for score, eid, e, pi, match_v in pares:
+        if eid in usadas_e or pi in usadas_p:
+            continue
+        usadas_e.add(eid)
+        usadas_p.add(pi)
+        anot_pix[eid] = _registro(pi)
+        if not match_v:
+            trabajo.advertencias.append(
+                f"Anotaciones: polilínea de {len(encimera_polylines_pix[pi])} "
+                f"puntos asignada por área a encimera de {len(e.vertices_mm)} "
+                f"vértices ({e.zona or '?'})")
     # Las encimeras opcion1/opcion2 con misma geometría que una de las únicas
     # apuntan al mismo registro
     for enc in encimeras_validas:
