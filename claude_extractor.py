@@ -1944,7 +1944,11 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         trabajo.cantos = [c for c in trabajo.cantos if c.tipo != 'ingletado']
 
     geometrias_procesadas = []  # tuplas hashables de vértices ya procesados
-
+    # Copetes de Claude ya usados como cobertura de alguna arista pared
+    # (consumo GLOBAL entre encimeras: la afinidad textual de zona es frágil
+    # — "encimera pared" vs "encimera de pared" — y sin este segundo nivel
+    # se duplicaban copetes de cabeza)
+    copetes_consumidos_global = set()
 
     for encimera in encimeras:
         # Snap a cotas conocidas
@@ -2173,12 +2177,12 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             if best_a is None or best_d > TOL_PERTENENCIA_MM:
                 continue
             aristas_cubiertas.add(best_a['idx'])
-            # Una marca corta (tick) señala la arista, no mide el inglete:
-            # la longitud real es la de la arista marcada.
-            L_inglete = L_total if L_total >= 100 else best_a['len']
+            # El trazo magenta SEÑALA la arista de unión; la longitud del
+            # inglete es la de la arista (regla usuario: "va ingletado 1m de
+            # la pata y 1m de la isla" = la cabeza), no la del trazo a mano.
             trabajo.cantos.append(Canto(
                 tipo='ingletado',
-                longitud_ml=round(L_inglete / 1000.0, 3),
+                longitud_ml=round(best_a['len'] / 1000.0, 3),
                 notas=f"trazo magenta operador (arista idx={best_a['idx']}) "
                       f"en {zona_corta}",
             ))
@@ -2268,7 +2272,15 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
 
                 pool_copetes = [(_longitud(p), p) for p in trabajo.piezas
                                 if p.tipo == 'copete' and _de_opcion(p)
-                                and _es_de_esta_encimera(p) and _longitud(p)]
+                                and _es_de_esta_encimera(p) and _longitud(p)
+                                and id(p) not in copetes_consumidos_global]
+                # 2º nivel: copetes de la opción NO afines y aún sin consumir
+                # en ninguna encimera (red de seguridad de la afinidad textual)
+                pool_copetes_global = [
+                    (_longitud(p), p) for p in trabajo.piezas
+                    if p.tipo == 'copete' and _de_opcion(p)
+                    and not _es_de_esta_encimera(p) and _longitud(p)
+                    and id(p) not in copetes_consumidos_global]
                 pool_frontales = [(_longitud(p), p) for p in trabajo.piezas
                                   if p.tipo == 'frontal' and _de_opcion(p)
                                   and _longitud(p)]
@@ -2278,11 +2290,14 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                 for a in aristas_pared:
                     tol = max(150, a['len'] * 0.2)
                     cubierta = False
-                    for pool in (pool_copetes, pool_frontales):
+                    for pool in (pool_copetes, pool_copetes_global,
+                                 pool_frontales):
                         match = next(((L, p) for L, p in pool
                                       if abs(L - a['len']) <= tol), None)
                         if match is not None:
                             pool.remove(match)
+                            if match[1].tipo == 'copete':
+                                copetes_consumidos_global.add(id(match[1]))
                             cubierta = True
                             break
                     if cubierta:
@@ -2873,9 +2888,17 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
     # pool se agota, la pieza falta → se crea. Así dos copetes de cabeza
     # IGUALES (p.ej. 0.6m + 0.6m) generan dos piezas, no una («si van
     # separadas se dibujan separadas»).
+    GENERICOS = {'encimera', 'tramo', 'superior', 'inferior', 'principal',
+                 'central', 'zona', 'con', 'de', 'la', 'el', 'en'}
+
+    def _tokens_distintivos(zona):
+        return {w for w in (zona or '').lower().replace('(', ' ').split()
+                if len(w) >= 3 and w not in GENERICOS}
+
     pool = {}
     for _, tipo in TIPOS:
-        pool[tipo] = [p.longitud_ml or ((p.largo_mm or 0) / 1000.0)
+        pool[tipo] = [{'L': p.longitud_ml or ((p.largo_mm or 0) / 1000.0),
+                       'zona': p.zona or ''}
                       for p in trabajo.piezas if p.tipo == tipo]
 
     usados = set()       # id() de trazos píxel ya consumidos (listas compartidas)
@@ -2916,16 +2939,60 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                 if best_d > TOL_PERTENENCIA_MM or not best_len or best_len < 100:
                     continue
                 usados.add(id(stroke_pix))
-                L_ml = round(best_len / 1000.0, 3)
-                # 1) ¿Queda una pieza de Claude en el pool que cubra este trazo?
-                consumida = None
-                for L_p in pool[tipo]:
-                    if L_p and abs(L_p - L_ml) <= max(0.2 * L_ml, 0.1):
-                        consumida = L_p
-                        break
-                if consumida is not None:
-                    pool[tipo].remove(consumida)
+                # Longitud objetivo: la arista si el trazo la recorre casi
+                # entera; si no, la del propio trazo (un zócalo puede cubrir
+                # solo un tramo de la arista — J0022: trazo de 860mm sobre
+                # una arista de isla de 2400)
+                L_trazo = _path_length_mm(stroke)
+                if L_trazo >= 0.8 * best_len:
+                    L_ml = round(best_len / 1000.0, 3)
+                else:
+                    L_ml = round(L_trazo / 1000.0, 3)
+                # 1) ¿Queda una pieza de Claude en el pool que cubra este
+                # trazo? (match exacto ±20%, prefiriendo afinidad de zona)
+                toks_enc = _tokens_distintivos(enc.zona)
+
+                def _afin(entrada):
+                    return bool(toks_enc
+                                & _tokens_distintivos(entrada['zona']))
+
+                def _compatible(e):
+                    # SOLO para zócalos: zonas con tokens distintivos
+                    # DISJUNTOS = piezas de encimeras distintas (el residuo
+                    # del zócalo de la pared no puede cubrir el trazo de la
+                    # isla). En copetes/frontales la zona describe la cabeza
+                    # y no suele nombrar a la encimera — no filtrar.
+                    if tipo != 'zocalo':
+                        return True
+                    toks_e = _tokens_distintivos(e['zona'])
+                    if toks_enc and toks_e and not (toks_enc & toks_e):
+                        return False
+                    return True
+
+                candidatas = sorted(
+                    (e for e in pool[tipo]
+                     if e['L'] and abs(e['L'] - L_ml) <= max(0.2 * L_ml, 0.1)
+                     and _compatible(e)),
+                    key=lambda e: not _afin(e))
+                if candidatas:
+                    pool[tipo].remove(candidatas[0])
                     continue
+                # 1b) Zócalos: una pieza larga de Claude (cota del plano,
+                # p.ej. 4830 para toda la pared) cubre VARIOS tramos marcados
+                # — consumo residual, pero SOLO de piezas afines a esta
+                # encimera (el residuo de la pared no debe absorber el zócalo
+                # nuevo de la isla)
+                if tipo == 'zocalo':
+                    afines = [e for e in pool[tipo]
+                              if _afin(e) and e['L'] >= L_ml * 0.8]
+                    if afines:
+                        mayor = max(afines, key=lambda e: e['L'])
+                        pool[tipo].remove(mayor)
+                        resto = mayor['L'] - L_ml
+                        if resto > 0.1:
+                            pool[tipo].append({'L': round(resto, 3),
+                                               'zona': mayor['zona']})
+                        continue
                 # 2) ¿Ya creamos pieza para esta misma arista?
                 clave_arista = (geo, tipo, best_i)
                 if clave_arista in aristas_creadas:
