@@ -28,12 +28,13 @@ TABLAS_ESTANDAR = {
     "laminam":      [(3000, 1000), (3000, 1500)],
     "ceratop":      [(3200, 1440)],
     "lapitec":      [(3000, 1440)],
-    # Cuarzo engineered
-    "silestone":    [(3040, 1440)],
+    # Cuarzo engineered — Silestone estándar + Jumbo 3250×1590 (el packer
+    # elige el formato que mejor convenga: menos cortes / menos tablas)
+    "silestone":    [(3040, 1440), (3250, 1590)],
     "compac":       [(3050, 1440)],
     "caesarstone":  [(3040, 1440)],
     "diresco":      [(3030, 1440)],
-    "cosentino":    [(3040, 1440)],  # igual Silestone (misma empresa)
+    "cosentino":    [(3040, 1440), (3250, 1590)],  # igual Silestone (misma empresa)
     "samsung":      [(3040, 1440)],
     # Piedra natural (granito, mármol, pizarra…) — variable; usamos media habitual
     "piedra_natural": [(3000, 1800), (2800, 1800), (2500, 1600)],
@@ -658,15 +659,7 @@ def calcular_tablas(json_path: Path, datos_override: Optional[dict] = None) -> d
         marca = grupo["marca"]
         formatos = tabla_para_material(marca, grupo.get("grosor_cm"))
         rotar = puede_rotar(marca)
-        # Usar el formato estándar principal (el primero)
-        tabla_w, tabla_h = formatos[0]
-
-        piezas_dim: list[tuple[float, float, str]] = []
-        advertencias_g: list[str] = []
-
         huecos_globales = datos.get("huecos") or []
-        # Mapa: label → info completa (vertices, huecos asociados) para visualización
-        label_info: dict = {}
 
         def huecos_de_pieza(pieza: dict) -> list[dict]:
             """Devuelve los huecos asociados a una pieza por su campo `zona`.
@@ -687,104 +680,108 @@ def calcular_tablas(json_path: Path, datos_override: Optional[dict] = None) -> d
                         return huecos_globales
             return []
 
-        for i, pieza in enumerate(grupo["piezas"]):
-            dims = dimensiones_pieza(pieza)
-            if not dims:
-                advertencias_g.append(
-                    f"Pieza #{i+1} ({pieza.get('tipo')} {pieza.get('zona','')}) sin dimensiones — no se calcula"
-                )
-                continue
-            w, h = dims
-            label = f"{pieza.get('tipo','')} {pieza.get('zona','')}"
-            if w == 0 or h == 0:
-                advertencias_g.append(f"Pieza #{i+1} ({label}) dimensión 0 — ignorada")
-                continue
-            tipo_p = (pieza.get("tipo") or "").lower()
-            # Asociar info de polígono y huecos al label (para visualización 2D real)
-            huecos_pza = huecos_de_pieza(pieza) if tipo_p in ("encimera","isla","cascada") else []
-            label_info[label] = {
-                "vertices_mm": pieza.get("vertices_mm"),
-                "forma": pieza.get("forma"),
-                "tipo": tipo_p,
-                "zona": pieza.get("zona"),
-                "huecos": huecos_pza,
-                "bbox_w": w,
-                "bbox_h": h,
-            }
-            # Si la pieza tiene polígono (L, U, etc.), descomponer en sub-rectángulos
-            # naturales antes de cualquier corte adicional (preserva la forma).
-            verts_pieza = pieza.get("vertices_mm")
-            if verts_pieza and len(verts_pieza) > 4 and tipo_p in ("encimera","isla","cascada"):
-                sub_rects = decomponer_poligono_en_rects(verts_pieza, label)
-                if len(sub_rects) > 1:
+        def _construir_piezas_dim(tabla_w: float, tabla_h: float):
+            """Construye la lista de piezas a empaquetar para UN formato de
+            tabla (los cortes dependen del tamaño). Devuelve
+            (piezas_dim, advertencias, label_info, cortes_encimera) donde
+            cortes_encimera penaliza cortes forzados de encimera/isla/cascada
+            (y más aún piezas que no caben de ninguna forma)."""
+            piezas_dim: list[tuple[float, float, str]] = []
+            advertencias_g: list[str] = []
+            label_info: dict = {}
+            cortes_encimera = 0
+            for i, pieza in enumerate(grupo["piezas"]):
+                dims = dimensiones_pieza(pieza)
+                if not dims:
                     advertencias_g.append(
-                        f"🔷 {label} (polígono {len(verts_pieza)}v) → {len(sub_rects)} sub-rect: "
-                        + " + ".join(f"{r['w']:.0f}×{r['h']:.0f}" for r in sub_rects)
+                        f"Pieza #{i+1} ({pieza.get('tipo')} {pieza.get('zona','')}) sin dimensiones — no se calcula"
                     )
-                    # Guardar info del polígono original + posición de cada sub-rect
-                    label_info[label]["sub_rects"] = sub_rects
-                    for sr in sub_rects:
-                        sr_label = f"{label} (parte L {sr['x0']:.0f},{sr['y0']:.0f})"
-                        label_info[sr_label] = {
-                            "vertices_mm": sr.get("vertices_mm") or [
-                                (0,0),(sr["w"],0),(sr["w"],sr["h"]),(0,sr["h"])
-                            ],
-                            "forma": "rectangulo",
-                            "tipo": tipo_p,
-                            "zona": pieza.get("zona"),
-                            "huecos": [],   # los huecos van a la pieza original
-                            "bbox_w": sr["w"], "bbox_h": sr["h"],
-                            "es_subpieza_de": label,
-                        }
-                        sw, sh = sr["w"], sr["h"]
-                        # Si el sub-rect aún no cabe en tabla, partir más
-                        if sw > tabla_w or sh > tabla_h:
-                            extra = split_pieza_por_huecos(sw, sh, sr_label, huecos_pza, tabla_w)
-                            piezas_dim.extend(extra)
-                        else:
-                            piezas_dim.append((sw, sh, sr_label))
-                    continue   # salta el procesamiento normal
+                    continue
+                w, h = dims
+                label = f"{pieza.get('tipo','')} {pieza.get('zona','')}"
+                if w == 0 or h == 0:
+                    advertencias_g.append(f"Pieza #{i+1} ({label}) dimensión 0 — ignorada")
+                    continue
+                tipo_p = (pieza.get("tipo") or "").lower()
+                # Asociar info de polígono y huecos al label (para visualización 2D real)
+                huecos_pza = huecos_de_pieza(pieza) if tipo_p in ("encimera","isla","cascada") else []
+                label_info[label] = {
+                    "vertices_mm": pieza.get("vertices_mm"),
+                    "forma": pieza.get("forma"),
+                    "tipo": tipo_p,
+                    "zona": pieza.get("zona"),
+                    "huecos": huecos_pza,
+                    "bbox_w": w,
+                    "bbox_h": h,
+                }
+                # Si la pieza tiene polígono (L, U, etc.), descomponer en sub-rectángulos
+                # naturales antes de cualquier corte adicional (preserva la forma).
+                verts_pieza = pieza.get("vertices_mm")
+                if verts_pieza and len(verts_pieza) > 4 and tipo_p in ("encimera","isla","cascada"):
+                    sub_rects = decomponer_poligono_en_rects(verts_pieza, label)
+                    if len(sub_rects) > 1:
+                        advertencias_g.append(
+                            f"🔷 {label} (polígono {len(verts_pieza)}v) → {len(sub_rects)} sub-rect: "
+                            + " + ".join(f"{r['w']:.0f}×{r['h']:.0f}" for r in sub_rects)
+                        )
+                        # Guardar info del polígono original + posición de cada sub-rect
+                        label_info[label]["sub_rects"] = sub_rects
+                        for sr in sub_rects:
+                            sr_label = f"{label} (parte L {sr['x0']:.0f},{sr['y0']:.0f})"
+                            label_info[sr_label] = {
+                                "vertices_mm": sr.get("vertices_mm") or [
+                                    (0,0),(sr["w"],0),(sr["w"],sr["h"]),(0,sr["h"])
+                                ],
+                                "forma": "rectangulo",
+                                "tipo": tipo_p,
+                                "zona": pieza.get("zona"),
+                                "huecos": [],   # los huecos van a la pieza original
+                                "bbox_w": sr["w"], "bbox_h": sr["h"],
+                                "es_subpieza_de": label,
+                            }
+                            sw, sh = sr["w"], sr["h"]
+                            # Si el sub-rect aún no cabe en tabla, partir más
+                            if sw > tabla_w or sh > tabla_h:
+                                extra = split_pieza_por_huecos(sw, sh, sr_label, huecos_pza, tabla_w)
+                                if len(extra) > 1:
+                                    cortes_encimera += 1
+                                piezas_dim.extend(extra)
+                            else:
+                                piezas_dim.append((sw, sh, sr_label))
+                        continue   # salta el procesamiento normal
 
-            fits_normal = (w <= tabla_w and h <= tabla_h)
-            fits_rotada = rotar and (h <= tabla_w and w <= tabla_h)
-            if not (fits_normal or fits_rotada):
-                if tipo_p in ("encimera", "isla", "cascada"):
-                    sub_piezas = split_pieza_por_huecos(w, h, label, huecos_pza, tabla_w)
-                elif tipo_p in ("rodapie", "zocalo"):
-                    sub_piezas = split_rodapie(w, h, label, tabla_w, tiene_lavavajillas=True)
+                fits_normal = (w <= tabla_w and h <= tabla_h)
+                fits_rotada = rotar and (h <= tabla_w and w <= tabla_h)
+                if not (fits_normal or fits_rotada):
+                    if tipo_p in ("encimera", "isla", "cascada"):
+                        sub_piezas = split_pieza_por_huecos(w, h, label, huecos_pza, tabla_w)
+                    elif tipo_p in ("rodapie", "zocalo"):
+                        sub_piezas = split_rodapie(w, h, label, tabla_w, tiene_lavavajillas=True)
+                    else:
+                        sub_piezas = split_pieza_por_huecos(w, h, label, [], tabla_w)
+                    if len(sub_piezas) > 1:
+                        advertencias_g.append(
+                            f"🔪 {label} ({w:.0f}×{h:.0f}mm) → {len(sub_piezas)} trozos: "
+                            + " + ".join(f"{s[0]:.0f}×{s[1]:.0f}" for s in sub_piezas)
+                        )
+                        if tipo_p in ("encimera", "isla", "cascada"):
+                            cortes_encimera += 1
+                    else:
+                        advertencias_g.append(
+                            f"⚠ PIEZA GRANDE: {label} ({w:.0f}×{h:.0f}mm) no se pudo partir — "
+                            f"supera tabla {tabla_w}×{tabla_h}mm"
+                        )
+                        cortes_encimera += 3  # overflow: penalización fuerte
+                    piezas_dim.extend(sub_piezas)
                 else:
-                    sub_piezas = split_pieza_por_huecos(w, h, label, [], tabla_w)
-                if len(sub_piezas) > 1:
-                    advertencias_g.append(
-                        f"🔪 {label} ({w:.0f}×{h:.0f}mm) → {len(sub_piezas)} trozos: "
-                        + " + ".join(f"{s[0]:.0f}×{s[1]:.0f}" for s in sub_piezas)
-                    )
-                else:
-                    advertencias_g.append(
-                        f"⚠ PIEZA GRANDE: {label} ({w:.0f}×{h:.0f}mm) no se pudo partir — "
-                        f"supera tabla {tabla_w}×{tabla_h}mm"
-                    )
-                piezas_dim.extend(sub_piezas)
-            else:
-                piezas_dim.append((w, h, label))
-
-        if not piezas_dim:
-            resultado["por_material"][clave] = {
-                "tablas_necesarias": 0,
-                "formato_tabla_mm": f"{tabla_w}×{tabla_h}",
-                "piezas_totales": 0,
-                "layout": [],
-                "advertencias": advertencias_g,
-            }
-            continue
-
-        tablas = pack_piezas(piezas_dim, tabla_w, tabla_h, rotar)
-        n_tablas = len(tablas)
+                    piezas_dim.append((w, h, label))
+            return piezas_dim, advertencias_g, label_info, cortes_encimera
 
         # CONSOLIDACIÓN: si la última tabla tiene poco aprovechamiento (<40%),
         # sub-dividir SOLO los rodapiés/zócalos que están en esa tabla (no todos)
         # para meterlos en las tablas anteriores.
-        def _intentar_consolidar(piezas_dim_actual, tablas_actuales):
+        def _intentar_consolidar(piezas_dim_actual, tablas_actuales, label_info,
+                                 tabla_w, tabla_h):
             if len(tablas_actuales) <= 1:
                 return tablas_actuales, piezas_dim_actual
             ultima = tablas_actuales[-1]
@@ -834,7 +831,50 @@ def calcular_tablas(json_path: Path, datos_override: Optional[dict] = None) -> d
                     break
             return mejor_tablas, mejor_dim
 
-        tablas, piezas_dim = _intentar_consolidar(piezas_dim, tablas)
+        # Probar TODOS los formatos del catálogo (estándar / Jumbo / por
+        # grosor) y elegir el que mejor convenga: menos cortes forzados de
+        # encimera, luego menos tablas, luego menos m² de tabla comprados.
+        candidatos = []
+        for fw, fh in formatos:
+            p_dim, advs_f, linfo_f, cortes_f = _construir_piezas_dim(fw, fh)
+            if not p_dim:
+                candidatos.append({"fw": fw, "fh": fh, "tablas": [],
+                                   "piezas": [], "advs": advs_f,
+                                   "linfo": linfo_f, "cortes": 0})
+                continue
+            tablas_f = pack_piezas(p_dim, fw, fh, rotar)
+            tablas_f, p_dim = _intentar_consolidar(p_dim, tablas_f, linfo_f, fw, fh)
+            candidatos.append({"fw": fw, "fh": fh, "tablas": tablas_f,
+                               "piezas": p_dim, "advs": advs_f,
+                               "linfo": linfo_f, "cortes": cortes_f})
+
+        mejor = min(candidatos, key=lambda c: (
+            c["cortes"],
+            len(c["tablas"]),
+            c["fw"] * c["fh"] * len(c["tablas"]),
+        ))
+        tabla_w, tabla_h = mejor["fw"], mejor["fh"]
+        tablas = mejor["tablas"]
+        piezas_dim = mejor["piezas"]
+        advertencias_g = mejor["advs"]
+        label_info = mejor["linfo"]
+        if len(candidatos) > 1:
+            resumen = ", ".join(
+                f"{c['fw']}×{c['fh']}→{len(c['tablas'])}tablas/{c['cortes']}cortes"
+                for c in candidatos)
+            advertencias_g.append(
+                f"📐 Formato de tabla elegido {tabla_w}×{tabla_h} entre: {resumen}")
+
+        if not piezas_dim:
+            resultado["por_material"][clave] = {
+                "tablas_necesarias": 0,
+                "formato_tabla_mm": f"{tabla_w}×{tabla_h}",
+                "piezas_totales": 0,
+                "layout": [],
+                "advertencias": advertencias_g,
+            }
+            continue
+
         n_tablas = len(tablas)
 
         # Construir info de layout (con x/y para visualización)
