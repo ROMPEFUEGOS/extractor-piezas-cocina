@@ -1985,6 +1985,62 @@ def _dedup_frontales(trabajo: TrabajoExtraido) -> None:
             f"({', '.join(f'{e.largo_mm}mm' for e in eliminados)})")
 
 
+def _ajustar_fondos_a_cotas(verts, cotas, cotas_propias):
+    """Snap de DIFERENCIAS: el snap por coordenada absoluta no ve que la
+    distancia entre dos líneas paralelas (el FONDO de un brazo o tramo)
+    debía ser una cota — J0024: 2635−1750=885 cuando el fondo real era 900.
+    Mueve solo líneas 'débiles' (no clavadas a una cota real) para que el
+    hueco entre líneas consecutivas case con una cota o un fondo típico.
+    Devuelve los vértices ajustados o None si no hubo cambios."""
+    FONDOS_TIPICOS = (600, 650, 700, 900)
+    reales = set(cotas or ()) | set(cotas_propias or ())
+    objetivos = reales | set(FONDOS_TIPICOS)
+    nuevos = [list(v) for v in verts]
+    cambios = False
+    for eje in (0, 1):
+        for _ in range(3):  # hasta 3 correcciones por eje
+            vals = sorted({v[eje] for v in nuevos})
+            if len(vals) < 2:
+                break
+            pinned = {v for v in vals
+                      if v == 0 or any(abs(v - c) <= 1 for c in reales)}
+            hecho = False
+            for a, b in zip(vals, vals[1:]):
+                gap = b - a
+                # Si el hueco YA coincide con una cota real, es correcto —
+                # no convertir un escalón de 294 (cota) en 300 (J0020)
+                if any(abs(c - gap) <= 1 for c in objetivos):
+                    continue
+                cands = [c for c in objetivos
+                         if 1 < abs(c - gap) <= max(20, gap * 0.03)]
+                if not cands:
+                    continue
+                target = min(cands, key=lambda c: abs(c - gap))
+                delta = gap - target
+                if b not in pinned:
+                    mover, nuevo_v = b, b - delta
+                elif a not in pinned and a != 0:
+                    mover, nuevo_v = a, a + delta
+                else:
+                    continue
+                # No reordenar líneas: el valor nuevo debe seguir entre
+                # sus vecinas
+                idx = vals.index(mover)
+                lo = vals[idx - 1] if idx > 0 else float('-inf')
+                hi = vals[idx + 1] if idx + 1 < len(vals) else float('inf')
+                if not (lo < nuevo_v < hi):
+                    continue
+                for v in nuevos:
+                    if v[eje] == mover:
+                        v[eje] = nuevo_v
+                cambios = True
+                hecho = True
+                break
+            if not hecho:
+                break
+    return nuevos if cambios else None
+
+
 def _escuadrar_poligono(verts):
     """Rectifica un polígono CASI ortogonal a ortogonal exacto. Las cocinas
     son rectilíneas: si todas las aristas están a ≤8° de un eje y alternan
@@ -2129,6 +2185,21 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                     encimera.ancho_mm = float(max(ys) - min(ys))
 
         zona_corta = (encimera.zona or '?').split('(')[0].strip()[:35]
+
+        # Snap de FONDOS: las distancias entre líneas paralelas también
+        # deben caer en cota (el snap absoluto no las ve)
+        if cotas:
+            ajustado = _ajustar_fondos_a_cotas(encimera.vertices_mm,
+                                               cotas, cotas_propias)
+            if ajustado is not None:
+                encimera.vertices_mm = ajustado
+                xs_a = [v[0] for v in ajustado]
+                ys_a = [v[1] for v in ajustado]
+                encimera.largo_mm = float(max(xs_a) - min(xs_a))
+                encimera.ancho_mm = float(max(ys_a) - min(ys_a))
+                trabajo.advertencias.append(
+                    f"Postproc [{zona_corta}]: fondo(s) ajustado(s) a cota "
+                    f"(snap de diferencias)")
 
         # Validar la FORMA contra la polilínea del operador y, si no encaja,
         # RECONSTRUIR el polígono desde ella — el operador es la verdad.
@@ -2394,8 +2465,13 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             aristas_pared = [a for a in aristas
                              if a['tipo'] == 'pared' and a['len'] >= 100
                              and a['idx'] not in aristas_pulido_op]
+            # Gemelas por REGISTRO compartido (no por geometría: cuando se
+            # procesa la primera opción, la gemela aún puede tener vértices
+            # divergentes sin adoptar — J0024 dejaba su copete sin ajustar)
             encs_geo = [e for e in encimeras
-                        if tuple(tuple(v) for v in e.vertices_mm) == geo_key]
+                        if tuple(tuple(v) for v in e.vertices_mm) == geo_key
+                        or (regs is not None
+                            and getattr(e, '_anot_reg', None) is regs)]
             sufijos = []
             for e in encs_geo:
                 suf = ''
@@ -2472,6 +2548,16 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                             pool.remove(match)
                             if match[1].tipo == 'copete':
                                 copetes_consumidos_global.add(id(match[1]))
+                                # La longitud del copete ES la de la arista
+                                # de pared que cubre (la cota leída por
+                                # Claude puede diferir: J0024 2650 vs 2635)
+                                L_arista = round(a['len'] / 1000.0, 3)
+                                if abs((match[1].longitud_ml or 0)
+                                       - L_arista) > 0.005:
+                                    match[1].longitud_ml = L_arista
+                                    match[1].notas = ((match[1].notas or '')
+                                                      + f' [ajustado a arista '
+                                                        f'{L_arista}ml]').strip()
                             cubierta = True
                             break
                     if cubierta:
@@ -2980,6 +3066,19 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
                     f"Postproc: hueco {h.tipo} reposicionado por trazo del "
                     f"operador ({old[0]:.0f},{old[1]:.0f})→({cx:.0f},{cy:.0f}) "
                     f"en {enc.zona or '?'}")
+            # Orientación: si la marca del operador es claramente apaisada o
+            # vertical y contradice el largo×ancho del hueco, se gira 90°
+            # (J0024: fregadero en el brazo vertical dibujado girado)
+            if (h.largo_mm and h.ancho_mm and bw >= 50 and bh >= 50
+                    and abs(bw - bh) > 0.15 * max(bw, bh)
+                    and abs(h.largo_mm - h.ancho_mm) > 10
+                    and (bw > bh) != (h.largo_mm > h.ancho_mm)):
+                h.largo_mm, h.ancho_mm = h.ancho_mm, h.largo_mm
+                h.notas = ((h.notas or '')
+                           + ' [girado 90° según marca del operador]').strip()
+                trabajo.advertencias.append(
+                    f"Postproc: hueco {h.tipo} girado 90° según la marca del "
+                    f"operador ({h.largo_mm:.0f}×{h.ancho_mm:.0f})")
             # El grifo va DETRÁS del fregadero, hacia la pared REAL (la
             # arista clasificada pared por los trazos del operador) — la
             # convención Y de Claude puede estar invertida respecto al canvas
