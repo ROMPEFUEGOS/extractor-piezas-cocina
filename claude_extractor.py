@@ -320,6 +320,22 @@ También puede ser isla o península independiente.
 **🔺 ENCIMERAS NO RECTANGULARES — UN POLÍGONO ÚNICO (CRÍTICO)**:
 Una encimera en L, U o con escalón es UN POLÍGONO ÚNICO. Emite UN solo objeto `pieza` con `vertices_mm` que recorra todo el contorno. El programa de nesting decompone luego en sub-rectángulos óptimos para cortar; tú no tienes que hacer ese reparto. Tu trabajo es conservar la forma real con todos sus vértices.
 
+**🧱 CONTACTO DE CADA ARISTA — `aristas_contacto` (OBLIGATORIO en toda pieza con `vertices_mm`)**:
+Junto a `vertices_mm` emite SIEMPRE `aristas_contacto`: una lista con UNA entrada por arista, alineada con los vértices (la entrada i describe la arista que va del vértice i al i+1; la última cierra contra el vértice 0). Valores permitidos:
+- `"pared"` → la arista va pegada a un muro del edificio (en el plano: líneas dobles, gruesas o sombreadas que delimitan la estancia)
+- `"mueble"` → pegada a columna de muebles, frigorífico panelado, pilar u otro obstáculo
+- `"vista"` → abierta a la cocina (esa arista se pulirá)
+- `"ventana"` → bajo ventana (se pule igual que vista)
+
+Cómo decidirlo MIRANDO EL PLANO (no lo inventes por geometría):
+- Sigue el muro dibujado: una arista de encimera ADOSADA al muro = `"pared"`. Una arista que da al espacio libre de la cocina = `"vista"`.
+- En una **PENÍNSULA o ISLA** la mayoría de aristas son `"vista"`: solo el tramo que conecta con el muro o la esquina es `"pared"`. NO asumas que el lado más largo es pared — en penínsulas suele ser justo al revés.
+- En una encimera rectangular contra pared: trasera = `"pared"`, frente = `"vista"`, y cada cabeza según tenga muro/mueble al lado o quede abierta.
+- COHERENCIA con el resto de tu salida: cada arista `"pared"`/`"mueble"` sin frontal (chapeado) lleva copete; cada arista `"vista"`/`"ventana"` va pulida. Tus piezas de copete/frontal y tus cantos deben cuadrar con esta lista — si no cuadran, revisa la lista o las piezas antes de responder.
+
+**📏 ESCALONES Y ENTRADAS — qué cota va en cada segmento (CRÍTICO)**:
+Cuando una encimera tiene un escalón (fondo que cambia, p.ej. de 900 a 300), identifica QUÉ cota pertenece a CADA segmento siguiendo las líneas de cota del plano (flechas/extremos). NO deduzcas la asignación por eliminación ni porque "la diferencia coincide con otra etiqueta": las dos asignaciones posibles producen los mismos números y solo el dibujo dice cuál es la real. Comprueba contra el dibujo: ¿el extremo es más estrecho o más ancho que el cuerpo? Declara en `notas` qué viste.
+
 **🏛 PILARES Y COLUMNAS — IMPORTANTE para piezas pequeñas**:
 Cuando hay un **pilar/columna** en la pared, la encimera lo rodea por sus caras vistas. Esto genera piezas adicionales pequeñas:
 - **Si el pilar SOBRESALE de la pared hacia la cocina**, la encimera tiene 2 tramos (uno antes del pilar, otro después). Cada uno es 1 pieza.
@@ -560,7 +576,7 @@ Para CADA hueco de **placa** y **fregadero** (también recomendable para grifo),
 
 **Cómo determinar estos valores** (en orden de prioridad):
 1. **Si la plantilla/plano muestra la medida exacta** (anotación manuscrita con cotas) → usar esa medida.
-2. **Si la plantilla muestra la posición gráficamente pero sin cota** → estimar proporcionalmente a la medida total de la encimera.
+2. **Si la plantilla muestra la posición gráficamente pero sin cota** → estimar proporcionalmente a la medida total de la encimera. **NUNCA "centres" el hueco por defecto**: mide en el dibujo la distancia relativa del hueco a cada extremo (p.ej. "el centro de la placa está a ~1/3 del extremo izquierdo") y traduce ESA proporción a mm. Declara la proporción observada en `notas`.
 3. **Si la plantilla NO da ninguna pista** → estimar:
    - **Posición**: cada hueco va **centrado en el módulo de mueble** que lo aloja (típicamente 60cm o 90cm de ancho). Si conoces la posición del módulo en la encimera, usa el centro de ese módulo. Si no, asume:
      - placa: cerca del centro (40-60% del largo de la encimera)
@@ -829,6 +845,11 @@ Estructura de ejemplo para un trabajo real (J0297 Elisa Baños):
       "tipo": "encimera", "material_rol": "encimera",
       "forma": "poligono",
       "vertices_mm": [[0,0],[2700,0],[2700,400],[3000,400],[3000,600],[0,600]],
+      /* aristas_contacto alineada con vertices_mm: arista i = vértice i → i+1.
+         idx0 frente=vista, idx1 cabeza dcha junto a pilar=mueble,
+         idx2-3 envuelven el pilar=pared, idx4 trasera (con chapeado)=pared,
+         idx5 cabeza izquierda contra muro=pared */
+      "aristas_contacto": ["vista","mueble","pared","pared","pared","pared"],
       "largo_mm": 3000, "ancho_mm": 600,
       "zona": "pared norte principal con saliente pilar trasero derecho"
     },
@@ -836,6 +857,8 @@ Estructura de ejemplo para un trabajo real (J0297 Elisa Baños):
       "tipo": "isla", "material_rol": "encimera",
       "forma": "rectangulo",
       "vertices_mm": [[0,0],[2200,0],[2200,900],[0,900]],
+      /* isla exenta: TODO vista */
+      "aristas_contacto": ["vista","vista","vista","vista"],
       "largo_mm": 2200, "ancho_mm": 900,
       "zona": "isla central"
     },
@@ -1034,11 +1057,23 @@ def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtrai
         verts = p.get('vertices_mm') or p.get('vertices')
         if verts and len(verts) > 0 and isinstance(verts[0], dict):
             verts = [[v.get('x'), v.get('y')] for v in verts]
+        # aristas_contacto: lista alineada con vertices (arista i = v_i→v_i+1)
+        contactos = p.get('aristas_contacto')
+        if contactos is not None:
+            if (not isinstance(contactos, list) or not verts
+                    or len(contactos) != len(verts)
+                    or not all(isinstance(c, str) and c.lower() in
+                               ('pared', 'vista', 'mueble', 'ventana')
+                               for c in contactos)):
+                contactos = None  # malformada → ignorar (caerá a heurística)
+            else:
+                contactos = [c.lower() for c in contactos]
         piezas.append(Pieza(
             tipo=p.get('tipo', 'desconocido'),
             material_rol=p.get('material_rol', 'encimera'),
             forma=p.get('forma'),
             vertices_mm=verts,
+            aristas_contacto=contactos,
             largo_mm=safe_float(p.get('largo_mm')),
             ancho_mm=safe_float(p.get('ancho_mm')),
             altura_mm=safe_float(p.get('altura_mm')),
@@ -1107,6 +1142,7 @@ def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtrai
         'cantos': [(c.tipo, c.longitud_ml, c.notas) for c in trabajo.cantos],
         'piezas': [(p.tipo, p.largo_mm, p.ancho_mm, p.zona) for p in trabajo.piezas],
     }
+    _espejar_opciones(trabajo)
     _ajustar_costado_cascada(trabajo)
     _reconciliar_geometria_encimera(trabajo)
     _completar_piezas_desde_trazos(trabajo)
@@ -1150,6 +1186,12 @@ def _completar_copete_principal(trabajo: TrabajoExtraido) -> None:
                  if p.tipo in ('encimera', 'isla') and p.largo_mm and p.ancho_mm]
     nuevos: list[Pieza] = []
     for enc in encimeras:
+        # Si esta encimera tiene clasificación fiable de aristas (trazos del
+        # operador o aristas_contacto de Claude), el copete-por-exclusión del
+        # reconciliador ya emitió los copetes de pared — la heurística del
+        # "copete principal" solo aplica a encimeras sin información.
+        if getattr(enc, '_anot_reg', None) or enc.aristas_contacto:
+            continue
         largo_m = enc.largo_mm / 1000.0
         ancho_m = enc.ancho_mm / 1000.0
         if largo_m < 1.5:
@@ -1805,6 +1847,10 @@ def _dedup_frontales(trabajo: TrabajoExtraido) -> None:
         return 1 if (round(v) % 25 == 0) else 0
     def _alt(f):
         return f.altura_mm or f.ancho_mm or 0
+    def _suf(f):
+        rol = f.material_rol or ''
+        return next((s for s in ('_opcion1', '_opcion2', '_opcion3',
+                                 '_opcion_a', '_opcion_b') if s in rol), '')
     frontales_ord = sorted(frontales, key=lambda f: -(f.largo_mm or 0))
     usados = []
     eliminados = []
@@ -1813,6 +1859,10 @@ def _dedup_frontales(trabajo: TrabajoExtraido) -> None:
         duplicado = False
         for f2 in list(usados):
             L2 = f2.largo_mm or 0
+            # Opciones de material distintas → piezas legítimas (la misma
+            # cocina presupuestada en dos materiales), nunca duplicados
+            if _suf(f) != _suf(f2):
+                continue
             # Alturas distintas conocidas → piezas distintas, no dedup
             h1, h2 = _alt(f), _alt(f2)
             if h1 and h2 and abs(h1 - h2) > 50:
@@ -1884,8 +1934,6 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
 
     geometrias_procesadas = []  # tuplas hashables de vértices ya procesados
 
-    encimera_principal = max(encimeras, key=lambda p: abs(_signed_area_2d(p.vertices_mm)))
-    aristas_pared_principal = []  # para auto-frontal global
 
     for encimera in encimeras:
         # Snap a cotas conocidas
@@ -1949,9 +1997,14 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             frontales_mm_local = zocalos_mm_local = []
         # Una arista NO se pule si está cubierta por: pared, mueble alto,
         # copete, frontal/chapeado o zócalo. El pulido es lo COMPLEMENTARIO.
+        # Precedencia de clasificación: trazos del operador (verdad absoluta)
+        # > aristas_contacto emitida por Claude > heurística cóncava (último
+        # recurso — invierte penínsulas y no sabe nada de rectángulos).
         trazos_no_pulir = (paredes_mm_local + ma_mm_local + copetes_mm_local
                            + frontales_mm_local + zocalos_mm_local)
+        fuente_clasificacion = 'heuristica'
         if trazos_no_pulir:
+            fuente_clasificacion = 'operador'
             n_override = 0
             n_libre = 0
             for a in aristas:
@@ -1967,9 +2020,29 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             trabajo.advertencias.append(
                 f"Postproc [{zona_corta}]: aristas (pared:{n_override} frente:{n_libre})"
                 f"{' [+copetes]' if copetes_mm_local else ''}")
+        elif (encimera.aristas_contacto
+              and len(encimera.aristas_contacto) == len(aristas)):
+            fuente_clasificacion = 'claude'
+            n_pared = 0
+            n_vista = 0
+            for a, contacto in zip(aristas, encimera.aristas_contacto):
+                if contacto in ('pared', 'mueble'):
+                    a['tipo'] = 'pared'
+                    n_pared += 1
+                else:  # vista / ventana → arista pulible
+                    a['tipo'] = 'frontal'
+                    n_vista += 1
+            trabajo.advertencias.append(
+                f"Postproc [{zona_corta}]: aristas_contacto de Claude "
+                f"(pared:{n_pared} vista:{n_vista})")
         elif not any(a['tipo'] in ('frontal', 'cabeza') for a in aristas):
-            # Convex sin anotación → no actuar para esta encimera
+            # Convexo sin información de paredes → no actuar
             continue
+        else:
+            trabajo.advertencias.append(
+                f"⚠ Postproc [{zona_corta}]: clasificación de aristas por "
+                f"heurística geométrica SIN confirmar (sin trazos del operador "
+                f"ni aristas_contacto) — revisar pared/vista")
 
         # Emitir pulidos. Si el operador anotó trazos de pulido cian para
         # ESTA encimera, son autoritativos: emitimos un canto por cada arista
@@ -2067,33 +2140,94 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                 f"Postproc [{zona_corta}]: {nuevos_pulidos} pulidos + "
                 f"{nuevos_ingletes_op} ingletes operador")
 
-        # Guardar las paredes de la encimera principal para el auto-frontal
-        if encimera is encimera_principal:
-            aristas_pared_principal = [a for a in aristas if a['tipo'] == 'pared']
+        # ── Copete por exclusión (regla simétrica al pulido) ─────────────
+        # Arista PARED/mueble sin chapeado ni copete que la cubra → copete.
+        # Solo con clasificación FIABLE (operador o aristas_contacto de
+        # Claude): la heurística geométrica inventa paredes (J0020) y
+        # emitiría copetes falsos. Las opciones de material comparten
+        # geometría → se emite el copete que falte en CADA opción (pool de
+        # coberturas independiente por sufijo _opcionN).
+        if fuente_clasificacion in ('operador', 'claude'):
+            aristas_pared = [a for a in aristas
+                             if a['tipo'] == 'pared' and a['len'] >= 100]
+            encs_geo = [e for e in encimeras
+                        if tuple(tuple(v) for v in e.vertices_mm) == geo_key]
+            sufijos = []
+            for e in encs_geo:
+                suf = ''
+                for s in ('_opcion1', '_opcion2', '_opcion3',
+                          '_opcion_a', '_opcion_b'):
+                    if s in (e.material_rol or ''):
+                        suf = s
+                        break
+                if suf not in sufijos:
+                    sufijos.append(suf)
+            # Afinidad de zona: los copetes solo cubren aristas de SU
+            # encimera (las dos primeras palabras de la zona de la encimera
+            # deben aparecer en la zona del copete) — sin esto, un copete de
+            # la península "cubriría" la cabeza de otra encimera del mismo
+            # largo. Los frontales cubren por longitud (su zona no suele
+            # nombrar a la encimera).
+            zona_tokens = ' '.join((zona_corta or '').lower().split()[:2])
 
-    # ── Auto-añadir frontal contra la pared más larga (encimera principal) ─
-    ref = next((p for p in trabajo.piezas if p.tipo == 'frontal'), None)
-    if ref and aristas_pared_principal:
-        L_pared = max(a['len'] for a in aristas_pared_principal)
-        if L_pared >= 1500:
-            existe = any(
-                p.tipo == 'frontal' and p.largo_mm
-                and abs(p.largo_mm - L_pared) <= max(150, L_pared * 0.10)
-                for p in trabajo.piezas
-            )
-            if not existe:
-                H = (ref.altura_mm if ref.altura_mm else 600)
-                mat_rol = ref.material_rol or 'frontal'
-                trabajo.piezas.append(Pieza(
-                    tipo='frontal',
-                    material_rol=mat_rol,
-                    largo_mm=round(L_pared, 0),
-                    altura_mm=H,
-                    zona='frontal contra pared larga',
-                    notas='Auto-añadido (postproc): pared larga sin chapeado explícito',
-                ))
-                trabajo.advertencias.append(
-                    f"Postproc: añadido frontal {round(L_pared, 0)}×{H}mm contra pared larga")
+            def _es_de_esta_encimera(p):
+                return zona_tokens and zona_tokens in (p.zona or '').lower()
+
+            for suf in sufijos:
+                def _de_opcion(p):
+                    rol = p.material_rol or ''
+                    if suf:
+                        return suf in rol
+                    return not any(s in rol for s in
+                                   ('_opcion1', '_opcion2', '_opcion3',
+                                    '_opcion_a', '_opcion_b'))
+
+                def _longitud(p):
+                    return ((p.longitud_ml or 0) * 1000) or (p.largo_mm or 0)
+
+                pool_copetes = [_longitud(p) for p in trabajo.piezas
+                                if p.tipo == 'copete' and _de_opcion(p)
+                                and _es_de_esta_encimera(p) and _longitud(p)]
+                pool_frontales = [_longitud(p) for p in trabajo.piezas
+                                  if p.tipo == 'frontal' and _de_opcion(p)
+                                  and _longitud(p)]
+                ref_copete = next((p for p in trabajo.piezas
+                                   if p.tipo == 'copete' and _de_opcion(p)),
+                                  None)
+                for a in aristas_pared:
+                    tol = max(150, a['len'] * 0.2)
+                    cubierta = False
+                    for pool in (pool_copetes, pool_frontales):
+                        match = next((L for L in pool
+                                      if abs(L - a['len']) <= tol), None)
+                        if match is not None:
+                            pool.remove(match)
+                            cubierta = True
+                            break
+                    if cubierta:
+                        continue
+                    L_ml = round(a['len'] / 1000.0, 3)
+                    trabajo.piezas.append(Pieza(
+                        tipo='copete',
+                        material_rol=(ref_copete.material_rol if ref_copete
+                                      else f'copete{suf}'),
+                        longitud_ml=L_ml,
+                        altura_mm=(ref_copete.altura_mm if ref_copete
+                                   and ref_copete.altura_mm else 50.0),
+                        zona=f'copete en {zona_corta} (arista idx={a["idx"]})',
+                        notas=f'Auto exclusión pared (postproc, fuente '
+                              f'{fuente_clasificacion})',
+                    ))
+                    trabajo.advertencias.append(
+                        f"Postproc [{zona_corta}]: añadido copete {L_ml}ml "
+                        f"en arista pared idx={a['idx']} sin chapeado"
+                        f"{suf or ''}")
+
+    # NOTA: la heurística de "auto-frontal contra la pared más larga" se
+    # eliminó (2026-06-11): inventó chapeados en J0014 y J0020 porque la
+    # clasificación geométrica de paredes no es fiable. Un frontal solo
+    # existe si lo emite Claude (plano/plantilla) o si el operador lo traza
+    # (lo crea _completar_piezas_desde_trazos).
 
 
 def _completar_ingletes_implicitos(trabajo: TrabajoExtraido) -> None:
@@ -2147,6 +2281,70 @@ def _completar_ingletes_implicitos(trabajo: TrabajoExtraido) -> None:
 
     if nuevos:
         trabajo.cantos.extend(nuevos)
+
+
+def _espejar_opciones(trabajo: TrabajoExtraido) -> None:
+    """Cuando hay varias opciones de material (_opcion1/_opcion2…), las
+    piezas físicas son LAS MISMAS en todas (misma cocina) — solo cambia el
+    material. Si Claude emitió una pieza en una opción y la olvidó en otra
+    (p.ej. frontal solo en opcion1), se clona en las que falte. Sin esto los
+    presupuestos por opción salen descompensados (J0020: opcion2 sin
+    frontal → 1 tabla menos)."""
+    TIPOS_FISICOS = ('encimera', 'isla', 'frontal', 'copete', 'zocalo',
+                     'costado')
+    SUFIJOS = ('_opcion1', '_opcion2', '_opcion3', '_opcion_a', '_opcion_b')
+
+    def _sufijo(p):
+        rol = p.material_rol or ''
+        return next((s for s in SUFIJOS if s in rol), None)
+
+    sufijos_presentes = sorted({_sufijo(p) for p in trabajo.piezas
+                                if _sufijo(p) and p.tipo in TIPOS_FISICOS})
+    if len(sufijos_presentes) < 2:
+        return
+
+    def _misma_pieza(a, b):
+        if a.tipo != b.tipo:
+            return False
+        if a.vertices_mm and b.vertices_mm:
+            return a.vertices_mm == b.vertices_mm
+        for va, vb in ((a.largo_mm, b.largo_mm), (a.ancho_mm, b.ancho_mm),
+                       (a.altura_mm, b.altura_mm)):
+            if va and vb and abs(va - vb) > 5:
+                return False
+        la = a.longitud_ml or 0
+        lb = b.longitud_ml or 0
+        if la and lb and abs(la - lb) > 0.01:
+            return False
+        return bool((a.largo_mm and b.largo_mm) or (la and lb))
+
+    import copy as _copy
+    nuevas = []
+    for suf_origen in sufijos_presentes:
+        piezas_origen = [p for p in trabajo.piezas
+                         if p.tipo in TIPOS_FISICOS and _sufijo(p) == suf_origen]
+        for suf_destino in sufijos_presentes:
+            if suf_destino == suf_origen:
+                continue
+            piezas_destino = [p for p in trabajo.piezas
+                              if p.tipo in TIPOS_FISICOS
+                              and _sufijo(p) == suf_destino]
+            for p in piezas_origen:
+                ya_clonadas = [q for q in nuevas if _sufijo(q) == suf_destino]
+                if any(_misma_pieza(p, q) for q in piezas_destino + ya_clonadas):
+                    continue
+                clon = _copy.copy(p)
+                clon.material_rol = (p.material_rol or '').replace(
+                    suf_origen, suf_destino)
+                clon.notas = ((p.notas or '')
+                              + f' [espejado de {suf_origen.lstrip("_")}]').strip()
+                nuevas.append(clon)
+                trabajo.advertencias.append(
+                    f"Postproc: pieza {p.tipo} ({p.largo_mm or p.longitud_ml}"
+                    f") espejada de {suf_origen} a {suf_destino} — Claude la "
+                    f"emitió solo en una opción")
+    if nuevas:
+        trabajo.piezas.extend(nuevas)
 
 
 def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:

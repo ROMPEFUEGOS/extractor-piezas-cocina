@@ -51,6 +51,12 @@ class Pieza:
     forma: Optional[str] = None
     # Vértices del polígono en mm, relativo a esquina inferior-izquierda (0,0)
     vertices_mm: Optional[list] = None  # ej: [[0,0],[2700,0],[2700,600],[0,600]]
+    # Clasificación de contacto POR ARISTA, alineada con vertices_mm: la
+    # entrada i describe la arista que va del vértice i al i+1.
+    # Valores: 'pared' | 'vista' | 'mueble' | 'ventana'. La emite Claude
+    # leyendo los muros del plano; el postproc la usa como verdad si no hay
+    # trazos del operador (que siempre tienen prioridad).
+    aristas_contacto: Optional[list] = None
     # Bounding box (calculable de vertices, también se admite directo si no hay polígono)
     largo_mm: Optional[float] = None    # bounding box X
     ancho_mm: Optional[float] = None    # bounding box Y (fondo)
