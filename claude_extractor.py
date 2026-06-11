@@ -1100,12 +1100,25 @@ def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtrai
             _cargar_paredes_y_muebles_altos(folder, trabajo)
         except Exception as e:
             trabajo.advertencias.append(f"Postproc: error cargando paredes/muebles_altos: {e}")
+    # Snapshot de lo que emitió Claude ANTES del postproc (para el log de
+    # divergencia Claude-vs-operador que alimenta el plan de aprendizaje)
+    snapshot_claude = {
+        'cantos': [(c.tipo, c.longitud_ml, c.notas) for c in trabajo.cantos],
+        'piezas': [(p.tipo, p.largo_mm, p.ancho_mm, p.zona) for p in trabajo.piezas],
+    }
     _ajustar_costado_cascada(trabajo)
     _reconciliar_geometria_encimera(trabajo)
+    _completar_piezas_desde_trazos(trabajo)
     _completar_pulidos_pata(trabajo)
     _completar_inglete_pata(trabajo)
     _completar_copete_principal(trabajo)
     _completar_ingletes_implicitos(trabajo)
+    _verificar_muesca_pilar(trabajo)
+    if folder is not None:
+        try:
+            _volcar_divergencia(trabajo, folder, snapshot_claude)
+        except Exception as e:
+            trabajo.advertencias.append(f"Postproc: error volcando divergencia: {e}")
     return trabajo
 
 
@@ -1122,8 +1135,13 @@ def _completar_copete_principal(trabajo: TrabajoExtraido) -> None:
     puntos persistidos), su anotación es la verdad — no inventamos copetes
     adicionales para no duplicar las piezas reales.
     """
-    if getattr(trabajo, '_copetes_por_geo', None):
-        return  # Operador ya señaló los copetes; no auto-añadir nada
+    # Si el operador anotó copetes (trazos con puntos persistidos en alguna
+    # encimera), su anotación es la verdad — no auto-añadir nada.
+    # (El antiguo flag _copetes_por_geo ya no se asigna; los trazos del
+    # operador viven en pieza._anot_reg.)
+    if any((getattr(p, '_anot_reg', None) or {}).get('copetes_pix')
+           for p in trabajo.piezas):
+        return
     copetes = [p for p in trabajo.piezas if p.tipo == 'copete']
     if not copetes:
         return  # Plantilla decía copete=NO, no inventar
@@ -2106,6 +2124,255 @@ def _completar_ingletes_implicitos(trabajo: TrabajoExtraido) -> None:
 
     if nuevos:
         trabajo.cantos.extend(nuevos)
+
+
+def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
+    """Emite piezas copete/zócalo/frontal a partir de los trazos del operador
+    cuando Claude no las emitió («si el operador lo marcó, existe»).
+
+    Cada trazo se asigna a la arista más cercana de su encimera (mismo
+    criterio de pertenencia que los pulidos cian: centroide → arista,
+    tolerancia 400mm — los trazos de otra encimera caen lejos al convertir
+    a mm-local y no matchean). La pieza se crea con longitud = longitud de
+    la arista, salvo que ya exista una del mismo tipo con longitud ±20%.
+    """
+    import math as _math
+    TOL_PERTENENCIA_MM = 400
+    TIPOS = (('copetes_pix', 'copete'), ('zocalos_pix', 'zocalo'),
+             ('frontales_pix', 'frontal'))
+
+    encimeras = [p for p in trabajo.piezas
+                 if p.tipo in ('encimera', 'isla') and p.vertices_mm
+                 and len(p.vertices_mm) >= 3]
+    if not encimeras:
+        return
+
+    def _altura_default(tipo, enc):
+        for m in trabajo.materiales:
+            if m.rol and tipo in m.rol.lower() and m.altura_cm:
+                return float(m.altura_cm) * 10.0
+        return {'copete': 50.0, 'zocalo': 60.0, 'frontal': None}[tipo]
+
+    def _material_rol(tipo, enc):
+        for m in trabajo.materiales:
+            if m.rol and tipo in m.rol.lower():
+                return m.rol
+        return enc.material_rol
+
+    # Pool de longitudes de piezas YA emitidas por Claude, por tipo. Cada
+    # trazo del operador consume como mucho una pieza del pool (±20%); si el
+    # pool se agota, la pieza falta → se crea. Así dos copetes de cabeza
+    # IGUALES (p.ej. 0.6m + 0.6m) generan dos piezas, no una («si van
+    # separadas se dibujan separadas»).
+    pool = {}
+    for _, tipo in TIPOS:
+        pool[tipo] = [p.longitud_ml or ((p.largo_mm or 0) / 1000.0)
+                      for p in trabajo.piezas if p.tipo == tipo]
+
+    usados = set()       # id() de trazos píxel ya consumidos (listas compartidas)
+    aristas_creadas = set()  # (geo, tipo, idx_arista) con pieza ya creada
+    nuevas: list = []
+    geometrias = set()
+    for enc in encimeras:
+        geo = tuple(tuple(v) for v in enc.vertices_mm)
+        if geo in geometrias:
+            continue
+        geometrias.add(geo)
+        regs = getattr(enc, '_anot_reg', None)
+        if not regs:
+            continue
+        zona_corta = (enc.zona or '?').split('(')[0].strip()[:35]
+        verts = enc.vertices_mm
+        n = len(verts)
+        for key_pix, tipo in TIPOS:
+            for stroke_pix in (regs.get(key_pix) or []):
+                if id(stroke_pix) in usados:
+                    continue
+                mm = _trazos_a_mm_local([stroke_pix], regs['polilinea_pix'], verts)
+                if not mm or not mm[0]:
+                    continue
+                stroke = mm[0]
+                cx = sum(p[0] for p in stroke) / len(stroke)
+                cy = sum(p[1] for p in stroke) / len(stroke)
+                best_d = float('inf')
+                best_i = None
+                best_len = None
+                for i in range(n):
+                    p1, p2 = verts[i], verts[(i + 1) % n]
+                    d = _dist_punto_a_segmento(cx, cy, p1[0], p1[1], p2[0], p2[1])
+                    if d < best_d:
+                        best_d = d
+                        best_i = i
+                        best_len = _math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                if best_d > TOL_PERTENENCIA_MM or not best_len or best_len < 100:
+                    continue
+                usados.add(id(stroke_pix))
+                L_ml = round(best_len / 1000.0, 3)
+                # 1) ¿Queda una pieza de Claude en el pool que cubra este trazo?
+                consumida = None
+                for L_p in pool[tipo]:
+                    if L_p and abs(L_p - L_ml) <= max(0.2 * L_ml, 0.1):
+                        consumida = L_p
+                        break
+                if consumida is not None:
+                    pool[tipo].remove(consumida)
+                    continue
+                # 2) ¿Ya creamos pieza para esta misma arista?
+                clave_arista = (geo, tipo, best_i)
+                if clave_arista in aristas_creadas:
+                    continue
+                aristas_creadas.add(clave_arista)
+                nuevas.append(Pieza(
+                    tipo=tipo,
+                    material_rol=_material_rol(tipo, enc),
+                    largo_mm=round(best_len, 0),
+                    altura_mm=_altura_default(tipo, enc),
+                    longitud_ml=L_ml,
+                    zona=f'{tipo} en {zona_corta}',
+                    notas='Auto desde trazo operador (postproc)',
+                ))
+                trabajo.advertencias.append(
+                    f"Postproc: añadido {tipo} {L_ml}ml desde trazo del "
+                    f"operador en {zona_corta}")
+    if nuevas:
+        trabajo.piezas.extend(nuevas)
+
+
+def _verificar_muesca_pilar(trabajo: TrabajoExtraido) -> None:
+    """Red de seguridad de pilares: si el operador marcó un pilar que cae
+    dentro (o pegado al borde) del polígono de una encimera y el polígono NO
+    tiene vértices cóncavos cerca del pilar, falta la muesca → advertencia.
+    """
+    import math as _math
+
+    def _concavos(verts):
+        n = len(verts)
+        area = _signed_area_2d(verts)
+        sentido = 1 if area > 0 else -1
+        out = []
+        for i in range(n):
+            xp, yp = verts[(i - 1) % n]
+            xc, yc = verts[i]
+            xn, yn = verts[(i + 1) % n]
+            cross = (xc - xp) * (yn - yc) - (yc - yp) * (xn - xc)
+            if cross * sentido < 0:
+                out.append((xc, yc))
+        return out
+
+    def _dentro(px, py, verts):
+        # Ray casting
+        n = len(verts)
+        dentro = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = verts[i]
+            xj, yj = verts[j]
+            if ((yi > py) != (yj > py)) and \
+                    (px < (xj - xi) * (py - yi) / ((yj - yi) or 1e-9) + xi):
+                dentro = not dentro
+            j = i
+        return dentro
+
+    geometrias = set()
+    for enc in trabajo.piezas:
+        if enc.tipo not in ('encimera', 'isla') or not enc.vertices_mm \
+                or len(enc.vertices_mm) < 3:
+            continue
+        geo = tuple(tuple(v) for v in enc.vertices_mm)
+        if geo in geometrias:
+            continue
+        geometrias.add(geo)
+        regs = getattr(enc, '_anot_reg', None)
+        if not regs or not regs.get('pilares_pix'):
+            continue
+        pilares_mm = _trazos_a_mm_local(
+            regs['pilares_pix'], regs['polilinea_pix'], enc.vertices_mm)
+        concavos = _concavos(enc.vertices_mm)
+        for trazo in pilares_mm:
+            if not trazo:
+                continue
+            cx = sum(p[0] for p in trazo) / len(trazo)
+            cy = sum(p[1] for p in trazo) / len(trazo)
+            n_v = len(enc.vertices_mm)
+            d_borde = min(
+                _dist_punto_a_segmento(cx, cy,
+                                       enc.vertices_mm[i][0], enc.vertices_mm[i][1],
+                                       enc.vertices_mm[(i + 1) % n_v][0],
+                                       enc.vertices_mm[(i + 1) % n_v][1])
+                for i in range(n_v))
+            if not (_dentro(cx, cy, enc.vertices_mm) or d_borde <= 200):
+                continue  # el pilar no afecta a esta encimera
+            tiene_muesca = any(
+                _math.hypot(vx - px, vy - py) <= 300
+                for (vx, vy) in concavos for (px, py) in trazo)
+            if not tiene_muesca:
+                trabajo.advertencias.append(
+                    f"⚠ PILAR sin muesca: el operador marcó un pilar sobre "
+                    f"'{enc.zona or '?'}' pero el polígono no tiene entrante "
+                    f"(vértices cóncavos) cerca — revisar geometría")
+
+
+def _volcar_divergencia(trabajo: TrabajoExtraido, folder,
+                        snapshot_claude: dict) -> None:
+    """Escribe <carpeta>/divergencia.json comparando lo que emitió Claude con
+    el resultado tras el postproc (anotaciones del operador como verdad).
+    Corpus para el plan de aprendizaje: métrica de % acierto por proyecto y,
+    a futuro, selección de ejemplos few-shot."""
+    from datetime import datetime
+
+    def _key_canto(t):
+        tipo, lml, _ = t
+        return (tipo, round(lml or 0, 2))
+
+    cantos_claude = snapshot_claude.get('cantos', [])
+    cantos_final = [(c.tipo, c.longitud_ml, c.notas) for c in trabajo.cantos]
+    claves_claude = [_key_canto(t) for t in cantos_claude]
+    claves_final = [_key_canto(t) for t in cantos_final]
+
+    conservados = []
+    restantes = list(claves_final)
+    for k in claves_claude:
+        if k in restantes:
+            restantes.remove(k)
+            conservados.append(k)
+    eliminados = [t for t in cantos_claude
+                  if _key_canto(t) not in conservados
+                  or claves_claude.count(_key_canto(t)) > conservados.count(_key_canto(t))]
+
+    piezas_claude = snapshot_claude.get('piezas', [])
+    piezas_final = [(p.tipo, p.largo_mm, p.ancho_mm, p.zona) for p in trabajo.piezas]
+    añadidas = [p for p in piezas_final if p not in piezas_claude]
+    quitadas = [p for p in piezas_claude if p not in piezas_final]
+
+    n_claude = len(cantos_claude)
+    div = {
+        'job_id': trabajo.job_id,
+        'fecha': datetime.now().isoformat(timespec='seconds'),
+        'metricas': {
+            'cantos_claude': n_claude,
+            'cantos_final': len(cantos_final),
+            'cantos_conservados': len(conservados),
+            'pct_cantos_acertados': round(100.0 * len(conservados) / n_claude, 1)
+                                    if n_claude else None,
+            'piezas_añadidas_postproc': len(añadidas),
+            'piezas_eliminadas_postproc': len(quitadas),
+        },
+        'cantos_eliminados': [
+            {'tipo': t[0], 'longitud_ml': t[1], 'notas': t[2]} for t in eliminados],
+        'cantos_añadidos': [
+            {'tipo': c.tipo, 'longitud_ml': c.longitud_ml, 'notas': c.notas}
+            for c in trabajo.cantos
+            if _key_canto((c.tipo, c.longitud_ml, None)) not in claves_claude],
+        'piezas_añadidas': [
+            {'tipo': p[0], 'largo_mm': p[1], 'ancho_mm': p[2], 'zona': p[3]}
+            for p in añadidas],
+        'piezas_eliminadas': [
+            {'tipo': p[0], 'largo_mm': p[1], 'ancho_mm': p[2], 'zona': p[3]}
+            for p in quitadas],
+    }
+    out = Path(folder) / 'divergencia.json'
+    out.write_text(json.dumps(div, ensure_ascii=False, indent=2),
+                   encoding='utf-8')
 
 
 def extract_trabajo(

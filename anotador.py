@@ -984,10 +984,13 @@ async function guardarPaginaActual(tieneTrazos) {
     };
     // Persistimos puntos crudos en polilíneas (vértices exactos) y en
     // anotaciones que el postprocesador necesita para clasificar aristas
-    // y emitir cantos: pared / muebles_altos / copete (descartan pulido)
-    // y pulido / inglete (autoritativos para emitir cantos).
+    // y emitir cantos/piezas: pared / muebles_altos / copete / frontal /
+    // zocalo (descartan pulido y generan piezas si Claude las omite),
+    // pulido / inglete (autoritativos para emitir cantos) y pilar
+    // (verificación de muesca en la encimera).
     const tipos_con_puntos = new Set(
-        ['pared', 'muebles_altos', 'copete', 'pulido', 'inglete']);
+        ['pared', 'muebles_altos', 'copete', 'pulido', 'inglete',
+         'frontal', 'zocalo', 'pilar']);
     const persistir_puntos = t.tipo === 'poly'
         || tipos_con_puntos.has(t.tipo_pieza);
     if (persistir_puntos) {
