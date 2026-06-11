@@ -1452,7 +1452,13 @@ def _trazos_a_mm_local(trazos_pix: list, cand_pix: list, vertices_mm: list) -> l
 
     def _pt(x, y):
         if rotado:
-            mm_x = x_min_mm + (y - y_min_px) * escala_xmm
+            # ROTACIÓN real de 90° (det +1), no transposición: la
+            # transposición pura (mm_x=+y, mm_y=+x) es un ESPEJO (det -1) y
+            # producía la pieza especular — fregadero/cabezas intercambiados
+            # en planos dibujados en vertical (detectado en J0021). Se
+            # voltea el eje X (canvas-abajo → x=0) y se conserva el mapeo Y
+            # directo validado en J0020.
+            mm_x = x_min_mm + (y_max_px - y) * escala_xmm
             mm_y = y_min_mm + (x - x_min_px) * escala_ymm
         else:
             mm_x = x_min_mm + (x - x_min_px) * escala_xmm
@@ -2697,7 +2703,17 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
                           if (h.tipo in ('placa', 'fregadero')) == es_grande]
             if es_grande and not candidatos:
                 continue  # un contorno grande JAMÁS reposiciona un grifo
-            h = min(candidatos or libres, key=_dist)
+
+            def _puntuacion(h):
+                # Preferir el hueco cuyas DIMENSIONES casan con el bbox del
+                # trazo (la distancia a la posición previa engaña si Claude
+                # la estimó mal o espejada); distancia solo como desempate.
+                if h.largo_mm and h.ancho_mm:
+                    return (abs(h.largo_mm - bw) + abs(h.ancho_mm - bh),
+                            _dist(h))
+                return (1e9, _dist(h))
+
+            h = min(candidatos or libres, key=_puntuacion)
             usados.add(id(h))
             old = (h.centro_x_mm, h.centro_y_mm)
             h.centro_x_mm = round(cx, 0)
