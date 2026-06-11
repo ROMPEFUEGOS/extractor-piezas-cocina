@@ -334,7 +334,7 @@ Cómo decidirlo MIRANDO EL PLANO (no lo inventes por geometría):
 - COHERENCIA con el resto de tu salida: cada arista `"pared"`/`"mueble"` sin frontal (chapeado) lleva copete; cada arista `"vista"`/`"ventana"` va pulida. Tus piezas de copete/frontal y tus cantos deben cuadrar con esta lista — si no cuadran, revisa la lista o las piezas antes de responder.
 
 **📐 COTA DE CADA ARISTA — `aristas_cota` (OBLIGATORIO junto a aristas_contacto)**:
-Junto a `aristas_contacto` emite `aristas_cota`: una lista alineada con los vértices donde la entrada i es la COTA EN MM que el plano da para la arista i (número), o `null` si el plano NO acota esa arista. Reglas:
+Junto a `aristas_contacto` emite `aristas_cota`: una lista alineada con los vértices donde la entrada i es la COTA EN MM que el plano da para la arista i (número), o `null` si el plano NO acota esa arista. **Una pieza con `vertices_mm` y sin `aristas_cota` es una respuesta INVÁLIDA** — el programa la necesita para corregir croquis no-a-escala. Reglas:
 - Solo cotas LEÍDAS del plano. NUNCA pongas un valor derivado por aritmética — para eso está `null` (el programa deriva por cierre).
 - Los croquis NO están a escala: un brazo dibujado "ancho" puede medir 300mm según su cota. Las COTAS mandan sobre las proporciones del dibujo, siempre.
 - CONSTRUYE los vértices por ARITMÉTICA de cotas, no copiando posiciones del dibujo: el quiebre de una L está en (largo_total − fondo_del_brazo), el alto total es la cota total si el plano da el total (no sumes si la cota YA es total).
@@ -2990,7 +2990,8 @@ def _resolver_poligono_por_cierre(poly, encimera, cotas, cotas_propias):
 
 
 def _reconstruir_desde_polilinea(encimera, regs, cotas, cotas_propias,
-                                 trabajo, zona_corta) -> bool:
+                                 trabajo, zona_corta,
+                                 forzar_cierre=False) -> bool:
     """Reemplaza vertices_mm por la geometría REAL que dibujó el operador.
     Los puntos de la polilínea se agrupan por eje (clustering — el trazo es
     a mano alzada), se escalan al bbox en mm de la pieza (el bbox de Claude
@@ -3034,7 +3035,7 @@ def _reconstruir_desde_polilinea(encimera, regs, cotas, cotas_propias,
         return mapeo
 
     nuevos_f = None
-    if not rotado:
+    if not rotado and not forzar_cierre:
         # Vía A — clustering por eje: contornos limpios con el bbox mm de
         # Claude validado por cotas
         mx = _cluster(xs_p, W_px)
