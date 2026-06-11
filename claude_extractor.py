@@ -1152,6 +1152,10 @@ def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtrai
     _completar_copete_principal(trabajo)
     _completar_ingletes_implicitos(trabajo)
     _verificar_muesca_pilar(trabajo)
+    # Segundo espejado: las piezas creadas por el postproc (copetes de
+    # exclusión llevan sufijo, pero las creadas desde trazos no) deben
+    # existir en TODAS las opciones de material
+    _espejar_opciones(trabajo)
     if folder is not None:
         try:
             _volcar_divergencia(trabajo, folder, snapshot_claude)
@@ -1610,10 +1614,17 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
         xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
         return (max(xs) - min(xs)) * (max(ys) - min(ys))
 
+    def _geo_quant(e):
+        # Clave cuantizada a rejilla de 200mm: las gemelas de opción pueden
+        # haber divergido ligeramente (snaps con cotas asimétricas en JSON
+        # reprocesados) y deben contar como la MISMA geometría
+        return tuple((round(v[0] / 200.0), round(v[1] / 200.0))
+                     for v in e.vertices_mm)
+
     encs_unicas = []
     seen_keys = set()
     for e in encimeras_validas:
-        k = tuple(tuple(v) for v in e.vertices_mm)
+        k = _geo_quant(e)
         if k in seen_keys:
             continue
         seen_keys.add(k)
@@ -1669,14 +1680,14 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
                 f"Anotaciones: polilínea de {len(encimera_polylines_pix[pi])} "
                 f"puntos asignada por área a encimera de {len(e.vertices_mm)} "
                 f"vértices ({e.zona or '?'})")
-    # Las encimeras opcion1/opcion2 con misma geometría que una de las únicas
-    # comparten el mismo registro
+    # Las encimeras opcion1/opcion2 con misma geometría (cuantizada) que una
+    # de las únicas comparten el mismo registro
     for enc in encimeras_validas:
         if getattr(enc, '_anot_reg', None) is not None:
             continue
-        k_enc = tuple(tuple(v) for v in enc.vertices_mm)
+        k_enc = _geo_quant(enc)
         for e2 in encs_unicas:
-            if (tuple(tuple(v) for v in e2.vertices_mm) == k_enc
+            if (_geo_quant(e2) == k_enc
                     and getattr(e2, '_anot_reg', None) is not None):
                 enc._anot_reg = e2._anot_reg  # type: ignore[attr-defined]
                 break
@@ -2026,6 +2037,7 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
     # se duplicaban copetes de cabeza)
     copetes_consumidos_global = set()
     geos_dudosas_avisadas = set()
+    registros_procesados = {}  # id(_anot_reg) → encimera ya procesada
 
     for encimera in encimeras:
         # Snap a cotas conocidas
@@ -2065,6 +2077,19 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # Caza escalones con cotas intercambiadas (J0020 600/300), que las
         # comprobaciones de cotas no detectan.
         regs = getattr(encimera, '_anot_reg', None)
+        # Procesar UNA sola vez por registro de anotaciones: las gemelas de
+        # opción comparten registro, pero el snap con cotas_propias
+        # asimétricas (las notas de la opción 2 no repiten las cotas) hacía
+        # divergir sus geometrías → doble procesado y cantos duplicados
+        # (J0024). La gemela adopta la geometría final de la primera.
+        if regs is not None:
+            ya = registros_procesados.get(id(regs))
+            if ya is not None:
+                encimera.vertices_mm = [list(v) for v in ya.vertices_mm]
+                encimera.largo_mm = ya.largo_mm
+                encimera.ancho_mm = ya.ancho_mm
+                encimera.aristas_contacto = ya.aristas_contacto
+                continue
         mapa_aristas = None
         if regs:
             d_forma, mapa_aristas = _alinear_poligono_con_polilinea(
@@ -2099,6 +2124,8 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         if geo_key in geometrias_procesadas:
             continue
         geometrias_procesadas.append(geo_key)
+        if regs is not None:
+            registros_procesados[id(regs)] = encimera
 
         aristas = _clasificar_aristas_encimera(encimera.vertices_mm)
         if not aristas:
@@ -2390,6 +2417,66 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                             cubierta = True
                             break
                     if cubierta:
+                        continue
+                    # Cobertura por TRAMOS: una arista larga puede estar
+                    # cubierta por la SUMA de varias piezas (J0024: trasera
+                    # de 4725 = copete 2650 + frontal 2100). Greedy de mayor
+                    # a menor hasta aproximar la longitud.
+                    candidatas_suma = sorted(
+                        [(L, p, pool) for pool in (pool_copetes,
+                                                   pool_copetes_global,
+                                                   pool_frontales)
+                         for (L, p) in pool if L <= a['len'] * 1.1],
+                        key=lambda x: -x[0])
+                    suma = 0.0
+                    usadas_suma = []
+                    for L, p, pool in candidatas_suma:
+                        if suma >= a['len'] * 0.95:
+                            break
+                        if suma + L <= a['len'] * 1.1:
+                            suma += L
+                            usadas_suma.append((L, p, pool))
+                    if usadas_suma and abs(suma - a['len']) <= max(150, a['len'] * 0.1):
+                        for L, p, pool in usadas_suma:
+                            pool.remove((L, p))
+                            if p.tipo == 'copete':
+                                copetes_consumidos_global.add(id(p))
+                        continue
+                    # La cobertura PARCIAL solo con FRONTALES: un chapeado
+                    # por tramos es habitual (pilar), pero un copete de
+                    # cabeza nunca es "tramo" de la trasera (J0021)
+                    usadas_suma = [(L, p, pool) for (L, p, pool) in usadas_suma
+                                   if p.tipo == 'frontal']
+                    suma = sum(L for L, _, _ in usadas_suma)
+                    if usadas_suma and suma >= 300:
+                        # Cobertura PARCIAL por tramos (J0024: trasera 4725
+                        # con frontal de 2100 a la derecha): se consume lo
+                        # cubierto y el copete se emite solo por el RESTO
+                        for L, p, pool in usadas_suma:
+                            pool.remove((L, p))
+                            if p.tipo == 'copete':
+                                copetes_consumidos_global.add(id(p))
+                        resto = a['len'] - suma
+                        if resto < 100:
+                            continue
+                        L_ml = round(resto / 1000.0, 3)
+                        trabajo.piezas.append(Pieza(
+                            tipo='copete',
+                            material_rol=(ref_copete.material_rol if ref_copete
+                                          else f'copete{suf}'),
+                            longitud_ml=L_ml,
+                            altura_mm=(ref_copete.altura_mm if ref_copete
+                                       and ref_copete.altura_mm else 50.0),
+                            zona=f'copete en {zona_corta} (arista idx={a["idx"]}, '
+                                 f'tramo sin chapeado)',
+                            notas=f'Auto exclusión pared (postproc, fuente '
+                                  f'{fuente_clasificacion}) — resto tras '
+                                  f'{round(suma)}mm cubiertos por tramos',
+                        ))
+                        trabajo.advertencias.append(
+                            f"Postproc [{zona_corta}]: añadido copete {L_ml}ml "
+                            f"en arista pared idx={a['idx']} (resto sin "
+                            f"chapeado){suf or ''}")
                         continue
                     L_ml = round(a['len'] / 1000.0, 3)
                     trabajo.piezas.append(Pieza(
@@ -3013,30 +3100,59 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                 if not mm or not mm[0]:
                     continue
                 stroke = mm[0]
-                cx = sum(p[0] for p in stroke) / len(stroke)
-                cy = sum(p[1] for p in stroke) / len(stroke)
-                best_d = float('inf')
-                best_i = None
-                best_len = None
+                L_trazo = _path_length_mm(stroke)
+                # Aristas CUBIERTAS por el trazo — no solo la más cercana al
+                # centroide: un trazo en L cubre DOS aristas, y el centroide
+                # de un trazo largo puede caer sobre una arista interior
+                # ajena (J0024: copete fantasma sobre una arista pulida).
+                # Además varios tramos cortos pueden caer en la misma arista
+                # larga (frontal por tramos alrededor de un pilar).
+                objetivos = []  # (idx, len_arista, cobertura_mm)
                 for i in range(n):
                     p1, p2 = verts[i], verts[(i + 1) % n]
-                    d = _dist_punto_a_segmento(cx, cy, p1[0], p1[1], p2[0], p2[1])
-                    if d < best_d:
-                        best_d = d
-                        best_i = i
-                        best_len = _math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-                if best_d > TOL_PERTENENCIA_MM or not best_len or best_len < 100:
+                    dxa = p2[0] - p1[0]
+                    dya = p2[1] - p1[1]
+                    L2a = dxa * dxa + dya * dya
+                    L_ar = _math.sqrt(L2a) or 1.0
+                    if L_ar < 100:
+                        continue
+                    ts = []
+                    for (px, py) in stroke:
+                        tt = max(0.0, min(1.0, ((px - p1[0]) * dxa
+                                                + (py - p1[1]) * dya)
+                                          / (L2a or 1)))
+                        cxp, cyp = p1[0] + tt * dxa, p1[1] + tt * dya
+                        # 450mm: los trazos de frontal/zócalo se dibujan
+                        # sobre la PARED del plano, no sobre la encimera
+                        if _math.hypot(px - cxp, py - cyp) <= 450:
+                            ts.append(tt)
+                    if len(ts) < 2:
+                        continue
+                    cov = (max(ts) - min(ts)) * L_ar
+                    frac_pts = len(ts) / len(stroke)
+                    if ((cov >= 0.2 * L_ar)
+                            or (frac_pts >= 0.5 and cov >= 100)
+                            or (frac_pts >= 0.25 and cov >= 300)):
+                        objetivos.append((i, L_ar, cov))
+                if not objetivos and L_trazo <= 400:
+                    # Marca corta (tick): arista más cercana al centroide
+                    cx = sum(p[0] for p in stroke) / len(stroke)
+                    cy = sum(p[1] for p in stroke) / len(stroke)
+                    best = None
+                    for i in range(n):
+                        p1, p2 = verts[i], verts[(i + 1) % n]
+                        d = _dist_punto_a_segmento(cx, cy, p1[0], p1[1],
+                                                   p2[0], p2[1])
+                        L_ar = _math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                        if L_ar >= 100 and (best is None or d < best[0]):
+                            best = (d, i, L_ar)
+                    if best and best[0] <= TOL_PERTENENCIA_MM:
+                        objetivos = [(best[1], best[2],
+                                      min(L_trazo, best[2]))]
+                if not objetivos:
                     continue
                 usados.add(id(stroke_pix))
-                # Longitud objetivo: la arista si el trazo la recorre casi
-                # entera; si no, la del propio trazo (un zócalo puede cubrir
-                # solo un tramo de la arista — J0022: trazo de 860mm sobre
-                # una arista de isla de 2400)
-                L_trazo = _path_length_mm(stroke)
-                if L_trazo >= 0.8 * best_len:
-                    L_ml = round(best_len / 1000.0, 3)
-                else:
-                    L_ml = round(L_trazo / 1000.0, 3)
+                objetivos_pendientes = list(objetivos)
                 # 1) ¿Queda una pieza de Claude en el pool que cubra este
                 # trazo? (match exacto ±20%, prefiriendo afinidad de zona)
                 toks_enc = _tokens_distintivos(enc.zona)
@@ -3058,47 +3174,57 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                         return False
                     return True
 
-                candidatas = sorted(
-                    (e for e in pool[tipo]
-                     if e['L'] and abs(e['L'] - L_ml) <= max(0.2 * L_ml, 0.1)
-                     and _compatible(e)),
-                    key=lambda e: not _afin(e))
-                if candidatas:
-                    pool[tipo].remove(candidatas[0])
-                    continue
-                # 1b) Zócalos: una pieza larga de Claude (cota del plano,
-                # p.ej. 4830 para toda la pared) cubre VARIOS tramos marcados
-                # — consumo residual, pero SOLO de piezas afines a esta
-                # encimera (el residuo de la pared no debe absorber el zócalo
-                # nuevo de la isla)
-                if tipo == 'zocalo':
-                    afines = [e for e in pool[tipo]
-                              if _afin(e) and e['L'] >= L_ml * 0.8]
-                    if afines:
-                        mayor = max(afines, key=lambda e: e['L'])
-                        pool[tipo].remove(mayor)
-                        resto = mayor['L'] - L_ml
-                        if resto > 0.1:
-                            pool[tipo].append({'L': round(resto, 3),
-                                               'zona': mayor['zona']})
+                for best_i, best_len, cov in objetivos_pendientes:
+                    # Longitud objetivo: la arista si el trazo la recorre en
+                    # su mayor parte (≥60% — el pulso a mano se queda corto);
+                    # si no, lo realmente cubierto (un zócalo o un tramo de
+                    # chapeado puede cubrir solo parte de la arista)
+                    if cov >= 0.6 * best_len:
+                        L_ml = round(best_len / 1000.0, 3)
+                    else:
+                        L_ml = round(cov / 1000.0, 3)
+                    if L_ml < 0.1:
                         continue
-                # 2) ¿Ya creamos pieza para esta misma arista?
-                clave_arista = (geo, tipo, best_i)
-                if clave_arista in aristas_creadas:
-                    continue
-                aristas_creadas.add(clave_arista)
-                nuevas.append(Pieza(
-                    tipo=tipo,
-                    material_rol=_material_rol(tipo, enc),
-                    largo_mm=round(best_len, 0),
-                    altura_mm=_altura_default(tipo, enc),
-                    longitud_ml=L_ml,
-                    zona=f'{tipo} en {zona_corta}',
-                    notas='Auto desde trazo operador (postproc)',
-                ))
-                trabajo.advertencias.append(
-                    f"Postproc: añadido {tipo} {L_ml}ml desde trazo del "
-                    f"operador en {zona_corta}")
+                    candidatas = sorted(
+                        (e for e in pool[tipo]
+                         if e['L'] and abs(e['L'] - L_ml) <= max(0.2 * L_ml, 0.1)
+                         and _compatible(e)),
+                        key=lambda e: not _afin(e))
+                    if candidatas:
+                        pool[tipo].remove(candidatas[0])
+                        continue
+                    # Zócalos: una pieza larga de Claude (cota del plano,
+                    # p.ej. 4830 para toda la pared) cubre VARIOS tramos
+                    # marcados — consumo residual SOLO de piezas afines
+                    if tipo == 'zocalo':
+                        afines = [e for e in pool[tipo]
+                                  if _afin(e) and e['L'] >= L_ml * 0.8]
+                        if afines:
+                            mayor = max(afines, key=lambda e: e['L'])
+                            pool[tipo].remove(mayor)
+                            resto = mayor['L'] - L_ml
+                            if resto > 0.1:
+                                pool[tipo].append({'L': round(resto, 3),
+                                                   'zona': mayor['zona']})
+                            continue
+                    # ¿Ya creamos pieza equivalente en esta arista? (tramos
+                    # DISTINTOS en la misma arista sí se permiten)
+                    clave_arista = (geo, tipo, best_i, round(L_ml, 1))
+                    if clave_arista in aristas_creadas:
+                        continue
+                    aristas_creadas.add(clave_arista)
+                    nuevas.append(Pieza(
+                        tipo=tipo,
+                        material_rol=_material_rol(tipo, enc),
+                        largo_mm=round(L_ml * 1000.0, 0),
+                        altura_mm=_altura_default(tipo, enc),
+                        longitud_ml=L_ml,
+                        zona=f'{tipo} en {zona_corta} (arista idx={best_i})',
+                        notas='Auto desde trazo operador (postproc)',
+                    ))
+                    trabajo.advertencias.append(
+                        f"Postproc: añadido {tipo} {L_ml}ml desde trazo del "
+                        f"operador en {zona_corta} (arista idx={best_i})")
     if nuevas:
         trabajo.piezas.extend(nuevas)
 
