@@ -1284,7 +1284,10 @@ def _recolectar_cotas(trabajo: TrabajoExtraido, encimera_skip) -> tuple:
     import re as _re
     cotas = set()
     cotas_propias = set()
-    pat = _re.compile(r'\b(\d{3,4})\s*mm\b', _re.IGNORECASE)
+    # 'Nmm' suelto Y AMBOS operandos de 'NxMmm' (p.ej. "2760x600mm")
+    pat = _re.compile(
+        r'\b(\d{3,4})\s*mm\b|\b(\d{3,4})\s*[x×]\s*(\d{3,4})\s*mm\b',
+        _re.IGNORECASE)
     for p in trabajo.piezas:
         if p is encimera_skip:
             continue
@@ -1296,30 +1299,32 @@ def _recolectar_cotas(trabajo: TrabajoExtraido, encimera_skip) -> tuple:
     for c in trabajo.cantos:
         if c.longitud_ml and c.longitud_ml >= 0.05:
             cotas.add(int(round(c.longitud_ml * 1000)))
+    def _valores(texto):
+        for m in pat.findall(str(texto)):
+            for g in (m if isinstance(m, tuple) else (m,)):
+                if g:
+                    v = int(g)
+                    if 100 <= v <= 10000:
+                        yield v
+
     # Texto general (advertencias + zona/notas de OTRAS piezas)
     for w in (trabajo.advertencias or []):
-        for m in pat.findall(str(w)):
-            v = int(m)
-            if 100 <= v <= 10000:
-                cotas.add(v)
+        for v in _valores(w):
+            cotas.add(v)
     for p in trabajo.piezas:
         if p is encimera_skip:
             continue
         for src in (p.zona, p.notas):
             if src:
-                for m in pat.findall(str(src)):
-                    v = int(m)
-                    if 100 <= v <= 10000:
-                        cotas.add(v)
+                for v in _valores(src):
+                    cotas.add(v)
     # Cotas propias de la encimera siendo snap-eada (mayor prioridad)
     if encimera_skip:
         for src in (encimera_skip.zona, encimera_skip.notas):
             if src:
-                for m in pat.findall(str(src)):
-                    v = int(m)
-                    if 100 <= v <= 10000:
-                        cotas_propias.add(v)
-                        cotas.add(v)
+                for v in _valores(src):
+                    cotas_propias.add(v)
+                    cotas.add(v)
     return cotas, cotas_propias
 
 
@@ -3002,6 +3007,7 @@ def _reconstruir_desde_polilinea(encimera, regs, cotas, cotas_propias,
             area_new = abs(_signed_area_2d(nuevos)) if len(nuevos) >= 3 else 0.0
             if not (area_orig > 0 and area_new < 0.5 * area_orig):
                 nuevos_f = [[float(x), float(y)] for x, y in nuevos]
+    via_solver = False
     if nuevos_f is None:
         # Vía B — solver de CIERRE: croquis torcidos o no a escala. La
         # topología viene del contorno del operador; las medidas, de las
@@ -3009,6 +3015,7 @@ def _reconstruir_desde_polilinea(encimera, regs, cotas, cotas_propias,
         nuevos_f = _resolver_poligono_por_cierre(poly, encimera, cotas,
                                                  cotas_propias)
         if nuevos_f is not None:
+            via_solver = True
             trabajo.advertencias.append(
                 f"🔧 Postproc [{zona_corta}]: polígono RESUELTO POR COTAS "
                 f"con cierre (croquis torcido/no a escala)")
@@ -3023,8 +3030,14 @@ def _reconstruir_desde_polilinea(encimera, regs, cotas, cotas_propias,
         p.largo_mm = float(max(xs) - min(xs))
         p.ancho_mm = float(max(ys) - min(ys))
         p.aristas_contacto = None  # desalineada del nuevo orden de vértices
+        p.aristas_cota = None      # ídem (re-runs la malinterpretarían)
         p.notas = ((p.notas or '')
                    + ' [geometría reconstruida desde polilínea del operador]').strip()
+        if via_solver:
+            # Croquis muy torcido: la proyección bbox de trazos es imprecisa
+            # — no crear PIEZAS desde trazos sobre esta geometría (los
+            # pulidos/clasificación van por cobertura píxel y sí valen)
+            p._sin_piezas_desde_trazos = True  # type: ignore[attr-defined]
 
     _aplicar(encimera)
     # Propagar a las gemelas de otras opciones de material — comparten el
@@ -3431,6 +3444,12 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
         geometrias.add(geo)
         regs = getattr(enc, '_anot_reg', None)
         if not regs or getattr(enc, '_anot_no_fiable', False):
+            continue
+        if getattr(enc, '_sin_piezas_desde_trazos', False):
+            trabajo.advertencias.append(
+                f"Postproc [{(enc.zona or '?')[:35]}]: piezas desde trazos NO "
+                f"aplicadas (croquis torcido, geometría del solver) — "
+                f"verificar chapeados/copetes manualmente")
             continue
         zona_corta = (enc.zona or '?').split('(')[0].strip()[:35]
         verts = enc.vertices_mm
