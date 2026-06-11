@@ -333,6 +333,14 @@ Cómo decidirlo MIRANDO EL PLANO (no lo inventes por geometría):
 - En una encimera rectangular contra pared: trasera = `"pared"`, frente = `"vista"`, y cada cabeza según tenga muro/mueble al lado o quede abierta.
 - COHERENCIA con el resto de tu salida: cada arista `"pared"`/`"mueble"` sin frontal (chapeado) lleva copete; cada arista `"vista"`/`"ventana"` va pulida. Tus piezas de copete/frontal y tus cantos deben cuadrar con esta lista — si no cuadran, revisa la lista o las piezas antes de responder.
 
+**📐 COTA DE CADA ARISTA — `aristas_cota` (OBLIGATORIO junto a aristas_contacto)**:
+Junto a `aristas_contacto` emite `aristas_cota`: una lista alineada con los vértices donde la entrada i es la COTA EN MM que el plano da para la arista i (número), o `null` si el plano NO acota esa arista. Reglas:
+- Solo cotas LEÍDAS del plano. NUNCA pongas un valor derivado por aritmética — para eso está `null` (el programa deriva por cierre).
+- Los croquis NO están a escala: un brazo dibujado "ancho" puede medir 300mm según su cota. Las COTAS mandan sobre las proporciones del dibujo, siempre.
+- CONSTRUYE los vértices por ARITMÉTICA de cotas, no copiando posiciones del dibujo: el quiebre de una L está en (largo_total − fondo_del_brazo), el alto total es la cota total si el plano da el total (no sumes si la cota YA es total).
+- VERIFICA EL CIERRE antes de responder: en un polígono ortogonal, la suma de aristas hacia la derecha = suma hacia la izquierda, y subidas = bajadas. Si tus vértices no cierran con tus `aristas_cota`, los vértices están mal — reconstrúyelos.
+- Una arista de encimera de menos de 150mm es casi seguro un error de construcción (revisa antes de emitir).
+
 **📏 ESCALONES Y ENTRADAS — qué cota va en cada segmento (CRÍTICO)**:
 Cuando una encimera tiene un escalón (fondo que cambia, p.ej. de 900 a 300), identifica QUÉ cota pertenece a CADA segmento siguiendo las líneas de cota del plano (flechas/extremos). NO deduzcas la asignación por eliminación ni porque "la diferencia coincide con otra etiqueta": las dos asignaciones posibles producen los mismos números y solo el dibujo dice cuál es la real. Comprueba contra el dibujo: ¿el extremo es más estrecho o más ancho que el cuerpo? Declara en `notas` qué viste.
 
@@ -850,6 +858,9 @@ Estructura de ejemplo para un trabajo real (J0297 Elisa Baños):
          idx2-3 envuelven el pilar=pared, idx4 trasera (con chapeado)=pared,
          idx5 cabeza izquierda contra muro=pared */
       "aristas_contacto": ["vista","mueble","pared","pared","pared","pared"],
+      /* aristas_cota: cota LEÍDA del plano por arista (null = sin cota; el
+         programa la deriva por cierre). Nunca valores calculados. */
+      "aristas_cota": [2700, null, 300, 200, 3000, 600],
       "largo_mm": 3000, "ancho_mm": 600,
       "zona": "pared norte principal con saliente pilar trasero derecho"
     },
@@ -1068,12 +1079,24 @@ def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtrai
                 contactos = None  # malformada → ignorar (caerá a heurística)
             else:
                 contactos = [c.lower() for c in contactos]
+        # aristas_cota: cota real leída por arista (mm o null), alineada
+        cotas_ar = p.get('aristas_cota')
+        if cotas_ar is not None:
+            if (not isinstance(cotas_ar, list) or not verts
+                    or len(cotas_ar) != len(verts)
+                    or not all(c is None or isinstance(c, (int, float))
+                               for c in cotas_ar)):
+                cotas_ar = None
+            else:
+                cotas_ar = [float(c) if c is not None else None
+                            for c in cotas_ar]
         piezas.append(Pieza(
             tipo=p.get('tipo', 'desconocido'),
             material_rol=p.get('material_rol', 'encimera'),
             forma=p.get('forma'),
             vertices_mm=verts,
             aristas_contacto=contactos,
+            aristas_cota=cotas_ar,
             largo_mm=safe_float(p.get('largo_mm')),
             ancho_mm=safe_float(p.get('ancho_mm')),
             altura_mm=safe_float(p.get('altura_mm')),
@@ -2041,14 +2064,15 @@ def _ajustar_fondos_a_cotas(verts, cotas, cotas_propias):
     return nuevos if cambios else None
 
 
-def _escuadrar_poligono(verts):
+def _escuadrar_poligono(verts, tol_ang=8.0):
     """Rectifica un polígono CASI ortogonal a ortogonal exacto. Las cocinas
-    son rectilíneas: si todas las aristas están a ≤8° de un eje y alternan
-    horizontal/vertical, cada arista se endereza promediando la coordenada
-    que debería ser constante (el pulso del trazo del operador o la lectura
-    de Claude meten derivas de 20-50mm — J0024 salió «descuadrada»).
+    son rectilíneas: si todas las aristas están a ≤tol_ang° de un eje y
+    alternan horizontal/vertical, cada arista se endereza promediando la
+    coordenada que debería ser constante (el pulso del trazo del operador o
+    la lectura de Claude meten derivas — J0024 salió «descuadrada»).
     Devuelve los vértices rectificados y trasladados a origen, o None si el
-    polígono no es rectilíneo (chaflanes, curvas...)."""
+    polígono no es rectilíneo (chaflanes, curvas...). Para contornos píxel
+    de croquis torcidos usar tol_ang≈20."""
     import math as _math
     n = len(verts)
     if n < 4:
@@ -2065,9 +2089,9 @@ def _escuadrar_poligono(verts):
         if L < 50:
             return None
         ang = _math.degrees(_math.atan2(abs(dy), abs(dx)))
-        if ang <= 8.0:
+        if ang <= tol_ang:
             orient.append('h')
-        elif ang >= 82.0:
+        elif ang >= 90.0 - tol_ang:
             orient.append('v')
         else:
             return None  # arista en diagonal real — no rectificar
@@ -2786,6 +2810,135 @@ def _alinear_poligono_con_polilinea(verts, poly):
     return d_min, mapa
 
 
+def _resolver_poligono_por_cierre(poly, encimera, cotas, cotas_propias):
+    """Resuelve el polígono de un croquis TORCIDO o NO A ESCALA:
+    la topología (secuencia de direcciones de arista) viene del contorno del
+    operador rectificado (≤20°); las medidas vienen de las COTAS. Por cada
+    eje se asignan cotas a las aristas (candidatas por cercanía al tamaño
+    dibujado) exigiendo el CIERRE del polígono (Σ positivas = Σ negativas),
+    con ≤1 arista libre por eje cuya longitud se deriva del cierre. Las
+    `aristas_cota` declaradas por Claude (agrupadas por eje) desempatan los
+    casos en que el dibujo engaña (un fondo de 300 dibujado como 850).
+    Devuelve los vértices o None si no hay solución con confianza."""
+    import itertools
+    import math as _math
+
+    poly_rect = _escuadrar_poligono(poly, tol_ang=20.0)
+    if poly_rect is None:
+        return None
+    n = len(poly_rect)
+    edges = []
+    for i in range(n):
+        dx = poly_rect[(i + 1) % n][0] - poly_rect[i][0]
+        dy = poly_rect[(i + 1) % n][1] - poly_rect[i][1]
+        if abs(dx) >= abs(dy):
+            edges.append(('x', 1 if dx > 0 else -1, abs(dx)))
+        else:
+            edges.append(('y', 1 if dy > 0 else -1, abs(dy)))
+
+    reales = {float(c) for c in (set(cotas or ()) | set(cotas_propias or ()))
+              if c >= 150}
+    if encimera.aristas_cota:
+        reales |= {float(c) for c in encimera.aristas_cota
+                   if c and c >= 150}
+    if len(reales) < 2:
+        return None
+
+    # Cotas declaradas por Claude agrupadas por el EJE de sus aristas (si su
+    # polígono es clasificable) — desempate semántico
+    declaradas_eje = {'x': set(), 'y': set()}
+    if encimera.aristas_cota and encimera.vertices_mm \
+            and len(encimera.aristas_cota) == len(encimera.vertices_mm):
+        vc = encimera.vertices_mm
+        for i, c in enumerate(encimera.aristas_cota):
+            if not c or c < 150:
+                continue
+            dx = vc[(i + 1) % len(vc)][0] - vc[i][0]
+            dy = vc[(i + 1) % len(vc)][1] - vc[i][1]
+            declaradas_eje['x' if abs(dx) >= abs(dy) else 'y'].add(float(c))
+
+    # Escala inicial para el ranking (votación de ratios cota/arista_px)
+    ratios = []
+    for _, _, L in sorted(edges, key=lambda e: -e[2])[:4]:
+        for c in reales:
+            r = c / L
+            if 1.0 <= r <= 15.0:
+                ratios.append(r)
+    if not ratios:
+        return None
+    ratios.sort()
+    mejor_r, mejor_n = ratios[0], 1
+    for r in ratios:
+        grupo = [x for x in ratios if abs(x - r) <= r * 0.06]
+        if len(grupo) > mejor_n:
+            mejor_n, mejor_r = len(grupo), sum(grupo) / len(grupo)
+    s0 = mejor_r
+
+    asignacion = [None] * n
+    for eje in ('x', 'y'):
+        idxs = [i for i in range(n) if edges[i][0] == eje]
+        if not idxs or len(idxs) > 6:
+            return None
+        cand = {}
+        for i in idxs:
+            L_est = edges[i][2] * s0
+            cercanas = sorted(reales, key=lambda c: abs(c - L_est))[:3]
+            cand[i] = [('c', c) for c in cercanas] + [('libre', None)]
+        mejor = None  # (score, {idx: longitud})
+        for combo in itertools.product(*(cand[i] for i in idxs)):
+            libres = [i for i, (t, _) in zip(idxs, combo) if t == 'libre']
+            if len(libres) > 1:
+                continue
+            suma = 0.0
+            for i, (t, c) in zip(idxs, combo):
+                if t == 'c':
+                    suma += edges[i][1] * c
+            largos = {i: c for i, (t, c) in zip(idxs, combo) if t == 'c'}
+            if libres:
+                i_l = libres[0]
+                valor = -suma / edges[i_l][1]
+                if valor < 150:
+                    continue
+                largos[i_l] = valor
+            elif abs(suma) > 5:
+                continue
+            score = 0.0
+            for i, (t, c) in zip(idxs, combo):
+                if t == 'c':
+                    L_est = edges[i][2] * s0
+                    score += 1.0 / (1.0 + abs(c - L_est) / 300.0)
+                    # La cota declarada por Claude EN ESTE EJE pesa más que
+                    # el parecido al dibujo: los croquis no están a escala
+                    # (un fondo de 300 puede venir dibujado como 680)
+                    if c in declaradas_eje[eje]:
+                        score += 0.8
+                else:
+                    score += 0.3
+            if mejor is None or score > mejor[0]:
+                mejor = (score, largos)
+        if mejor is None or mejor[0] / len(idxs) < 0.5:
+            return None
+        for i, L in mejor[1].items():
+            asignacion[i] = L
+
+    # Reconstrucción tipo tortuga desde la topología
+    x = y = 0.0
+    pts = []
+    for i in range(n):
+        pts.append([x, y])
+        eje_i, sg, _ = edges[i]
+        if eje_i == 'x':
+            x += sg * asignacion[i]
+        else:
+            y += sg * asignacion[i]
+    mx = min(p[0] for p in pts)
+    my = min(p[1] for p in pts)
+    pts = [[round(p[0] - mx, 1), round(p[1] - my, 1)] for p in pts]
+    if abs(_signed_area_2d(pts)) < 1e5:  # < 0.1 m²
+        return None
+    return pts
+
+
 def _reconstruir_desde_polilinea(encimera, regs, cotas, cotas_propias,
                                  trabajo, zona_corta) -> bool:
     """Reemplaza vertices_mm por la geometría REAL que dibujó el operador.
@@ -2811,8 +2964,7 @@ def _reconstruir_desde_polilinea(encimera, regs, cotas, cotas_propias,
         return False
     ar_px = W_px / H_px
     ar_mm = W_mm / H_mm
-    if abs(ar_px - ar_mm) > abs(ar_px - 1.0 / ar_mm):
-        return False  # plano rotado 90° respecto a la emisión — no fiable
+    rotado = abs(ar_px - ar_mm) > abs(ar_px - 1.0 / ar_mm)
 
     def _cluster(vals, span):
         """Agrupa coordenadas casi iguales (misma línea del plano dibujada a
@@ -2831,21 +2983,38 @@ def _reconstruir_desde_polilinea(encimera, regs, cotas, cotas_propias,
                 mapeo[v] = avg
         return mapeo
 
-    mx = _cluster(xs_p, W_px)
-    my = _cluster(ys_p, H_px)
-    x0 = min(mx.values())
-    y0 = min(my.values())
-    sx = W_mm / ((max(mx.values()) - x0) or 1)
-    sy = H_mm / ((max(my.values()) - y0) or 1)
-    crudos = [[(mx[p[0]] - x0) * sx, (my[p[1]] - y0) * sy] for p in poly]
-    nuevos, _ = _snap_vertices_a_cotas(crudos, cotas or set(), cotas_propias)
-
-    area_orig = abs(_signed_area_2d(verts))
-    area_new = abs(_signed_area_2d(nuevos)) if len(nuevos) >= 3 else 0.0
-    if area_orig > 0 and area_new < 0.5 * area_orig:
+    nuevos_f = None
+    if not rotado:
+        # Vía A — clustering por eje: contornos limpios con el bbox mm de
+        # Claude validado por cotas
+        mx = _cluster(xs_p, W_px)
+        my = _cluster(ys_p, H_px)
+        x0 = min(mx.values())
+        y0 = min(my.values())
+        sx = W_mm / ((max(mx.values()) - x0) or 1)
+        sy = H_mm / ((max(my.values()) - y0) or 1)
+        crudos = [[(mx[p[0]] - x0) * sx, (my[p[1]] - y0) * sy] for p in poly]
+        nuevos, _ = _snap_vertices_a_cotas(crudos, cotas or set(), cotas_propias)
+        # El resultado debe ser (casi) ortogonal — un contorno torcido de
+        # forma no rígida produce aquí un polígono deforme (J0025)
+        if _escuadrar_poligono(nuevos) is not None:
+            area_orig = abs(_signed_area_2d(verts))
+            area_new = abs(_signed_area_2d(nuevos)) if len(nuevos) >= 3 else 0.0
+            if not (area_orig > 0 and area_new < 0.5 * area_orig):
+                nuevos_f = [[float(x), float(y)] for x, y in nuevos]
+    if nuevos_f is None:
+        # Vía B — solver de CIERRE: croquis torcidos o no a escala. La
+        # topología viene del contorno del operador; las medidas, de las
+        # cotas (con las libres derivadas por cierre del polígono).
+        nuevos_f = _resolver_poligono_por_cierre(poly, encimera, cotas,
+                                                 cotas_propias)
+        if nuevos_f is not None:
+            trabajo.advertencias.append(
+                f"🔧 Postproc [{zona_corta}]: polígono RESUELTO POR COTAS "
+                f"con cierre (croquis torcido/no a escala)")
+    if nuevos_f is None:
         return False
     verts_orig = [list(v) for v in verts]
-    nuevos_f = [[float(x), float(y)] for x, y in nuevos]
 
     def _aplicar(p):
         p.vertices_mm = [list(v) for v in nuevos_f]

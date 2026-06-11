@@ -57,6 +57,12 @@ class Pieza:
     # leyendo los muros del plano; el postproc la usa como verdad si no hay
     # trazos del operador (que siempre tienen prioridad).
     aristas_contacto: Optional[list] = None
+    # Cota REAL leída del plano para cada arista (mm), alineada con
+    # vertices_mm; null donde el plano no acota esa arista. NUNCA derivada
+    # por aritmética. Permite al postproc verificar el CIERRE del polígono
+    # (Σ por eje) y reconstruir croquis no-a-escala desde la topología del
+    # contorno del operador + cotas.
+    aristas_cota: Optional[list] = None
     # Bounding box (calculable de vertices, también se admite directo si no hay polígono)
     largo_mm: Optional[float] = None    # bounding box X
     ancho_mm: Optional[float] = None    # bounding box Y (fondo)
