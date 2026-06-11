@@ -1971,6 +1971,30 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                     encimera.largo_mm = float(max(xs) - min(xs))
                     encimera.ancho_mm = float(max(ys) - min(ys))
 
+        zona_corta = (encimera.zona or '?').split('(')[0].strip()[:35]
+
+        # Validar la FORMA contra la polilínea del operador y, si no encaja,
+        # RECONSTRUIR el polígono desde ella — el operador es la verdad.
+        # Caza escalones con cotas intercambiadas (J0020 600/300), que las
+        # comprobaciones de cotas no detectan.
+        regs = getattr(encimera, '_anot_reg', None)
+        mapa_aristas = None
+        if regs:
+            d_forma, mapa_aristas = _alinear_poligono_con_polilinea(
+                encimera.vertices_mm, regs.get('polilinea_pix'))
+            if d_forma is not None and d_forma > 0.15:
+                if _reconstruir_desde_polilinea(encimera, regs, cotas,
+                                                cotas_propias, trabajo,
+                                                zona_corta):
+                    mapa_aristas = list(range(len(encimera.vertices_mm)))
+                else:
+                    trabajo.advertencias.append(
+                        f"⚠ GEOMETRÍA DUDOSA [{zona_corta}]: el polígono no "
+                        f"encaja con la polilínea del operador (desviación "
+                        f"{d_forma * 100:.0f}% del bbox) y no se pudo "
+                        f"reconstruir — revisar vértices contra el plano")
+                    mapa_aristas = None
+
         # Dedup por geometría (opcion1/opcion2 misma forma → solo procesar una)
         geo_key = tuple(tuple(v) for v in encimera.vertices_mm)
         if geo_key in geometrias_procesadas:
@@ -1981,16 +2005,10 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         if not aristas:
             continue
 
-        zona_corta = (encimera.zona or '?').split('(')[0].strip()[:35]
-
         # Convertir trazos pixel → mm-local de ESTA encimera con los vertices
-        # actualizados (post-snap). El cargador almacenó en pixel-space para
-        # que el snap pueda mover los vertices sin invalidar las claves.
-        regs = getattr(encimera, '_anot_reg', None)
+        # actualizados (post-snap/reconstrucción). El cargador almacenó en
+        # pixel-space para que los vértices puedan moverse sin invalidar nada.
         if regs:
-            # Validar la FORMA del polígono contra la polilínea del operador
-            # (caza escalones con cotas intercambiadas, p.ej. 600/300 J0020)
-            _validar_forma_contra_polilinea(encimera, regs, trabajo, zona_corta)
             cand_pix = regs['polilinea_pix']
             paredes_mm_local = _trazos_a_mm_local(regs['paredes_pix'], cand_pix, encimera.vertices_mm)
             ma_mm_local = _trazos_a_mm_local(regs['ma_pix'], cand_pix, encimera.vertices_mm)
@@ -2011,7 +2029,20 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         trazos_no_pulir = (paredes_mm_local + ma_mm_local + copetes_mm_local
                            + frontales_mm_local + zocalos_mm_local)
         fuente_clasificacion = 'heuristica'
-        if trazos_no_pulir:
+        tipos_px = (_clasificar_aristas_pixel(regs, encimera, mapa_aristas)
+                    if regs else None)
+        if tipos_px is not None:
+            # Vía preferente: clasificación EN PÍXEL sobre el canvas real
+            # (inmune a trazos de otras piezas y a errores de geometría)
+            fuente_clasificacion = 'operador'
+            n_override = sum(1 for t in tipos_px if t == 'pared')
+            for a, t in zip(aristas, tipos_px):
+                a['tipo'] = t
+            trabajo.advertencias.append(
+                f"Postproc [{zona_corta}]: aristas por trazos del operador "
+                f"en píxel (pared:{n_override} "
+                f"frente:{len(aristas) - n_override})")
+        elif trazos_no_pulir:
             fuente_clasificacion = 'operador'
             n_override = 0
             n_libre = 0
@@ -2056,8 +2087,12 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # ESTA encimera, son autoritativos: emitimos un canto por cada arista
         # cubierta por un trazo. Si no, fallback geométrico: aristas no-pared.
         nuevos_pulidos = 0
-        # Track aristas cubiertas (operador pulido O inglete)
-        aristas_cubiertas = set()  # idx de aristas con algún canto operator
+        # Track aristas cubiertas (operador pulido O inglete) — excluyen el
+        # pulido automático. OJO: el inglete NO excluye copete (es la unión
+        # en esquina de los copetes/chapeados, no un sustituto); solo el
+        # pulido del operador hace la arista incompatible con copete.
+        aristas_cubiertas = set()       # pulido O inglete → sin pulido auto
+        aristas_pulido_op = set()       # SOLO pulido operador → sin copete
         TOL_PERTENENCIA_MM = 400
 
         if pulidos_op_local:
@@ -2083,6 +2118,7 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                 if best_a['idx'] in aristas_cubiertas:
                     continue
                 aristas_cubiertas.add(best_a['idx'])
+                aristas_pulido_op.add(best_a['idx'])
                 if best_a['len'] >= 50:
                     trabajo.cantos.append(Canto(
                         tipo='recto_pulido',
@@ -2097,9 +2133,11 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # NO emita un pulido auto sobre la misma esquina.
         nuevos_ingletes_op = 0
         for stroke in ingletes_op_local:
-            L_total = _path_length_mm(stroke)
-            if L_total < 50 or not stroke:
+            if not stroke or len(stroke) < 2:
                 continue
+            # Sin umbral de longitud: un tick de 2-3px ya es una marca
+            # deliberada de inglete (el operador no pinta magenta por azar)
+            L_total = _path_length_mm(stroke)
             cx = sum(p[0] for p in stroke) / len(stroke)
             cy = sum(p[1] for p in stroke) / len(stroke)
             best_a = None
@@ -2114,10 +2152,14 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             if best_a is None or best_d > TOL_PERTENENCIA_MM:
                 continue
             aristas_cubiertas.add(best_a['idx'])
+            # Una marca corta (tick) señala la arista, no mide el inglete:
+            # la longitud real es la de la arista marcada.
+            L_inglete = L_total if L_total >= 100 else best_a['len']
             trabajo.cantos.append(Canto(
                 tipo='ingletado',
-                longitud_ml=round(L_total / 1000.0, 3),
-                notas=f"trazo magenta operador en {zona_corta}",
+                longitud_ml=round(L_inglete / 1000.0, 3),
+                notas=f"trazo magenta operador (arista idx={best_a['idx']}) "
+                      f"en {zona_corta}",
             ))
             nuevos_ingletes_op += 1
 
@@ -2156,8 +2198,11 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # geometría → se emite el copete que falte en CADA opción (pool de
         # coberturas independiente por sufijo _opcionN).
         if fuente_clasificacion in ('operador', 'claude'):
+            # Una arista con PULIDO del operador nunca lleva copete (vista);
+            # el inglete sí es compatible (unión en esquina de copetes)
             aristas_pared = [a for a in aristas
-                             if a['tipo'] == 'pared' and a['len'] >= 100]
+                             if a['tipo'] == 'pared' and a['len'] >= 100
+                             and a['idx'] not in aristas_pulido_op]
             encs_geo = [e for e in encimeras
                         if tuple(tuple(v) for v in e.vertices_mm) == geo_key]
             sufijos = []
@@ -2193,10 +2238,10 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                 def _longitud(p):
                     return ((p.longitud_ml or 0) * 1000) or (p.largo_mm or 0)
 
-                pool_copetes = [_longitud(p) for p in trabajo.piezas
+                pool_copetes = [(_longitud(p), p) for p in trabajo.piezas
                                 if p.tipo == 'copete' and _de_opcion(p)
                                 and _es_de_esta_encimera(p) and _longitud(p)]
-                pool_frontales = [_longitud(p) for p in trabajo.piezas
+                pool_frontales = [(_longitud(p), p) for p in trabajo.piezas
                                   if p.tipo == 'frontal' and _de_opcion(p)
                                   and _longitud(p)]
                 ref_copete = next((p for p in trabajo.piezas
@@ -2206,7 +2251,7 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                     tol = max(150, a['len'] * 0.2)
                     cubierta = False
                     for pool in (pool_copetes, pool_frontales):
-                        match = next((L for L in pool
+                        match = next(((L, p) for L, p in pool
                                       if abs(L - a['len']) <= tol), None)
                         if match is not None:
                             pool.remove(match)
@@ -2230,6 +2275,21 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                         f"Postproc [{zona_corta}]: añadido copete {L_ml}ml "
                         f"en arista pared idx={a['idx']} sin chapeado"
                         f"{suf or ''}")
+                # Copetes fantasma: los copetes de Claude de ESTA encimera que
+                # quedaron sin consumir y no casan con NINGUNA arista pared
+                # reclaman una arista vista → eliminarlos (solo con
+                # clasificación del operador, la más fiable).
+                if fuente_clasificacion == 'operador':
+                    for L_p, pieza_cop in pool_copetes:
+                        if any(abs(L_p - a['len']) <= max(150, a['len'] * 0.2)
+                               for a in aristas_pared):
+                            continue
+                        if pieza_cop in trabajo.piezas:
+                            trabajo.piezas.remove(pieza_cop)
+                            trabajo.advertencias.append(
+                                f"Postproc [{zona_corta}]: eliminado copete "
+                                f"fantasma {round(L_p / 1000.0, 3)}ml{suf or ''} "
+                                f"— reclama una arista vista/pulida")
 
     # NOTA: la heurística de "auto-frontal contra la pared más larga" se
     # eliminó (2026-06-11): inventó chapeados en J0014 y J0020 porque la
@@ -2306,19 +2366,20 @@ def _punto_en_poligono(px, py, verts) -> bool:
     return dentro
 
 
-def _validar_forma_contra_polilinea(encimera, regs, trabajo, zona_corta) -> None:
-    """Compara el polígono emitido por Claude con la polilínea de contorno
-    que dibujó el operador (misma cantidad de vértices). Ambos se normalizan
-    al bbox unitario y se prueba toda alineación cíclica, sentido y volteo
-    vertical; si NI la mejor alineación encaja, la forma es sospechosa —
-    típicamente un escalón con las cotas intercambiadas (600/300), que las
-    comprobaciones de cotas no pueden detectar porque ambas asignaciones
-    producen los mismos números."""
+def _alinear_poligono_con_polilinea(verts, poly):
+    """Busca la mejor correspondencia entre los vértices del polígono (mm) y
+    los puntos de la polilínea del operador (px): toda rotación cíclica y
+    sentido de recorrido, SIN espejo — intercambiar las cotas de un escalón
+    equivale a un espejo vertical y es justo el error a detectar (convención
+    confirmada con J0020: el mapeo Y px↔mm es directo).
+
+    Devuelve (d_min, mapa_aristas): d_min es la desviación máxima entre
+    vértices emparejados (fracción del bbox unitario) y mapa_aristas[i] = el
+    índice de la arista de la polilínea que corresponde a la arista i del
+    polígono. (None, None) si no hay correspondencia 1:1 de vértices."""
     import math as _math
-    poly = regs.get('polilinea_pix')
-    verts = encimera.vertices_mm
     if not poly or not verts or len(poly) != len(verts) or len(verts) < 4:
-        return
+        return None, None
 
     def _norm(pts):
         xs = [p[0] for p in pts]
@@ -2327,26 +2388,178 @@ def _validar_forma_contra_polilinea(encimera, regs, trabajo, zona_corta) -> None
         h = (max(ys) - min(ys)) or 1
         return [((p[0] - min(xs)) / w, (p[1] - min(ys)) / h) for p in pts]
 
-    # OJO: NO se permite volteo (espejo) en la comparación — intercambiar
-    # las dos cotas de un escalón equivale exactamente a un espejo vertical,
-    # que es el error que queremos cazar. Solo alineación cíclica y sentido
-    # de recorrido (invertir el orden de los puntos no cambia la forma).
     a = _norm(verts)
     n = len(a)
-    d_min = float('inf')
     b0 = _norm(poly)
-    for b in (b0, list(reversed(b0))):
+    mejor = (float('inf'), 0, False)
+    for rev in (False, True):
+        b = list(reversed(b0)) if rev else b0
         for off in range(n):
             d = max(_math.hypot(a[i][0] - b[(i + off) % n][0],
                                 a[i][1] - b[(i + off) % n][1])
                     for i in range(n))
-            d_min = min(d_min, d)
-    if d_min > 0.15:
-        trabajo.advertencias.append(
-            f"⚠ GEOMETRÍA DUDOSA [{zona_corta}]: el polígono no encaja con la "
-            f"polilínea del operador (desviación {d_min * 100:.0f}% del bbox) "
-            f"— posible escalón/entrada con cotas intercambiadas; revisar "
-            f"vértices contra el plano")
+            if d < mejor[0]:
+                mejor = (d, off, rev)
+    d_min, off, rev = mejor
+    mapa = []
+    for i in range(n):
+        j = (i + off) % n
+        # sin reversa: vértice i ↔ poly[j] → arista i ↔ arista j de poly.
+        # con reversa: vértice i ↔ poly[n-1-j] → la arista i une los puntos
+        # poly[n-1-j] y poly[n-2-j] → arista (n-2-j) % n de poly.
+        mapa.append(j if not rev else (n - 2 - j) % n)
+    return d_min, mapa
+
+
+def _reconstruir_desde_polilinea(encimera, regs, cotas, cotas_propias,
+                                 trabajo, zona_corta) -> bool:
+    """Reemplaza vertices_mm por la geometría REAL que dibujó el operador.
+    Los puntos de la polilínea se agrupan por eje (clustering — el trazo es
+    a mano alzada), se escalan al bbox en mm de la pieza (el bbox de Claude
+    es fiable: cuadra con las cotas) con mapeo Y DIRECTO px↔mm y se snapean
+    a cotas. Se usa cuando el polígono de Claude no encaja con la polilínea
+    (escalón con cotas intercambiadas, J0020). Tras reconstruir, el vértice
+    i corresponde al punto i de la polilínea (identidad)."""
+    poly = regs.get('polilinea_pix')
+    verts = encimera.vertices_mm
+    if not poly or len(poly) != len(verts):
+        return False
+    xs_m = [v[0] for v in verts]
+    ys_m = [v[1] for v in verts]
+    xs_p = [p[0] for p in poly]
+    ys_p = [p[1] for p in poly]
+    W_mm = max(xs_m) - min(xs_m)
+    H_mm = max(ys_m) - min(ys_m)
+    W_px = (max(xs_p) - min(xs_p)) or 1
+    H_px = (max(ys_p) - min(ys_p)) or 1
+    if W_mm < 50 or H_mm < 50:
+        return False
+    ar_px = W_px / H_px
+    ar_mm = W_mm / H_mm
+    if abs(ar_px - ar_mm) > abs(ar_px - 1.0 / ar_mm):
+        return False  # plano rotado 90° respecto a la emisión — no fiable
+
+    def _cluster(vals, span):
+        """Agrupa coordenadas casi iguales (misma línea del plano dibujada a
+        mano — el pulso da desvíos de 5-8px). Devuelve {valor: media}."""
+        tol = max(8.0, span * 0.03)
+        grupos = []
+        for v in sorted(set(vals)):
+            if grupos and abs(v - grupos[-1][0]) <= tol:
+                grupos[-1].append(v)
+            else:
+                grupos.append([v])
+        mapeo = {}
+        for g in grupos:
+            avg = sum(g) / len(g)
+            for v in g:
+                mapeo[v] = avg
+        return mapeo
+
+    mx = _cluster(xs_p, W_px)
+    my = _cluster(ys_p, H_px)
+    x0 = min(mx.values())
+    y0 = min(my.values())
+    sx = W_mm / ((max(mx.values()) - x0) or 1)
+    sy = H_mm / ((max(my.values()) - y0) or 1)
+    crudos = [[(mx[p[0]] - x0) * sx, (my[p[1]] - y0) * sy] for p in poly]
+    nuevos, _ = _snap_vertices_a_cotas(crudos, cotas or set(), cotas_propias)
+
+    area_orig = abs(_signed_area_2d(verts))
+    area_new = abs(_signed_area_2d(nuevos)) if len(nuevos) >= 3 else 0.0
+    if area_orig > 0 and area_new < 0.5 * area_orig:
+        return False
+    verts_orig = [list(v) for v in verts]
+    nuevos_f = [[float(x), float(y)] for x, y in nuevos]
+
+    def _aplicar(p):
+        p.vertices_mm = [list(v) for v in nuevos_f]
+        xs = [v[0] for v in p.vertices_mm]
+        ys = [v[1] for v in p.vertices_mm]
+        p.largo_mm = float(max(xs) - min(xs))
+        p.ancho_mm = float(max(ys) - min(ys))
+        p.aristas_contacto = None  # desalineada del nuevo orden de vértices
+        p.notas = ((p.notas or '')
+                   + ' [geometría reconstruida desde polilínea del operador]').strip()
+
+    _aplicar(encimera)
+    # Propagar a las gemelas de otras opciones de material — comparten el
+    # MISMO registro de anotaciones (objeto idéntico asignado en _cargar):
+    # si no, su geo_key divergente las dejaría fuera del dedup y sin los
+    # copetes/pulidos de exclusión de su opción.
+    for otra in trabajo.piezas:
+        if otra is encimera or otra.tipo not in ('encimera', 'isla'):
+            continue
+        if getattr(otra, '_anot_reg', None) is regs:
+            _aplicar(otra)
+    trabajo.advertencias.append(
+        f"🔧 Postproc [{zona_corta}]: polígono RECONSTRUIDO desde la "
+        f"polilínea del operador (la emisión de Claude no encajaba): "
+        f"{[[round(v[0]), round(v[1])] for v in encimera.vertices_mm]}")
+    return True
+
+
+def _clasificar_aristas_pixel(regs, encimera, mapa, tol_mm=250):
+    """Clasifica cada arista del polígono (pared/frontal) midiendo EN
+    PÍXELES — sobre el canvas real, sin proyectar entre marcos — la
+    cobertura de los trazos de no-pulir (pared/MA/copete/frontal/zócalo) a
+    lo largo de la arista correspondiente de la polilínea. Inmune a los
+    trazos de OTRAS piezas del mismo canvas (que en el marco mm-local de
+    esta pieza caen donde no deben) y a errores de geometría de Claude.
+
+    Una arista es pared si los trazos cubren ≥30% de su longitud (o ≥300mm
+    equivalentes) a distancia ≤ tol_mm. Devuelve lista de tipos alineada con
+    las aristas del polígono, o None si no aplica."""
+    import math as _math
+    poly = regs.get('polilinea_pix')
+    verts = encimera.vertices_mm
+    if not poly or mapa is None or len(poly) != len(verts):
+        return None
+    trazos = []
+    for k in ('paredes_pix', 'ma_pix', 'copetes_pix', 'frontales_pix',
+              'zocalos_pix'):
+        trazos.extend(regs.get(k) or [])
+    if not trazos:
+        return None
+    # Los trazos de PULIDO del operador mandan: una arista cubierta por cian
+    # es vista por definición, aunque un rectángulo de muebles altos (que en
+    # el plano cuelga SOBRE la encimera) también la roce.
+    trazos_pulido = list(regs.get('pulidos_pix') or [])
+    xs_m = [v[0] for v in verts]
+    ys_m = [v[1] for v in verts]
+    xs_p = [p[0] for p in poly]
+    ys_p = [p[1] for p in poly]
+    escala = (((max(xs_m) - min(xs_m)) / ((max(xs_p) - min(xs_p)) or 1))
+              + ((max(ys_m) - min(ys_m)) / ((max(ys_p) - min(ys_p)) or 1))) / 2
+    escala = escala or 1.0
+    tol_px = tol_mm / escala
+    n = len(poly)
+
+    def _cobertura(lista_trazos, x1, y1, dx, dy, L2, L):
+        ts = []
+        for tr in lista_trazos:
+            for (px, py) in tr:
+                t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (L2 or 1)))
+                cxp, cyp = x1 + t * dx, y1 + t * dy
+                if _math.hypot(px - cxp, py - cyp) <= tol_px:
+                    ts.append(t)
+        return (max(ts) - min(ts)) * L if len(ts) >= 2 else 0.0
+
+    tipos = []
+    for i in range(n):
+        k = mapa[i]
+        x1, y1 = poly[k]
+        x2, y2 = poly[(k + 1) % n]
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx * dx + dy * dy
+        L = _math.sqrt(L2) or 1.0
+        objetivo = min(300 / escala, 0.30 * L)
+        if _cobertura(trazos_pulido, x1, y1, dx, dy, L2, L) >= objetivo:
+            tipos.append('frontal')  # cian del operador = vista, sin discusión
+            continue
+        cobertura = _cobertura(trazos, x1, y1, dx, dy, L2, L)
+        tipos.append('pared' if cobertura >= objetivo else 'frontal')
+    return tipos
 
 
 def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
@@ -2371,29 +2584,32 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
                       if zona_tokens and zona_tokens in (h.pieza_zona or '').lower()]
         if not huecos_enc:
             continue
-        trazos_mm = _trazos_a_mm_local(regs['huecos_pix'],
-                                       regs['polilinea_pix'],
-                                       enc.vertices_mm)
+        poly_pix = regs['polilinea_pix']
         usados = set()
-        n_v = len(enc.vertices_mm)
-        for trazo in trazos_mm:
-            if not trazo:
+        n_p = len(poly_pix)
+        for stroke_pix in regs['huecos_pix']:
+            if not stroke_pix:
                 continue
+            # Pertenencia EN PÍXEL contra la polilínea de ESTA encimera (los
+            # trazos se comparten entre encimeras y la proyección bbox a
+            # mm-local puede plantar dentro un trazo que es de otra pieza).
+            cx_p = sum(p[0] for p in stroke_pix) / len(stroke_pix)
+            cy_p = sum(p[1] for p in stroke_pix) / len(stroke_pix)
+            if not _punto_en_poligono(cx_p, cy_p, poly_pix):
+                d_borde_px = min(
+                    _dist_punto_a_segmento(cx_p, cy_p,
+                                           poly_pix[i][0], poly_pix[i][1],
+                                           poly_pix[(i + 1) % n_p][0],
+                                           poly_pix[(i + 1) % n_p][1])
+                    for i in range(n_p))
+                if d_borde_px > 40:  # ~200mm a escala típica de 5mm/px
+                    continue
+            mm = _trazos_a_mm_local([stroke_pix], poly_pix, enc.vertices_mm)
+            if not mm or not mm[0]:
+                continue
+            trazo = mm[0]
             cx = sum(p[0] for p in trazo) / len(trazo)
             cy = sum(p[1] for p in trazo) / len(trazo)
-            # Los trazos rojos se comparten entre encimeras: solo los que
-            # caen DENTRO de este polígono (o pegados, ≤200mm del borde)
-            # reposicionan huecos de esta pieza — los demás son de otra.
-            if not _punto_en_poligono(cx, cy, enc.vertices_mm):
-                d_borde = min(
-                    _dist_punto_a_segmento(cx, cy,
-                                           enc.vertices_mm[i][0],
-                                           enc.vertices_mm[i][1],
-                                           enc.vertices_mm[(i + 1) % n_v][0],
-                                           enc.vertices_mm[(i + 1) % n_v][1])
-                    for i in range(n_v))
-                if d_borde > 200:
-                    continue
 
             def _dist(h):
                 if h.centro_x_mm is None or h.centro_y_mm is None:
@@ -2404,7 +2620,20 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
             libres = [h for h in huecos_enc if id(h) not in usados]
             if not libres:
                 break
-            h = min(libres, key=_dist)
+            # Matching por TAMAÑO del trazo: un contorno grande es una
+            # placa/fregadero; una marca pequeña es grifo/enchufe/dosificador
+            # (la cercanía sola confundía el rectángulo del fregadero con el
+            # grifo que Claude había colocado al lado).
+            xs_t = [p[0] for p in trazo]
+            ys_t = [p[1] for p in trazo]
+            bw = max(xs_t) - min(xs_t)
+            bh = max(ys_t) - min(ys_t)
+            es_grande = bw >= 150 and bh >= 150
+            candidatos = [h for h in libres
+                          if (h.tipo in ('placa', 'fregadero')) == es_grande]
+            if es_grande and not candidatos:
+                continue  # un contorno grande JAMÁS reposiciona un grifo
+            h = min(candidatos or libres, key=_dist)
             usados.add(id(h))
             old = (h.centro_x_mm, h.centro_y_mm)
             h.centro_x_mm = round(cx, 0)
