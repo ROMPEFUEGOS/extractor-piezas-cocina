@@ -1468,6 +1468,52 @@ def _trazos_a_mm_local(trazos_pix: list, cand_pix: list, vertices_mm: list) -> l
     return [[_pt(x, y) for x, y in t] for t in trazos_pix]
 
 
+def _desinclinar_pagina(etiquetas_pts: list) -> None:
+    """Corrige IN PLACE la inclinación del escaneo de una página: calcula el
+    ángulo de la arista más larga del contorno de encimera mayor (mod 90°,
+    en (-45°,45°]) y, si está entre 1° y 25°, rota TODOS los puntos de la
+    página por el ángulo opuesto (rotación pura — preserva quiralidad).
+    Sin esto, un plano escaneado torcido convierte los rectángulos en
+    paralelogramos y dispara falsas GEOMETRÍAS DUDOSAS (J0023, ~5°)."""
+    import math as _math
+    polys = [pts for tipo, modo, cerrado, pts in etiquetas_pts
+             if tipo == 'encimera' and modo == 'poly' and cerrado and pts]
+    if not polys:
+        return
+
+    def _area_bbox(p):
+        xs = [q[0] for q in p]
+        ys = [q[1] for q in p]
+        return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+    mayor = max(polys, key=_area_bbox)
+    n = len(mayor)
+    mejor_L = 0.0
+    mejor_ang = 0.0
+    for i in range(n):
+        x1, y1 = mayor[i]
+        x2, y2 = mayor[(i + 1) % n]
+        L = _math.hypot(x2 - x1, y2 - y1)
+        if L > mejor_L:
+            mejor_L = L
+            mejor_ang = _math.degrees(_math.atan2(y2 - y1, x2 - x1))
+    desv = mejor_ang % 90.0
+    if desv > 45.0:
+        desv -= 90.0
+    if not (1.0 <= abs(desv) <= 25.0):
+        return
+    todos = [q for _, _, _, pts in etiquetas_pts for q in (pts or [])]
+    cx = sum(q[0] for q in todos) / len(todos)
+    cy = sum(q[1] for q in todos) / len(todos)
+    rad = _math.radians(-desv)
+    cos_a, sin_a = _math.cos(rad), _math.sin(rad)
+    for _, _, _, pts in etiquetas_pts:
+        for q in (pts or []):
+            dx, dy = q[0] - cx, q[1] - cy
+            q[0] = cx + dx * cos_a - dy * sin_a
+            q[1] = cy + dx * sin_a + dy * cos_a
+
+
 def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
     """Lee `anotaciones.json` del proyecto y stashea, para CADA encimera del
     trabajo (cada una con su propio sistema de coords local-mm trasladado a
@@ -1509,6 +1555,16 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
     pilares_pix = []
     huecos_pix = []
     for pid, pdata in (anot.get("paginas_anotadas") or {}).items():
+        # Corregir la inclinación del escaneo ANTES de consumir los trazos
+        # (rotación pura por página; los puntos se mutan in place)
+        etiquetas_pts = [(et.get("tipo"), et.get("modo"),
+                          bool(et.get("cerrado")), et.get("puntos"))
+                         for et in pdata.get("etiquetas", [])
+                         if et.get("puntos")]
+        try:
+            _desinclinar_pagina(etiquetas_pts)
+        except Exception:
+            pass
         for et in pdata.get("etiquetas", []):
             pts = et.get("puntos")
             if not pts:
@@ -1969,6 +2025,7 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
     # — "encimera pared" vs "encimera de pared" — y sin este segundo nivel
     # se duplicaban copetes de cabeza)
     copetes_consumidos_global = set()
+    geos_dudosas_avisadas = set()
 
     for encimera in encimeras:
         # Snap a cotas conocidas
@@ -2018,11 +2075,15 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                                                 zona_corta):
                     mapa_aristas = list(range(len(encimera.vertices_mm)))
                 else:
-                    trabajo.advertencias.append(
-                        f"⚠ GEOMETRÍA DUDOSA [{zona_corta}]: el polígono no "
-                        f"encaja con la polilínea del operador (desviación "
-                        f"{d_forma * 100:.0f}% del bbox) y no se pudo "
-                        f"reconstruir — revisar vértices contra el plano")
+                    geo_aviso = tuple(tuple(v) for v in encimera.vertices_mm)
+                    if geo_aviso not in geos_dudosas_avisadas:
+                        geos_dudosas_avisadas.add(geo_aviso)
+                        trabajo.advertencias.append(
+                            f"⚠ GEOMETRÍA DUDOSA [{zona_corta}]: el polígono "
+                            f"no encaja con la polilínea del operador "
+                            f"(desviación {d_forma * 100:.0f}% del bbox) y no "
+                            f"se pudo reconstruir — revisar vértices contra "
+                            f"el plano")
                     mapa_aristas = None
             else:
                 # Forma OK: derivar el mapa con la MISMA transformación que
