@@ -1742,37 +1742,57 @@ def _completar_pulidos_pata(trabajo: TrabajoExtraido) -> None:
             continue
         L_ml = round(altura / 1000.0, 3)
 
-        # ¿La pieza asociada (encimera/isla) tiene paredes CERCA de sus
-        # aristas? Comprobamos por proximidad real, no solo por presencia
-        # global de trazos pared en el canvas.
+        # Regla usuario (J0022): las caídas verticales de la pata van
+        # pulidas EN LAS MISMAS DIRECCIONES que va pulida la isla — cada
+        # caída corresponde a un LARGO de la isla; se pule si ese largo es
+        # vista. Con clasificación de aristas disponible se usa esa verdad;
+        # si no, fallback a la heurística pared-cerca.
         zona_costado = (costado.zona or '').lower()
-        es_isla_libre = False
+        n_pulidos = None
         if 'isla' in zona_costado:
             islas = [p for p in trabajo.piezas
                      if p.tipo in ('encimera', 'isla')
                      and 'isla' in (p.zona or '').lower()
                      and p.vertices_mm]
-            es_isla_libre = True  # asumimos libre y comprobamos
             for isla in islas:
-                regs = getattr(isla, '_anot_reg', None)
-                if not regs or not regs.get('paredes_pix'):
-                    continue
-                paredes_mm = _trazos_a_mm_local(
-                    regs['paredes_pix'], regs['polilinea_pix'], isla.vertices_mm)
-                if not paredes_mm:
-                    continue
-                n_v = len(isla.vertices_mm)
-                tiene_pared_cerca = False
-                for i in range(n_v):
-                    p1 = isla.vertices_mm[i]
-                    p2 = isla.vertices_mm[(i + 1) % n_v]
-                    if _dist_minima_arista_a_trazos(p1, p2, paredes_mm) <= 250:
-                        tiene_pared_cerca = True
-                        break
-                if tiene_pared_cerca:
-                    es_isla_libre = False
+                tipos_ar = getattr(isla, '_aristas_tipos', None)
+                if tipos_ar:
+                    max_len = max(a['len'] for a in tipos_ar)
+                    largos = [a for a in tipos_ar if a['len'] >= 0.7 * max_len]
+                    n_pulidos = sum(1 for a in largos if a['tipo'] != 'pared')
+                    n_pulidos = max(0, min(2, n_pulidos))
                     break
-        n_pulidos = 2 if es_isla_libre else 1
+        if n_pulidos is None:
+            # Fallback heurístico: isla libre (sin pared cerca) → 2 caídas
+            es_isla_libre = False
+            if 'isla' in zona_costado:
+                islas = [p for p in trabajo.piezas
+                         if p.tipo in ('encimera', 'isla')
+                         and 'isla' in (p.zona or '').lower()
+                         and p.vertices_mm]
+                es_isla_libre = True  # asumimos libre y comprobamos
+                for isla in islas:
+                    regs = getattr(isla, '_anot_reg', None)
+                    if not regs or not regs.get('paredes_pix'):
+                        continue
+                    paredes_mm = _trazos_a_mm_local(
+                        regs['paredes_pix'], regs['polilinea_pix'], isla.vertices_mm)
+                    if not paredes_mm:
+                        continue
+                    n_v = len(isla.vertices_mm)
+                    tiene_pared_cerca = False
+                    for i in range(n_v):
+                        p1 = isla.vertices_mm[i]
+                        p2 = isla.vertices_mm[(i + 1) % n_v]
+                        if _dist_minima_arista_a_trazos(p1, p2, paredes_mm) <= 250:
+                            tiene_pared_cerca = True
+                            break
+                    if tiene_pared_cerca:
+                        es_isla_libre = False
+                        break
+            n_pulidos = 2 if es_isla_libre else 1
+        if n_pulidos == 0:
+            continue
 
         # Evitar duplicar si el operador ya emitió pulido para esta pata
         zona_corta = zona_costado.split('(')[0].strip()[:35]
@@ -2270,9 +2290,16 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                 def _longitud(p):
                     return ((p.longitud_ml or 0) * 1000) or (p.largo_mm or 0)
 
+                def _es_cobertura(p):
+                    # Las piezas generadas por el PROPIO postproc no cubren
+                    # aristas de otras encimeras (el copete auto del tramo
+                    # superior se tragaba la cabeza del tramo inferior)
+                    return 'postproc' not in (p.notas or '').lower()
+
                 pool_copetes = [(_longitud(p), p) for p in trabajo.piezas
                                 if p.tipo == 'copete' and _de_opcion(p)
                                 and _es_de_esta_encimera(p) and _longitud(p)
+                                and _es_cobertura(p)
                                 and id(p) not in copetes_consumidos_global]
                 # 2º nivel: copetes de la opción NO afines y aún sin consumir
                 # en ninguna encimera (red de seguridad de la afinidad textual)
@@ -2280,10 +2307,11 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                     (_longitud(p), p) for p in trabajo.piezas
                     if p.tipo == 'copete' and _de_opcion(p)
                     and not _es_de_esta_encimera(p) and _longitud(p)
+                    and _es_cobertura(p)
                     and id(p) not in copetes_consumidos_global]
                 pool_frontales = [(_longitud(p), p) for p in trabajo.piezas
                                   if p.tipo == 'frontal' and _de_opcion(p)
-                                  and _longitud(p)]
+                                  and _longitud(p) and _es_cobertura(p)]
                 ref_copete = next((p for p in trabajo.piezas
                                    if p.tipo == 'copete' and _de_opcion(p)),
                                   None)
