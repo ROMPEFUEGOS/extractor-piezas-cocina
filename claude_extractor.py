@@ -2187,6 +2187,37 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
 
         # Snap a cotas conocidas
         cotas, cotas_propias = _recolectar_cotas(trabajo, encimera)
+
+        # Reescalado a cotas propias: el croquis puede dibujar una pieza a
+        # OTRA escala que el resto (J0026: isla de polilínea 900×525 con
+        # cotas 1000×620 — fuera de la tolerancia del snap). Si ambos lados
+        # del bbox casan con cotas propias distintas con factores de escala
+        # similares, se reescala el polígono entero.
+        if cotas_propias and encimera.vertices_mm:
+            xs_b = [v[0] for v in encimera.vertices_mm]
+            ys_b = [v[1] for v in encimera.vertices_mm]
+            W_b = max(xs_b) - min(xs_b)
+            H_b = max(ys_b) - min(ys_b)
+            if W_b > 100 and H_b > 100:
+                cl = min(cotas_propias, key=lambda c: abs(c - W_b))
+                ca = min((c for c in cotas_propias if c != cl),
+                         key=lambda c: abs(c - H_b), default=None)
+                if ca is not None:
+                    fx = cl / W_b
+                    fy = ca / H_b
+                    if (0.8 <= fx <= 1.25 and 0.8 <= fy <= 1.25
+                            and abs(fx - fy) <= 0.1
+                            and (abs(fx - 1) > 0.02 or abs(fy - 1) > 0.02)):
+                        x0_b, y0_b = min(xs_b), min(ys_b)
+                        encimera.vertices_mm = [
+                            [(v[0] - x0_b) * fx, (v[1] - y0_b) * fy]
+                            for v in encimera.vertices_mm]
+                        encimera.largo_mm = float(cl)
+                        encimera.ancho_mm = float(ca)
+                        trabajo.advertencias.append(
+                            f"Postproc [{(encimera.zona or '?')[:35]}]: "
+                            f"reescalado a cotas propias {cl:.0f}×{ca:.0f} "
+                            f"(croquis a otra escala: ×{fx:.2f}/{fy:.2f})")
         if cotas:
             verts_snap, snap_log = _snap_vertices_a_cotas(
                 encimera.vertices_mm, cotas, cotas_propias)
@@ -3474,10 +3505,20 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
         return
 
     def _altura_default(tipo, enc):
+        if tipo == 'frontal':
+            # La altura del material puede ser la de una zona especial
+            # (campana a 1500 — J0026); los chapeados de pared van a ~600.
+            # Prioridad: frontal de Claude en la MISMA encimera > 600.
+            zona_tokens_enc = ' '.join((enc.zona or '').lower().split()[:2])
+            for p in trabajo.piezas:
+                if (p.tipo == 'frontal' and p.altura_mm and zona_tokens_enc
+                        and zona_tokens_enc in (p.zona or '').lower()):
+                    return p.altura_mm
+            return 600.0
         for m in trabajo.materiales:
             if m.rol and tipo in m.rol.lower() and m.altura_cm:
                 return float(m.altura_cm) * 10.0
-        return {'copete': 50.0, 'zocalo': 60.0, 'frontal': None}[tipo]
+        return {'copete': 50.0, 'zocalo': 60.0}[tipo]
 
     def _material_rol(tipo, enc):
         for m in trabajo.materiales:
@@ -3676,6 +3717,21 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                     trabajo.advertencias.append(
                         f"Postproc: añadido {tipo} {L_ml}ml desde trazo del "
                         f"operador en {zona_corta} (arista idx={best_i})")
+                    if tipo == 'frontal':
+                        # Un chapeado en esta arista anula el copete que el
+                        # copete-por-exclusión emitió ANTES de conocer este
+                        # trazo (copete y frontal son excluyentes — J0026)
+                        marca_idx = f'(arista idx={best_i})'
+                        for p in list(trabajo.piezas):
+                            if (p.tipo == 'copete'
+                                    and marca_idx in (p.zona or '')
+                                    and zona_corta in (p.zona or '')
+                                    and 'Auto exclusión' in (p.notas or '')):
+                                trabajo.piezas.remove(p)
+                                trabajo.advertencias.append(
+                                    f"Postproc [{zona_corta}]: copete auto de "
+                                    f"la arista idx={best_i} retirado — el "
+                                    f"operador marcó chapeado ahí")
     if nuevas:
         trabajo.piezas.extend(nuevas)
 
