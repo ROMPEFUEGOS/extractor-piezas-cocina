@@ -1985,6 +1985,54 @@ def _dedup_frontales(trabajo: TrabajoExtraido) -> None:
             f"({', '.join(f'{e.largo_mm}mm' for e in eliminados)})")
 
 
+def _escuadrar_poligono(verts):
+    """Rectifica un polígono CASI ortogonal a ortogonal exacto. Las cocinas
+    son rectilíneas: si todas las aristas están a ≤8° de un eje y alternan
+    horizontal/vertical, cada arista se endereza promediando la coordenada
+    que debería ser constante (el pulso del trazo del operador o la lectura
+    de Claude meten derivas de 20-50mm — J0024 salió «descuadrada»).
+    Devuelve los vértices rectificados y trasladados a origen, o None si el
+    polígono no es rectilíneo (chaflanes, curvas...)."""
+    import math as _math
+    n = len(verts)
+    if n < 4:
+        return None
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    if (max(xs) - min(xs)) < 100 or (max(ys) - min(ys)) < 100:
+        return None
+    orient = []
+    for i in range(n):
+        dx = verts[(i + 1) % n][0] - verts[i][0]
+        dy = verts[(i + 1) % n][1] - verts[i][1]
+        L = _math.hypot(dx, dy)
+        if L < 50:
+            return None
+        ang = _math.degrees(_math.atan2(abs(dy), abs(dx)))
+        if ang <= 8.0:
+            orient.append('h')
+        elif ang >= 82.0:
+            orient.append('v')
+        else:
+            return None  # arista en diagonal real — no rectificar
+    if any(orient[i] == orient[(i + 1) % n] for i in range(n)):
+        return None  # dos aristas seguidas en el mismo eje — caso raro
+    nuevos = [list(v) for v in verts]
+    for i in range(n):
+        j = (i + 1) % n
+        if orient[i] == 'h':
+            ym = (verts[i][1] + verts[j][1]) / 2.0
+            nuevos[i][1] = ym
+            nuevos[j][1] = ym
+        else:
+            xm = (verts[i][0] + verts[j][0]) / 2.0
+            nuevos[i][0] = xm
+            nuevos[j][0] = xm
+    mx = min(v[0] for v in nuevos)
+    my = min(v[1] for v in nuevos)
+    return [[v[0] - mx, v[1] - my] for v in nuevos]
+
+
 def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
     """Reconcilia frontales (chapeados) y pulidos contra la geometría real del
     polígono de TODAS las encimeras del trabajo (L principal, isla, costado,
@@ -2040,6 +2088,16 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
     registros_procesados = {}  # id(_anot_reg) → encimera ya procesada
 
     for encimera in encimeras:
+        # Escuadrar: las cocinas son ortogonales — el pulso del trazo o la
+        # lectura de Claude meten derivas de 20-50mm por arista
+        rect = _escuadrar_poligono(encimera.vertices_mm)
+        if rect is not None:
+            encimera.vertices_mm = rect
+            xs_r = [v[0] for v in rect]
+            ys_r = [v[1] for v in rect]
+            encimera.largo_mm = float(max(xs_r))
+            encimera.ancho_mm = float(max(ys_r))
+
         # Snap a cotas conocidas
         cotas, cotas_propias = _recolectar_cotas(trabajo, encimera)
         if cotas:
@@ -3078,7 +3136,11 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                       for p in trabajo.piezas if p.tipo == tipo]
 
     usados = set()       # id() de trazos píxel ya consumidos (listas compartidas)
-    aristas_creadas = set()  # (geo, tipo, idx_arista) con pieza ya creada
+    aristas_creadas = set()  # (geo, tipo, idx_arista, L) con pieza ya creada
+    # Tramos de arista ya cubiertos por trazos anteriores: (geo, tipo, idx)
+    # → [(t0, t1)]. Un garabato redundante ENCIMA de la misma marca (J0024:
+    # frontal repasado 3 veces) no debe crear piezas nuevas.
+    intervalos_cubiertos = {}
     nuevas: list = []
     geometrias = set()
     for enc in encimeras:
@@ -3093,7 +3155,11 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
         verts = enc.vertices_mm
         n = len(verts)
         for key_pix, tipo in TIPOS:
-            for stroke_pix in (regs.get(key_pix) or []):
+            # Trazos GRANDES primero: la marca principal registra su tramo y
+            # los repasos pequeños encima quedan como redundantes
+            trazos_orden = sorted(regs.get(key_pix) or [],
+                                  key=_path_length_mm, reverse=True)
+            for stroke_pix in trazos_orden:
                 if id(stroke_pix) in usados:
                     continue
                 mm = _trazos_a_mm_local([stroke_pix], regs['polilinea_pix'], verts)
@@ -3133,7 +3199,7 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                     if ((cov >= 0.2 * L_ar)
                             or (frac_pts >= 0.5 and cov >= 100)
                             or (frac_pts >= 0.25 and cov >= 300)):
-                        objetivos.append((i, L_ar, cov))
+                        objetivos.append((i, L_ar, cov, min(ts), max(ts)))
                 if not objetivos and L_trazo <= 400:
                     # Marca corta (tick): arista más cercana al centroide
                     cx = sum(p[0] for p in stroke) / len(stroke)
@@ -3148,7 +3214,7 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                             best = (d, i, L_ar)
                     if best and best[0] <= TOL_PERTENENCIA_MM:
                         objetivos = [(best[1], best[2],
-                                      min(L_trazo, best[2]))]
+                                      min(L_trazo, best[2]), 0.0, 1.0)]
                 if not objetivos:
                     continue
                 usados.add(id(stroke_pix))
@@ -3174,7 +3240,18 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                         return False
                     return True
 
-                for best_i, best_len, cov in objetivos_pendientes:
+                for best_i, best_len, cov, t0, t1 in objetivos_pendientes:
+                    # ¿Garabato redundante? Si el tramo ya está cubierto en
+                    # ≥70% por trazos anteriores de este tipo en esta arista
+                    # (la marca se repasa varias veces), no genera nada.
+                    clave_int = (geo, tipo, best_i)
+                    previos = intervalos_cubiertos.get(clave_int, [])
+                    solape = 0.0
+                    for (a0, a1) in previos:
+                        solape += max(0.0, min(t1, a1) - max(t0, a0))
+                    if (t1 - t0) > 0 and solape / (t1 - t0) >= 0.7:
+                        continue
+                    intervalos_cubiertos.setdefault(clave_int, []).append((t0, t1))
                     # Longitud objetivo: la arista si el trazo la recorre en
                     # su mayor parte (≥60% — el pulso a mano se queda corto);
                     # si no, lo realmente cubierto (un zócalo o un tramo de
