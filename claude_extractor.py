@@ -1994,6 +1994,14 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                         f"{d_forma * 100:.0f}% del bbox) y no se pudo "
                         f"reconstruir — revisar vértices contra el plano")
                     mapa_aristas = None
+            else:
+                # Forma OK: derivar el mapa con la MISMA transformación que
+                # los demás trazos (la alineación normalizada es ambigua en
+                # rectángulos y podría rotar el mapeo respecto a los huecos)
+                mapa_cercania = _mapa_aristas_por_cercania(
+                    regs, encimera.vertices_mm)
+                if mapa_cercania is not None:
+                    mapa_aristas = mapa_cercania
 
         # Dedup por geometría (opcion1/opcion2 misma forma → solo procesar una)
         geo_key = tuple(tuple(v) for v in encimera.vertices_mm)
@@ -2082,6 +2090,13 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                 f"⚠ Postproc [{zona_corta}]: clasificación de aristas por "
                 f"heurística geométrica SIN confirmar (sin trazos del operador "
                 f"ni aristas_contacto) — revisar pared/vista")
+
+        # Guardar la clasificación final en la pieza para pasos posteriores
+        # (p.ej. recolocar el grifo hacia la arista pared real — la
+        # convención Y de Claude puede no coincidir con la del canvas)
+        encimera._aristas_tipos = [  # type: ignore[attr-defined]
+            {'v1': a['v1'], 'v2': a['v2'], 'tipo': a['tipo'], 'len': a['len']}
+            for a in aristas]
 
         # Emitir pulidos. Si el operador anotó trazos de pulido cian para
         # ESTA encimera, son autoritativos: emitimos un canto por cada arista
@@ -2220,10 +2235,17 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             # deben aparecer en la zona del copete) — sin esto, un copete de
             # la península "cubriría" la cabeza de otra encimera del mismo
             # largo. Los frontales cubren por longitud (su zona no suele
-            # nombrar a la encimera).
+            # nombrar a la encimera). Si el trabajo solo tiene UNA geometría
+            # de encimera, todos los copetes son suyos (la afinidad textual
+            # es frágil: "encimera principal" vs "…superior encimera").
             zona_tokens = ' '.join((zona_corta or '').lower().split()[:2])
+            geos_unicas = {tuple(tuple(v) for v in p.vertices_mm)
+                           for p in encimeras}
+            unica_encimera = len(geos_unicas) == 1
 
             def _es_de_esta_encimera(p):
+                if unica_encimera:
+                    return True
                 return zona_tokens and zona_tokens in (p.zona or '').lower()
 
             for suf in sufijos:
@@ -2499,6 +2521,48 @@ def _reconstruir_desde_polilinea(encimera, regs, cotas, cotas_propias,
     return True
 
 
+def _mapa_aristas_por_cercania(regs, verts):
+    """Mapa arista_polígono → arista_polilínea derivado de la MISMA
+    transformación px→mm que usan trazos y huecos (_trazos_a_mm_local):
+    cada vértice de la polilínea convertido a mm-local se empareja con el
+    vértice más cercano del polígono. Para rectángulos esto es lo único
+    fiable — la alineación por forma normalizada es ambigua (cualquier
+    offset de un rectángulo encaja) y podía rotar el mapeo 90° respecto a
+    la transformación de los demás trazos. Devuelve None si el emparejado
+    no es una biyección consecutiva (polilínea deformada)."""
+    import math as _math
+    poly = regs.get('polilinea_pix')
+    if not poly or not verts or len(poly) != len(verts):
+        return None
+    conv = _trazos_a_mm_local([poly], poly, verts)
+    if not conv or not conv[0] or len(conv[0]) != len(verts):
+        return None
+    pts = conv[0]
+    n = len(verts)
+    pareja = []
+    for (px, py) in pts:
+        i_min = min(range(n), key=lambda i: _math.hypot(verts[i][0] - px,
+                                                        verts[i][1] - py))
+        pareja.append(i_min)
+    if len(set(pareja)) != n:
+        return None  # dos puntos cayeron en el mismo vértice
+    # ¿Recorrido consecutivo (directo o inverso)?
+    directo = all(pareja[(k + 1) % n] == (pareja[k] + 1) % n for k in range(n))
+    inverso = all(pareja[(k + 1) % n] == (pareja[k] - 1) % n for k in range(n))
+    if not (directo or inverso):
+        return None
+    mapa = [None] * n
+    for k in range(n):
+        if directo:
+            # poly arista k (puntos k→k+1) ↔ polígono arista pareja[k]
+            mapa[pareja[k]] = k
+        else:
+            # inverso: poly k→k+1 recorre polígono pareja[k]→pareja[k]-1,
+            # que es la arista pareja[k]-1 del polígono
+            mapa[(pareja[k] - 1) % n] = k
+    return mapa
+
+
 def _clasificar_aristas_pixel(regs, encimera, mapa, tol_mm=250):
     """Clasifica cada arista del polígono (pared/frontal) midiendo EN
     PÍXELES — sobre el canvas real, sin proyectar entre marcos — la
@@ -2651,6 +2715,44 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
                     f"Postproc: hueco {h.tipo} reposicionado por trazo del "
                     f"operador ({old[0]:.0f},{old[1]:.0f})→({cx:.0f},{cy:.0f}) "
                     f"en {enc.zona or '?'}")
+            # El grifo va DETRÁS del fregadero, hacia la pared REAL (la
+            # arista clasificada pared por los trazos del operador) — la
+            # convención Y de Claude puede estar invertida respecto al canvas
+            if h.tipo == 'fregadero':
+                grifo = next((g for g in huecos_enc
+                              if g.tipo == 'grifo' and id(g) not in usados),
+                             None)
+                tipos_ar = getattr(enc, '_aristas_tipos', None)
+                if grifo is not None and tipos_ar:
+                    paredes_largas = [
+                        t for t in tipos_ar
+                        if t['tipo'] == 'pared'
+                        and t['len'] >= 0.5 * max(x['len'] for x in tipos_ar)]
+                    if paredes_largas:
+                        import math as _math
+                        def _d_arista(t):
+                            p1 = enc.vertices_mm[t['v1']]
+                            p2 = enc.vertices_mm[t['v2']]
+                            return _dist_punto_a_segmento(
+                                cx, cy, p1[0], p1[1], p2[0], p2[1])
+                        cercana = min(paredes_largas, key=_d_arista)
+                        p1 = enc.vertices_mm[cercana['v1']]
+                        p2 = enc.vertices_mm[cercana['v2']]
+                        # Proyección del centro del fregadero sobre la pared
+                        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+                        L2 = dx * dx + dy * dy or 1
+                        tt = max(0.0, min(1.0, ((cx - p1[0]) * dx
+                                                + (cy - p1[1]) * dy) / L2))
+                        px_, py_ = p1[0] + tt * dx, p1[1] + tt * dy
+                        # Grifo a ~60mm de la pared, alineado con el fregadero
+                        nx, ny = cx - px_, cy - py_
+                        nn = _math.hypot(nx, ny) or 1
+                        usados.add(id(grifo))
+                        grifo.centro_x_mm = round(px_ + nx / nn * 60, 0)
+                        grifo.centro_y_mm = round(py_ + ny / nn * 60, 0)
+                        grifo.notas = ((grifo.notas or '')
+                                       + ' [recolocado detrás del fregadero '
+                                         'hacia la pared clasificada]').strip()
 
 
 def _espejar_opciones(trabajo: TrabajoExtraido) -> None:
