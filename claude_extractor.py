@@ -186,6 +186,15 @@ el saliente continúa al final con fondo 280mm.
   · Lateral izquierdo del pilar: ej. 35×600 (espesor del material × altura).
   · Lateral derecho del pilar: ej. 35×600.
   Las 3 van unidas con inglete (añadir a `cantos`: `{"tipo":"ingletado","longitud_ml":...}`).
+- **Frontal ALTO que parte la pared**: si un tramo de la pared lleva un frontal
+  de altura especial (campana/columna, p.ej. 300×1500), el chapeado estándar de
+  esa pared mide **total_pared − largo_del_alto**, NUNCA el total. Ejemplos
+  reales: pared 2410 con alto de 300 → chapeado 2110 + alto 300×1500; cabeza
+  600 con alto de 243 → chapeado 243×1500 + copete 357. Haz la RESTA con las
+  cotas, no copies la longitud de la arista.
+- **NO INVENTES chapeados**: un frontal solo existe si el plano lo dibuja, la
+  plantilla lo lista o una nota lo indica. Una península/isla NO lleva chapeado
+  salvo indicación explícita (sus traseras suelen ser vistas o de mueble).
 
 **RODAPIÉS / ZÓCALOS — TODAS LAS ZONAS CON MUEBLES BAJOS**:
 Cualquier zona que tenga muebles bajos (sea tramo de encimera, isla, esquina,
@@ -1172,6 +1181,7 @@ def json_to_trabajo(data: dict, folder_info: dict, folder=None) -> TrabajoExtrai
     _completar_piezas_desde_trazos(trabajo)
     _reposicionar_huecos_desde_trazos(trabajo)
     _ajustar_profundidad_huecos(trabajo)
+    _validar_huecos_dentro(trabajo)
     _completar_pulidos_pata(trabajo)
     _completar_inglete_pata(trabajo)
     _completar_copete_principal(trabajo)
@@ -2188,12 +2198,32 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # Snap a cotas conocidas
         cotas, cotas_propias = _recolectar_cotas(trabajo, encimera)
 
+        # Guard global de mutación: si la MAYORÍA de las aristas relevantes
+        # YA coinciden con cotas propias (±5), la geometría es
+        # cota-consistente (viene del solver o de un plano bien construido)
+        # — reescalar/snapear la ROMPE (J0026: la línea x=2050, que no es
+        # cota, saltaba a la cota 2200, que es una arista y no el ancho).
+        geometria_consistente = False
+        if cotas_propias and encimera.vertices_mm:
+            import math as _math_gc
+            vs_gc = encimera.vertices_mm
+            n_gc = len(vs_gc)
+            lens_gc = [_math_gc.hypot(vs_gc[(i + 1) % n_gc][0] - vs_gc[i][0],
+                                      vs_gc[(i + 1) % n_gc][1] - vs_gc[i][1])
+                       for i in range(n_gc)]
+            relevantes_gc = [L for L in lens_gc if L >= 150]
+            casadas_gc = [L for L in relevantes_gc
+                          if any(abs(L - c) <= 5 for c in cotas_propias)]
+            geometria_consistente = (len(relevantes_gc) >= 3
+                                     and len(casadas_gc)
+                                     >= 0.5 * len(relevantes_gc))
+
         # Reescalado a cotas propias: el croquis puede dibujar una pieza a
         # OTRA escala que el resto (J0026: isla de polilínea 900×525 con
         # cotas 1000×620 — fuera de la tolerancia del snap). Si ambos lados
         # del bbox casan con cotas propias distintas con factores de escala
         # similares, se reescala el polígono entero.
-        if cotas_propias and encimera.vertices_mm:
+        if cotas_propias and encimera.vertices_mm and not geometria_consistente:
             xs_b = [v[0] for v in encimera.vertices_mm]
             ys_b = [v[1] for v in encimera.vertices_mm]
             W_b = max(xs_b) - min(xs_b)
@@ -2218,7 +2248,7 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                             f"Postproc [{(encimera.zona or '?')[:35]}]: "
                             f"reescalado a cotas propias {cl:.0f}×{ca:.0f} "
                             f"(croquis a otra escala: ×{fx:.2f}/{fy:.2f})")
-        if cotas:
+        if cotas and not geometria_consistente:
             verts_snap, snap_log = _snap_vertices_a_cotas(
                 encimera.vertices_mm, cotas, cotas_propias)
             if snap_log['x'] or snap_log['y']:
@@ -2250,7 +2280,7 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
 
         # Snap de FONDOS: las distancias entre líneas paralelas también
         # deben caer en cota (el snap absoluto no las ve)
-        if cotas:
+        if cotas and not geometria_consistente:
             ajustado = _ajustar_fondos_a_cotas(encimera.vertices_mm,
                                                cotas, cotas_propias)
             if ajustado is not None:
@@ -2574,6 +2604,10 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                     return True
                 return zona_tokens and zona_tokens in (p.zona or '').lower()
 
+            # Aristas pared cubiertas por CHAPEADO (frontal): alimenta el
+            # inglete automático de esquinas reflejas (J0026: 795/225)
+            frontales_en_arista: dict = {}
+
             for suf in sufijos:
                 def _de_opcion(p):
                     rol = p.material_rol or ''
@@ -2611,7 +2645,24 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                 ref_copete = next((p for p in trabajo.piezas
                                    if p.tipo == 'copete' and _de_opcion(p)),
                                   None)
+                # FASE 1 — matches exactos globales (≤10mm) ANTES de ningún
+                # subset-sum: la pared grande no puede robarle al escalón sus
+                # chapeados exactos (J0026: 795+225+1255 sumaban ≈2200 y el
+                # subset de la arista 2200 se los tragaba)
+                # (solo chapeados: los copetes conservan el camino original
+                # — su orden de consumo entre gemelas ya está validado)
+                cubiertas_exactas = set()
                 for a in sorted(aristas_pared, key=lambda x: -x['len']):
+                    m = next(((L, p) for L, p in pool_frontales
+                              if abs(L - a['len']) <= 5), None)
+                    if m is None:
+                        continue
+                    pool_frontales.remove(m)
+                    frontales_en_arista.setdefault(a['idx'], []).append(m[1])
+                    cubiertas_exactas.add(a['idx'])
+                for a in sorted(aristas_pared, key=lambda x: -x['len']):
+                    if a['idx'] in cubiertas_exactas:
+                        continue
                     tol = max(150, a['len'] * 0.2)
                     cubierta = False
                     for pool in (pool_copetes, pool_copetes_global,
@@ -2630,6 +2681,9 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                                 pool.remove(match)
                                 if match[1].tipo == 'copete':
                                     copetes_consumidos_global.add(id(match[1]))
+                                elif match[1].tipo == 'frontal':
+                                    frontales_en_arista.setdefault(
+                                        a['idx'], []).append(match[1])
                                 cubierta = True
                                 break
                     if cubierta:
@@ -2661,6 +2715,9 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                     if mejor_sub and mejor_sub[0][0] <= max(150, a['len'] * 0.1):
                         for L, p, pool in mejor_sub[1]:
                             pool.remove((L, p))
+                            if p.tipo == 'frontal':
+                                frontales_en_arista.setdefault(
+                                    a['idx'], []).append(p)
                             if p.tipo == 'copete':
                                 copetes_consumidos_global.add(id(p))
                                 if len(mejor_sub[1]) == 1:
@@ -2739,6 +2796,89 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                                 f"Postproc [{zona_corta}]: eliminado copete "
                                 f"fantasma {round(L_p / 1000.0, 3)}ml{suf or ''} "
                                 f"— reclama una arista vista/pulida")
+
+            # Inglete automático entre chapeados que doblan una esquina
+            # REFLEJA (escalón/columna — J0026: 795/225). En una esquina
+            # normal de cocina (90° interior) los chapeados se juntan a
+            # testa, sin inglete: solo la esquina que ENVUELVE material
+            # (ángulo interior 270°) deja canto visto que se ingleta.
+            if frontales_en_arista and len(encimera.vertices_mm) >= 3:
+                verts_e = encimera.vertices_mm
+                sentido = 1 if _signed_area_2d(verts_e) > 0 else -1
+                por_idx = {a['idx']: a for a in aristas_pared}
+                op_inglete = {k for k in aristas_cubiertas
+                              if k not in aristas_pulido_op}
+                hechas = set()
+                for i in sorted(frontales_en_arista):
+                    for j in sorted(frontales_en_arista):
+                        if j <= i or (i, j) in hechas:
+                            continue
+                        a1, a2 = por_idx.get(i), por_idx.get(j)
+                        if not a1 or not a2:
+                            continue
+                        if a1['v2'] == a2['v1']:
+                            vp, vc, vn = (verts_e[a1['v1']],
+                                          verts_e[a1['v2']],
+                                          verts_e[a2['v2']])
+                        elif a2['v2'] == a1['v1']:
+                            vp, vc, vn = (verts_e[a2['v1']],
+                                          verts_e[a2['v2']],
+                                          verts_e[a1['v2']])
+                        else:
+                            continue  # no comparten vértice
+                        cross = ((vc[0] - vp[0]) * (vn[1] - vc[1])
+                                 - (vc[1] - vp[1]) * (vn[0] - vc[0]))
+                        if cross * sentido >= 0:
+                            continue  # esquina normal → a testa
+                        if i in op_inglete or j in op_inglete:
+                            continue  # el operador ya marcó ese inglete
+                        hechas.add((i, j))
+                        alt = max((p.altura_mm or 600.0)
+                                  for p in (frontales_en_arista[i]
+                                            + frontales_en_arista[j]))
+                        L_ing = round(2 * alt / 1000.0, 3)
+                        trabajo.cantos.append(Canto(
+                            tipo='ingletado', longitud_ml=L_ing,
+                            notas=f'unión chapeados en esquina refleja '
+                                  f'aristas idx={i}/{j} de {zona_corta}: '
+                                  f'2 cantos × {alt:.0f}mm (postproc)'))
+                        trabajo.advertencias.append(
+                            f"Postproc [{zona_corta}]: inglete {L_ing}ml "
+                            f"entre chapeados de aristas idx={i}/{j} "
+                            f"(esquina refleja)")
+
+            # Patrón "frontal alto parte la pared" (J0025: 600−243; J0026:
+            # 2410−300): si existe un frontal ALTO y un chapeado estándar
+            # mide EXACTAMENTE una arista pared completa, el reparto es
+            # sospechoso — el chapeado real suele ser pared_total − alto.
+            altos = [p for p in trabajo.piezas
+                     if p.tipo == 'frontal' and (p.altura_mm or 0) >= 800
+                     and 'postproc' not in (p.notas or '').lower()]
+            # Si algún chapeado estándar YA es "cota − alto" (el diseño hizo
+            # la resta: J0025 2312=2760−448, J0026 corregido 2110=2410−300),
+            # el reparto está resuelto → sin aviso.
+            reparto_hecho = any(
+                abs((p.largo_mm or 0) - (c - (alto.largo_mm or 0))) <= 10
+                for p in trabajo.piezas
+                if p.tipo == 'frontal' and (p.altura_mm or 600) < 800
+                for alto in altos for c in (cotas_propias or ()))
+            if altos and not reparto_hecho:
+                for a in aristas_pared:
+                    chap = next(
+                        (p for p in trabajo.piezas if p.tipo == 'frontal'
+                         and (p.altura_mm or 600) < 800
+                         and abs((p.largo_mm or 0) - a['len']) <= 5), None)
+                    if chap:
+                        alto = altos[0]
+                        trabajo.advertencias.append(
+                            f"⚠ [{zona_corta}]: chapeado {chap.largo_mm:.0f} "
+                            f"ocupa la arista pared idx={a['idx']} completa "
+                            f"pero existe frontal alto {alto.largo_mm or 0:.0f}"
+                            f"×{alto.altura_mm or 0:.0f} — si comparten pared, "
+                            f"el chapeado suele ser pared_total − "
+                            f"{alto.largo_mm or 0:.0f} (patrón J0025/J0026) — "
+                            f"VERIFICAR reparto")
+                        break
 
     # NOTA: la heurística de "auto-frontal contra la pared más larga" se
     # eliminó (2026-06-11): inventó chapeados en J0014 y J0020 porque la
@@ -3420,6 +3560,113 @@ def _ajustar_profundidad_huecos(trabajo: TrabajoExtraido) -> None:
                 f"({cx:.0f},{cy:.0f})→({nuevo_x:.0f},{nuevo_y:.0f})")
 
 
+def _validar_huecos_dentro(trabajo: TrabajoExtraido) -> None:
+    """Invariante (J0026): un hueco placa/fregadero debe caer ÍNTEGRO dentro
+    del polígono de su pieza. Si no cabe: 1) se prueba girado 90° (el
+    fregadero va A LO LARGO del brazo), 2) se desliza a lo largo del frente
+    conservando la distancia perpendicular (regla 80mm); si nada lo mete →
+    advertencia. Los huecos con marca roja del operador no se mueven (la
+    marca es autoritativa): solo se avisa de la inconsistencia."""
+    import math as _math
+    MARGEN_BORDE = 2.0
+    procesados = set()
+    for enc in trabajo.piezas:
+        if enc.tipo not in ('encimera', 'isla') or not enc.vertices_mm \
+                or len(enc.vertices_mm) < 3:
+            continue
+        verts = enc.vertices_mm
+        zona_tokens = ' '.join((enc.zona or '').lower().split()[:2])
+
+        def _dentro(cx, cy, l, a):
+            for sx in (-1.0, 0.0, 1.0):
+                for sy in (-1.0, 0.0, 1.0):
+                    px = cx + sx * (l / 2.0 - MARGEN_BORDE)
+                    py = cy + sy * (a / 2.0 - MARGEN_BORDE)
+                    if not _punto_en_poligono(px, py, verts):
+                        return False
+            return True
+
+        for h in trabajo.huecos:
+            if h.tipo not in ('placa', 'fregadero') or id(h) in procesados:
+                continue
+            if not (zona_tokens and zona_tokens in (h.pieza_zona or '').lower()):
+                continue
+            if h.centro_x_mm is None or h.centro_y_mm is None \
+                    or not h.largo_mm or not h.ancho_mm:
+                continue
+            procesados.add(id(h))
+            cx, cy = h.centro_x_mm, h.centro_y_mm
+            l, a = h.largo_mm, h.ancho_mm
+            if _dentro(cx, cy, l, a):
+                continue
+            if 'trazo rojo' in (h.notas or ''):
+                trabajo.advertencias.append(
+                    f"⚠ Hueco {h.tipo} con marca del operador NO cabe en "
+                    f"{(enc.zona or '?')[:35]} — revisar geometría o marca")
+                continue
+            arreglado = None
+            if _dentro(cx, cy, a, l):
+                arreglado = (cx, cy, a, l, 'girado 90°')
+            if arreglado is None:
+                # Deslizar por la arista vista (frente) más cercana,
+                # conservando la componente perpendicular (regla 80mm)
+                tipos_ar = getattr(enc, '_aristas_tipos', None) or []
+                mejor = None
+                for ar in tipos_ar:
+                    if ar['tipo'] == 'pared':
+                        continue
+                    p1, p2 = verts[ar['v1']], verts[ar['v2']]
+                    d = _dist_punto_a_segmento(cx, cy, p1[0], p1[1],
+                                               p2[0], p2[1])
+                    if mejor is None or d < mejor[0]:
+                        mejor = (d, p1, p2)
+                if mejor:
+                    _, p1, p2 = mejor
+                    ux, uy = p2[0] - p1[0], p2[1] - p1[1]
+                    L_ar = _math.hypot(ux, uy) or 1.0
+                    ux, uy = ux / L_ar, uy / L_ar
+                    for paso in range(1, int(L_ar / 25.0) + 1):
+                        for signo in (1, -1):
+                            s = signo * paso * 25.0
+                            for (ll, aa, et) in ((l, a, ''),
+                                                 (a, l, 'girado 90° y ')):
+                                if _dentro(cx + s * ux, cy + s * uy, ll, aa):
+                                    arreglado = (cx + s * ux, cy + s * uy,
+                                                 ll, aa,
+                                                 f'{et}deslizado '
+                                                 f'{abs(s):.0f}mm')
+                                    break
+                            if arreglado:
+                                break
+                        if arreglado:
+                            break
+            if arreglado is None:
+                trabajo.advertencias.append(
+                    f"⚠ Hueco {h.tipo} ({l:.0f}×{a:.0f}) NO cabe en "
+                    f"{(enc.zona or '?')[:35]} en ninguna posición — VERIFICAR")
+                continue
+            ncx, ncy, nl, na, como = arreglado
+            dx_, dy_ = ncx - cx, ncy - cy
+            h.centro_x_mm, h.centro_y_mm = round(ncx, 0), round(ncy, 0)
+            h.largo_mm, h.ancho_mm = nl, na
+            h.notas = ((h.notas or '')
+                       + f' [{como} para caber en la pieza]').strip()
+            trabajo.advertencias.append(
+                f"Postproc: hueco {h.tipo} {como} para caber en "
+                f"{(enc.zona or '?')[:35]}"
+                + (" — VERIFICAR posición lateral"
+                   if _math.hypot(dx_, dy_) > 300 else ""))
+            # El grifo acompaña a su fregadero (mantiene la alineación)
+            if h.tipo == 'fregadero' and (abs(dx_) > 1 or abs(dy_) > 1):
+                for g in trabajo.huecos:
+                    if (g.tipo == 'grifo' and g.centro_x_mm is not None
+                            and g.centro_y_mm is not None
+                            and _math.hypot(g.centro_x_mm - cx,
+                                            g.centro_y_mm - cy) <= 700):
+                        g.centro_x_mm = round(g.centro_x_mm + dx_, 0)
+                        g.centro_y_mm = round(g.centro_y_mm + dy_, 0)
+
+
 def _espejar_opciones(trabajo: TrabajoExtraido) -> None:
     """Cuando hay varias opciones de material (_opcion1/_opcion2…), las
     piezas físicas son LAS MISMAS en todas (misma cocina) — solo cambia el
@@ -3552,6 +3799,8 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
     # frontal repasado 3 veces) no debe crear piezas nuevas.
     intervalos_cubiertos = {}
     nuevas: list = []
+    frontal_trazos_totales = 0
+    frontales_consumidos_L: list = []
     geometrias = set()
     for enc in encimeras:
         geo = tuple(tuple(v) for v in enc.vertices_mm)
@@ -3634,6 +3883,8 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                 if not objetivos:
                     continue
                 usados.add(id(stroke_pix))
+                if tipo == 'frontal':
+                    frontal_trazos_totales += 1
                 objetivos_pendientes = list(objetivos)
                 # 1) ¿Queda una pieza de Claude en el pool que cubra este
                 # trazo? (match exacto ±20%, prefiriendo afinidad de zona)
@@ -3685,6 +3936,8 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                         key=lambda e: not _afin(e))
                     if candidatas:
                         pool[tipo].remove(candidatas[0])
+                        if tipo == 'frontal':
+                            frontales_consumidos_L.append(candidatas[0]['L'])
                         continue
                     # Zócalos: una pieza larga de Claude (cota del plano,
                     # p.ej. 4830 para toda la pared) cubre VARIOS tramos
@@ -3735,6 +3988,32 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                                     f"operador marcó chapeado ahí")
     if nuevas:
         trabajo.piezas.extend(nuevas)
+
+    # Red de seguridad anti-invención (J0026: chapeado 1000 de la península
+    # que Claude se inventó): si el operador SÍ marcó chapeados, un frontal
+    # de Claude cuya longitud no casa con NINGÚN trazo es sospechoso.
+    if frontal_trazos_totales:
+        avisadas = set()
+        for p in trabajo.piezas:
+            if p.tipo != 'frontal':
+                continue
+            notas_p = (p.notas or '').lower()
+            if 'postproc' in notas_p or 'espejad' in notas_p:
+                continue
+            L = p.longitud_ml or ((p.largo_mm or 0) / 1000.0)
+            if not L:
+                continue
+            clave = round(L, 1)
+            if clave in avisadas:
+                continue
+            if any(abs(L - Lc) <= max(0.2 * L, 0.1)
+                   for Lc in frontales_consumidos_L):
+                continue
+            avisadas.add(clave)
+            trabajo.advertencias.append(
+                f"⚠ Frontal {L:.2f}ml (alto {p.altura_mm or '?'}mm, "
+                f"{(p.zona or '?')[:35]}) SIN trazo del operador que lo "
+                f"respalde — verificar que existe en el plano")
 
 
 def _verificar_muesca_pilar(trabajo: TrabajoExtraido) -> None:
