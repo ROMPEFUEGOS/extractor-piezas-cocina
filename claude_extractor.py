@@ -3366,16 +3366,41 @@ def _clasificar_aristas_pixel(regs, encimera, mapa, tol_mm=250):
     n = len(poly)
 
     def _cobertura(lista_trazos, x1, y1, dx, dy, L2, L):
-        ts = []
+        # Longitud CUBIERTA real: unión de intervalos entre puntos
+        # CONSECUTIVOS del trazo que están cerca de la arista — el trazo
+        # solo cubre el tramo que RECORRE. El span max−min de proyecciones
+        # daba cobertura total a un trazo que RODEA la pieza y toca las dos
+        # esquinas sin recorrer la arista (J0026: el cian perimetral de la
+        # península forzaba 'vista' en la cabeza que va contra pared). Un
+        # trazo recto de solo 2 puntos a lo largo de la arista sigue
+        # cubriendo [0,1] (J0021/J0022: trazos de pared en línea).
+        intervalos = []
         for tr in lista_trazos:
+            prev_t = None
             for (px, py) in tr:
-                t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (L2 or 1)))
+                t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy)
+                                 / (L2 or 1)))
                 cxp, cyp = x1 + t * dx, y1 + t * dy
-                if _math.hypot(px - cxp, py - cyp) <= tol_px:
-                    ts.append(t)
-        return (max(ts) - min(ts)) * L if len(ts) >= 2 else 0.0
+                cerca = _math.hypot(px - cxp, py - cyp) <= tol_px
+                if cerca and prev_t is not None:
+                    intervalos.append((min(prev_t, t), max(prev_t, t)))
+                prev_t = t if cerca else None
+        if not intervalos:
+            return 0.0
+        intervalos.sort()
+        total = 0.0
+        cur_a, cur_b = intervalos[0]
+        for a, b in intervalos[1:]:
+            if a <= cur_b:
+                cur_b = max(cur_b, b)
+            else:
+                total += cur_b - cur_a
+                cur_a, cur_b = a, b
+        total += cur_b - cur_a
+        return total * L
 
     tipos = []
+    cian_cubre = []
     for i in range(n):
         k = mapa[i]
         x1, y1 = poly[k]
@@ -3386,9 +3411,35 @@ def _clasificar_aristas_pixel(regs, encimera, mapa, tol_mm=250):
         objetivo = min(300 / escala, 0.30 * L)
         if _cobertura(trazos_pulido, x1, y1, dx, dy, L2, L) >= objetivo:
             tipos.append('frontal')  # cian del operador = vista, sin discusión
+            cian_cubre.append(True)
             continue
+        cian_cubre.append(False)
         cobertura = _cobertura(trazos, x1, y1, dx, dy, L2, L)
         tipos.append('pared' if cobertura >= objetivo else 'frontal')
+
+    # Ticks de COPETE: una marca corta no alcanza el 30% de cobertura pero
+    # es una declaración deliberada de "esta arista va contra pared"
+    # (J0026: la cabeza de la península con tick naranja se pulía). Cada
+    # trazo de copete fuerza 'pared' en su arista más cercana, salvo que
+    # el cian del operador la reclame como vista.
+    for tr in (regs.get('copetes_pix') or []):
+        if not tr:
+            continue
+        cx = sum(p[0] for p in tr) / len(tr)
+        cy = sum(p[1] for p in tr) / len(tr)
+        best_i = None
+        best_d = float('inf')
+        for i in range(n):
+            k = mapa[i]
+            x1, y1 = poly[k]
+            x2, y2 = poly[(k + 1) % n]
+            d = _dist_punto_a_segmento(cx, cy, x1, y1, x2, y2)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        if (best_i is not None and best_d <= tol_px
+                and tipos[best_i] == 'frontal' and not cian_cubre[best_i]):
+            tipos[best_i] = 'pared'
     return tipos
 
 
