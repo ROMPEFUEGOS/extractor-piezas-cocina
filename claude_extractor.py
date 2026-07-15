@@ -2487,14 +2487,26 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                 cy = sum(p[1] for p in stroke) / len(stroke)
                 best_a = None
                 best_d = float('inf')
+                best_pared_d = float('inf')
                 for a in aristas:
                     p1 = encimera.vertices_mm[a['v1']]
                     p2 = encimera.vertices_mm[a['v2']]
                     d = _dist_punto_a_segmento(cx, cy, p1[0], p1[1], p2[0], p2[1])
+                    # Una arista PARED nunca se pule (J0026: el trazo cian
+                    # caía sobre la pared del chapeado 795) — el pulido solo
+                    # puede vivir en aristas vistas
+                    if a['tipo'] == 'pared':
+                        best_pared_d = min(best_pared_d, d)
+                        continue
                     if d < best_d:
                         best_d = d
                         best_a = a
                 if best_a is None or best_d > TOL_PERTENENCIA_MM:
+                    if best_pared_d <= TOL_PERTENENCIA_MM:
+                        trabajo.advertencias.append(
+                            f"Postproc [{zona_corta}]: trazo de pulido del "
+                            f"operador sobre arista PARED ignorado (las "
+                            f"paredes con chapeado no se pulen)")
                     continue
                 if best_a['idx'] in aristas_cubiertas:
                     continue
@@ -2513,6 +2525,7 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
         # está dentro de tolerancia). Marca la arista como cubierta para que
         # NO emita un pulido auto sobre la misma esquina.
         nuevos_ingletes_op = 0
+        ingletes_op_por_arista = {}  # idx → Canto emitido (reinterpretable)
         for stroke in ingletes_op_local:
             if not stroke or len(stroke) < 2:
                 continue
@@ -2536,12 +2549,14 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             # El trazo magenta SEÑALA la arista de unión; la longitud del
             # inglete es la de la arista (regla usuario: "va ingletado 1m de
             # la pata y 1m de la isla" = la cabeza), no la del trazo a mano.
-            trabajo.cantos.append(Canto(
+            canto_ing = Canto(
                 tipo='ingletado',
                 longitud_ml=round(best_a['len'] / 1000.0, 3),
                 notas=f"trazo magenta operador (arista idx={best_a['idx']}) "
                       f"en {zona_corta}",
-            ))
+            )
+            trabajo.cantos.append(canto_ing)
+            ingletes_op_por_arista[best_a['idx']] = canto_ing
             nuevos_ingletes_op += 1
 
         # ── Pulido por exclusión (regla universal) ──────────────────────
@@ -2845,8 +2860,21 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                                  - (vc[1] - vp[1]) * (vn[0] - vc[0]))
                         if cross * sentido >= 0:
                             continue  # esquina normal → a testa
-                        if i in op_inglete or j in op_inglete:
-                            continue  # el operador ya marcó ese inglete
+                        # Si el operador marcó inglete en una de las dos
+                        # aristas, su marca señala ESTA unión — pero el
+                        # inglete entre chapeados corre por la ALTURA de
+                        # los dos chapeados (2 cantos verticales), no por
+                        # el largo de la arista (J0026: 0.795 → 2×0.6)
+                        canto_op = (ingletes_op_por_arista.get(i)
+                                    or ingletes_op_por_arista.get(j))
+                        if canto_op is not None and canto_op in trabajo.cantos:
+                            trabajo.cantos.remove(canto_op)
+                            trabajo.advertencias.append(
+                                f"Postproc [{zona_corta}]: inglete del "
+                                f"operador reinterpretado — la unión de "
+                                f"chapeados en esquina va por su altura")
+                        elif i in op_inglete or j in op_inglete:
+                            continue  # inglete op de otra encimera/unión
                         hechas.add((i, j))
                         alt = max((p.altura_mm or 600.0)
                                   for p in (frontales_en_arista[i]
@@ -2873,10 +2901,12 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
             # la resta: J0025 2312=2760−448, J0026 corregido 2110=2410−300),
             # el reparto está resuelto → sin aviso.
             reparto_hecho = any(
-                abs((p.largo_mm or 0) - (c - (alto.largo_mm or 0))) <= 10
+                abs((p.largo_mm or 0) - (c - (alto.largo_mm or 0))) <= 25
                 for p in trabajo.piezas
                 if p.tipo == 'frontal' and (p.altura_mm or 600) < 800
-                for alto in altos for c in (cotas_propias or ()))
+                for alto in altos
+                for c in (list(cotas_propias or ())
+                          + [a['len'] for a in aristas_pared]))
             if altos and not reparto_hecho:
                 for a in aristas_pared:
                     chap = next(
