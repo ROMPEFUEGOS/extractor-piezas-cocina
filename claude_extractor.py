@@ -974,6 +974,21 @@ def parse_folder_name(folder_name: str) -> dict:
     return info
 
 
+def _mensaje_streaming(client, **kwargs):
+    """Llamada en streaming (obligatoria para max_tokens grandes): devuelve
+    el mensaje final completo. Fable/Opus razonan DENTRO del presupuesto de
+    salida, así que hace falta margen amplio."""
+    with client.messages.stream(**kwargs) as stream:
+        return stream.get_final_message()
+
+
+def _texto_respuesta(message) -> str:
+    """Texto de la respuesta ignorando bloques de thinking (Fable/Opus 4.7+
+    con razonamiento siempre activo devuelven ThinkingBlock delante)."""
+    return "".join(b.text for b in message.content
+                   if getattr(b, 'type', None) == 'text')
+
+
 def extract_json_from_response(text: str) -> Optional[dict]:
     """Extrae el JSON de la respuesta de Claude, con múltiples estrategias."""
     # 1. Bloques ```json ... ``` — el ÚLTIMO suele ser el resultado final
@@ -4218,13 +4233,14 @@ def extract_trabajo(
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            message = client.messages.create(
+            message = _mensaje_streaming(
+                client,
                 model=model,
-                max_tokens=8000,
+                max_tokens=32000,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": content}]
             )
-            response_text = message.content[0].text
+            response_text = _texto_respuesta(message)
             break
         except anthropic.RateLimitError as e:
             wait = 60 * (attempt + 1)
@@ -4262,9 +4278,10 @@ def extract_trabajo(
         if verbose:
             print(f"  No se encontró JSON válido, pidiendo conversión...")
         try:
-            message2 = client.messages.create(
+            message2 = _mensaje_streaming(
+                client,
                 model=model,
-                max_tokens=8000,
+                max_tokens=32000,
                 messages=[
                     {"role": "user", "content": content},
                     {"role": "assistant", "content": response_text},
@@ -4276,7 +4293,7 @@ def extract_trabajo(
                 ],
                 system=SYSTEM_PROMPT,
             )
-            response_text = message2.content[0].text
+            response_text = _texto_respuesta(message2)
             data = extract_json_from_response(response_text)
         except Exception as e:
             if verbose:
@@ -4301,11 +4318,12 @@ def extract_trabajo(
             print(f"  Resultado vacío, reintentando con PDFs prioritarios...")
         content2, archivos2 = build_claude_content(folder, verbose=False, max_pdfs=3)
         try:
-            msg2 = client.messages.create(
-                model=model, max_tokens=8000, system=SYSTEM_PROMPT,
+            msg2 = _mensaje_streaming(
+                client,
+                model=model, max_tokens=32000, system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": content2}]
             )
-            data2 = extract_json_from_response(msg2.content[0].text)
+            data2 = extract_json_from_response(_texto_respuesta(msg2))
             if data2 and data2.get('materiales'):
                 trabajo2 = json_to_trabajo(data2, folder_info, folder=folder)
                 trabajo2 = _limpiar_trabajo(trabajo2)
