@@ -145,8 +145,9 @@ Ejemplos:
                         help='Salida solo en formato JSON')
     parser.add_argument('--guardar', '-g', action='store_true',
                         help='Guardar resultados en archivos .json y .txt')
-    parser.add_argument('--model', '-m', default='claude-sonnet-4-6',
-                        help='Modelo de Claude (default: claude-sonnet-4-6)')
+    parser.add_argument('--model', '-m', default='claude-fable-5',
+                        help='Modelo de Claude (default: claude-fable-5; '
+                             'alternativa más barata: claude-opus-4-8)')
     parser.add_argument('--api-key', '-k', default=None,
                         help='API key de Anthropic (o usa ANTHROPIC_API_KEY env var)')
 
