@@ -3797,9 +3797,32 @@ def _validar_huecos_dentro(trabajo: TrabajoExtraido) -> None:
             if _dentro(cx, cy, l, a):
                 continue
             if 'trazo rojo' in (h.notas or ''):
-                trabajo.advertencias.append(
-                    f"⚠ Hueco {h.tipo} con marca del operador NO cabe en "
-                    f"{(enc.zona or '?')[:35]} — revisar geometría o marca")
+                # La marca es autoritativa, pero el pulso de la mano tiene
+                # ruido: si un empujón mínimo (≤30mm) lo mete entero, se
+                # aplica (J0033: fregadero asomando 4mm del frente). Solo
+                # si ni así cabe, se avisa.
+                empujado = False
+                for mag in (5.0, 10.0, 15.0, 20.0, 25.0, 30.0):
+                    for sx, sy in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                                   (-1, -1), (-1, 1), (1, -1), (1, 1)):
+                        if _dentro(cx + sx * mag, cy + sy * mag, l, a):
+                            h.centro_x_mm = round(cx + sx * mag, 0)
+                            h.centro_y_mm = round(cy + sy * mag, 0)
+                            h.notas = ((h.notas or '')
+                                       + f' [ajustado {mag:.0f}mm para '
+                                         f'caber]').strip()
+                            trabajo.advertencias.append(
+                                f"Postproc: hueco {h.tipo} (marca del "
+                                f"operador) ajustado {mag:.0f}mm para caber "
+                                f"en la pieza")
+                            empujado = True
+                            break
+                    if empujado:
+                        break
+                if not empujado:
+                    trabajo.advertencias.append(
+                        f"⚠ Hueco {h.tipo} con marca del operador NO cabe en "
+                        f"{(enc.zona or '?')[:35]} — revisar geometría o marca")
                 continue
             arreglado = None
             if _dentro(cx, cy, a, l):
@@ -4140,9 +4163,14 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                             continue
                     if L_ml < 0.1:
                         continue
+                    # Zócalos: tolerancia más ancha — el trazo recorre la
+                    # pared pero la cota de Claude suele ser el frente del
+                    # mueble (J0033: trazo 807 vs zócalo 970 → duplicado)
+                    tol_pool = (max(0.25 * L_ml, 0.15) if tipo == 'zocalo'
+                                else max(0.2 * L_ml, 0.1))
                     candidatas = sorted(
                         (e for e in pool[tipo]
-                         if e['L'] and abs(e['L'] - L_ml) <= max(0.2 * L_ml, 0.1)
+                         if e['L'] and abs(e['L'] - L_ml) <= tol_pool
                          and _compatible(e)),
                         key=lambda e: not _afin(e))
                     if candidatas:
