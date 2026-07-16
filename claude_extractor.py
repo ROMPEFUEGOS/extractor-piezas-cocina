@@ -985,7 +985,12 @@ def _mensaje_streaming(client, **kwargs):
     if effort:
         kwargs['output_config'] = {'effort': effort}
     with client.messages.stream(**kwargs) as stream:
-        return stream.get_final_message()
+        msg = stream.get_final_message()
+    if not any(getattr(b, 'type', None) == 'text' for b in msg.content):
+        print(f"  ⚠ Respuesta SIN TEXTO: stop_reason={msg.stop_reason}, "
+              f"output_tokens={msg.usage.output_tokens} — el razonamiento "
+              f"agotó el presupuesto o el modelo declinó")
+    return msg
 
 
 def _texto_respuesta(message) -> str:
@@ -3496,17 +3501,25 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
         zona_tokens = ' '.join((enc.zona or '').lower().split()[:2])
         huecos_enc = [h for h in trabajo.huecos
                       if zona_tokens and zona_tokens in (h.pieza_zona or '').lower()]
+        geos_unicas = {tuple(tuple(v) for v in p.vertices_mm)
+                       for p in trabajo.piezas
+                       if p.tipo in ('encimera', 'isla') and p.vertices_mm}
+        if len(geos_unicas) == 1:
+            # Una sola encimera física: TODOS los huecos son suyos aunque
+            # su pieza_zona no case textualmente (J0030: el fregadero decía
+            # 'tramo oeste' y quedaba fuera del matching de marcas)
+            huecos_enc = list(trabajo.huecos)
         if not huecos_enc:
             continue
         poly_pix = regs['polilinea_pix']
         usados = set()
         n_p = len(poly_pix)
+
+        # ── 1) Recolectar marcas válidas (pertenencia en píxel) ──────────
+        marcas = []
         for stroke_pix in regs['huecos_pix']:
             if not stroke_pix:
                 continue
-            # Pertenencia EN PÍXEL contra la polilínea de ESTA encimera (los
-            # trazos se comparten entre encimeras y la proyección bbox a
-            # mm-local puede plantar dentro un trazo que es de otra pieza).
             cx_p = sum(p[0] for p in stroke_pix) / len(stroke_pix)
             cy_p = sum(p[1] for p in stroke_pix) / len(stroke_pix)
             if not _punto_en_poligono(cx_p, cy_p, poly_pix):
@@ -3522,52 +3535,23 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
             if not mm or not mm[0]:
                 continue
             trazo = mm[0]
-            cx = sum(p[0] for p in trazo) / len(trazo)
-            cy = sum(p[1] for p in trazo) / len(trazo)
-
-            def _dist(h):
-                if h.centro_x_mm is None or h.centro_y_mm is None:
-                    return 1e9  # sin posición previa: se asigna el último
-                import math as _math
-                return _math.hypot(h.centro_x_mm - cx, h.centro_y_mm - cy)
-
-            libres = [h for h in huecos_enc if id(h) not in usados]
-            if not libres:
-                break
-            # Matching por TAMAÑO del trazo: un contorno grande es una
-            # placa/fregadero; una marca pequeña es grifo/enchufe/dosificador
-            # (la cercanía sola confundía el rectángulo del fregadero con el
-            # grifo que Claude había colocado al lado).
             xs_t = [p[0] for p in trazo]
             ys_t = [p[1] for p in trazo]
-            bw = max(xs_t) - min(xs_t)
-            bh = max(ys_t) - min(ys_t)
-            es_grande = bw >= 150 and bh >= 150
-            candidatos = [h for h in libres
-                          if (h.tipo in ('placa', 'fregadero')) == es_grande]
-            if es_grande and not candidatos:
-                continue  # un contorno grande JAMÁS reposiciona un grifo
+            marcas.append({
+                'cx': sum(xs_t) / len(xs_t), 'cy': sum(ys_t) / len(ys_t),
+                'bw': max(xs_t) - min(xs_t), 'bh': max(ys_t) - min(ys_t),
+            })
 
-            def _puntuacion(h):
-                # Preferir el hueco cuyas DIMENSIONES casan con el bbox del
-                # trazo (la distancia a la posición previa engaña si Claude
-                # la estimó mal o espejada); distancia solo como desempate.
-                if h.largo_mm and h.ancho_mm:
-                    return (abs(h.largo_mm - bw) + abs(h.ancho_mm - bh),
-                            _dist(h))
-                return (1e9, _dist(h))
-
-            h = min(candidatos or libres, key=_puntuacion)
+        def _aplicar_marca(m, h):
             usados.add(id(h))
+            cx, cy, bw, bh = m['cx'], m['cy'], m['bw'], m['bh']
             old = (h.centro_x_mm, h.centro_y_mm)
             h.centro_x_mm = round(cx, 0)
             h.centro_y_mm = round(cy, 0)
-            xs = [p[0] for p in trazo]
-            ys = [p[1] for p in trazo]
-            if not h.largo_mm and (max(xs) - min(xs)) >= 50:
-                h.largo_mm = round(max(xs) - min(xs), 0)
-            if not h.ancho_mm and (max(ys) - min(ys)) >= 50:
-                h.ancho_mm = round(max(ys) - min(ys), 0)
+            if not h.largo_mm and bw >= 50:
+                h.largo_mm = round(bw, 0)
+            if not h.ancho_mm and bh >= 50:
+                h.ancho_mm = round(bh, 0)
             h.notas = ((h.notas or '')
                        + ' [posición desde trazo rojo del operador]').strip()
             if old[0] is not None and abs(old[0] - cx) > 100:
@@ -3589,8 +3573,7 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
                     f"Postproc: hueco {h.tipo} girado 90° según la marca del "
                     f"operador ({h.largo_mm:.0f}×{h.ancho_mm:.0f})")
             # El grifo va DETRÁS del fregadero, hacia la pared REAL (la
-            # arista clasificada pared por los trazos del operador) — la
-            # convención Y de Claude puede estar invertida respecto al canvas
+            # arista clasificada pared por los trazos del operador)
             if h.tipo == 'fregadero':
                 grifo = next((g for g in huecos_enc
                               if g.tipo == 'grifo' and id(g) not in usados),
@@ -3611,13 +3594,11 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
                         cercana = min(paredes_largas, key=_d_arista)
                         p1 = enc.vertices_mm[cercana['v1']]
                         p2 = enc.vertices_mm[cercana['v2']]
-                        # Proyección del centro del fregadero sobre la pared
                         dx, dy = p2[0] - p1[0], p2[1] - p1[1]
                         L2 = dx * dx + dy * dy or 1
                         tt = max(0.0, min(1.0, ((cx - p1[0]) * dx
                                                 + (cy - p1[1]) * dy) / L2))
                         px_, py_ = p1[0] + tt * dx, p1[1] + tt * dy
-                        # Grifo a ~60mm de la pared, alineado con el fregadero
                         nx, ny = cx - px_, cy - py_
                         nn = _math.hypot(nx, ny) or 1
                         usados.add(id(grifo))
@@ -3626,6 +3607,68 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
                         grifo.notas = ((grifo.notas or '')
                                        + ' [recolocado detrás del fregadero '
                                          'hacia la pared clasificada]').strip()
+
+        # ── 2) Marcas GRANDES ↔ placa/fregadero: asignación GLOBAL óptima
+        # (J0030: placa y fregadero competían por el mismo rectángulo y el
+        # orden de trazo decidía; ahora gana el emparejamiento de coste
+        # mínimo probando todas las combinaciones — son ≤3×3)
+        import itertools as _it
+        grandes = [m for m in marcas if m['bw'] >= 150 and m['bh'] >= 150]
+        ticks = [m for m in marcas if m not in grandes]
+        h_grandes = [h for h in huecos_enc
+                     if h.tipo in ('placa', 'fregadero') and id(h) not in usados]
+        RUIDO_MM = 900.0
+
+        def _coste(m, h):
+            if h.largo_mm and h.ancho_mm:
+                directo = (abs(h.largo_mm - m['bw'])
+                           + abs(h.ancho_mm - m['bh']))
+                girado = (abs(h.largo_mm - m['bh'])
+                          + abs(h.ancho_mm - m['bw']))
+                return min(directo, girado)
+            return 500.0
+
+        if grandes and h_grandes:
+            k = min(len(grandes), len(h_grandes))
+            mejor = None
+            for ms in _it.permutations(grandes, k):
+                for hs in _it.combinations(h_grandes, k):
+                    c = sum(_coste(m, h) for m, h in zip(ms, hs))
+                    if mejor is None or c < mejor[0]:
+                        mejor = (c, ms, hs)
+            if mejor:
+                for m, h in zip(mejor[1], mejor[2]):
+                    if _coste(m, h) > RUIDO_MM:
+                        trabajo.advertencias.append(
+                            f"Postproc: marca roja de {m['bw']:.0f}×"
+                            f"{m['bh']:.0f}mm ignorada — no casa con ningún "
+                            f"hueco (¿anotación/círculo del plano?)")
+                        continue
+                    _aplicar_marca(m, h)
+
+        # ── 3) TICKS (marcas puntuales) → enchufes; el grifo se deriva del
+        # fregadero (recolocación), no de ticks, salvo que no haya enchufes
+        # en el trabajo (J0030: los dos ticks eran enchufes en el frontal y
+        # uno se tragó al grifo)
+        hay_enchufes = any(h.tipo == 'enchufe' for h in trabajo.huecos)
+        for m in ticks:
+            enchufe = next((h for h in huecos_enc
+                            if h.tipo == 'enchufe' and id(h) not in usados
+                            and h.centro_x_mm is None), None)
+            if enchufe is not None:
+                _aplicar_marca(m, enchufe)
+                continue
+            if not hay_enchufes:
+                pequeno = next((h for h in huecos_enc
+                                if h.tipo in ('grifo', 'dosificador')
+                                and id(h) not in usados), None)
+                if pequeno is not None:
+                    _aplicar_marca(m, pequeno)
+                    continue
+            trabajo.advertencias.append(
+                f"Postproc: marca puntual del operador en "
+                f"({m['cx']:.0f},{m['cy']:.0f}) sin hueco libre al que "
+                f"asignarse — ¿enchufe adicional? VERIFICAR")
 
 
 def _ajustar_profundidad_huecos(trabajo: TrabajoExtraido) -> None:
@@ -4355,7 +4398,7 @@ def extract_trabajo(
             message = _mensaje_streaming(
                 client,
                 model=model,
-                max_tokens=32000,
+                max_tokens=64000,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": content}]
             )
@@ -4400,7 +4443,7 @@ def extract_trabajo(
             message2 = _mensaje_streaming(
                 client,
                 model=model,
-                max_tokens=32000,
+                max_tokens=64000,
                 messages=[
                     {"role": "user", "content": content},
                     {"role": "assistant", "content": response_text},
@@ -4439,7 +4482,7 @@ def extract_trabajo(
         try:
             msg2 = _mensaje_streaming(
                 client,
-                model=model, max_tokens=32000, system=SYSTEM_PROMPT,
+                model=model, max_tokens=64000, system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": content2}]
             )
             data2 = extract_json_from_response(_texto_respuesta(msg2))
