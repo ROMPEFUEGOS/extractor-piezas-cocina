@@ -675,6 +675,75 @@ def generar_dxf(json_path: Path, output_path: Path):
             print(f"    {tipo.upper():10s}  {w:.0f} × {h:.0f} mm   {zona}")
 
 
+def _imagen_plano_anotado(carpeta):
+    """Devuelve (PIL.Image) de la página clasificada 'plano-anotado' del
+    proyecto, o None si no se puede localizar/convertir."""
+    import json as _json
+    from pathlib import Path as _P
+    carpeta = _P(carpeta)
+    clas = carpeta / 'clasificacion.json'
+    try:
+        d = _json.loads(clas.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    for nombre, info in (d.get('archivos') or {}).items():
+        for pag in (info.get('paginas') or []):
+            if pag.get('categoria') != 'plano-anotado':
+                continue
+            f = carpeta / nombre
+            if not f.exists():
+                continue
+            try:
+                if f.suffix.lower() == '.pdf':
+                    from pdf2image import convert_from_path
+                    n = pag.get('pagina', 1)
+                    imgs = convert_from_path(str(f), dpi=150,
+                                             first_page=n, last_page=n)
+                    return imgs[0] if imgs else None
+                from PIL import Image
+                return Image.open(f)
+            except Exception:
+                return None
+    return None
+
+
+def generar_pdf_documento(dxf_path, salida_pdf=None):
+    """Documento PDF junto al DXF: página 1 = plano anotado del proyecto
+    (si se localiza), página 2 = 'export' del DXF con TODAS las piezas tal
+    cual están diseñadas (líneas blancas sobre negro, como un visor CAD)."""
+    from pathlib import Path as _P
+    dxf_path = _P(dxf_path)
+    if salida_pdf is None:
+        salida_pdf = dxf_path.with_name(dxf_path.stem + '_documento.pdf')
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    import ezdxf as _ez
+    from ezdxf.addons.drawing import RenderContext, Frontend
+    from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+
+    A4_APAISADO = (11.69, 8.27)
+    with PdfPages(str(salida_pdf)) as pdf:
+        img = _imagen_plano_anotado(dxf_path.parent)
+        if img is not None:
+            fig = plt.figure(figsize=A4_APAISADO)
+            ax = fig.add_axes([0.01, 0.01, 0.98, 0.98])
+            ax.axis('off')
+            ax.imshow(img)
+            pdf.savefig(fig)
+            plt.close(fig)
+        doc = _ez.readfile(str(dxf_path))
+        fig = plt.figure(figsize=A4_APAISADO)
+        ax = fig.add_axes([0, 0, 1, 1])
+        ctx = RenderContext(doc)
+        backend = MatplotlibBackend(ax)
+        Frontend(ctx, backend).draw_layout(doc.modelspace(), finalize=True)
+        pdf.savefig(fig, facecolor=fig.get_facecolor())
+        plt.close(fig)
+    return salida_pdf
+
+
 def main():
     parser = argparse.ArgumentParser(description='Genera DXF desde JSON de extracción')
     parser.add_argument('json', help='Ruta al archivo _extraccion.json')
@@ -692,6 +761,11 @@ def main():
         output_path = json_path.parent / (json_path.stem.replace('_extraccion', '') + '.dxf')
 
     generar_dxf(json_path, output_path)
+    try:
+        pdf = generar_pdf_documento(output_path)
+        print(f"  Documento PDF: {pdf}")
+    except Exception as e:
+        print(f"  [WARN] No se pudo generar el PDF de documento: {e}")
 
 
 if __name__ == '__main__':
