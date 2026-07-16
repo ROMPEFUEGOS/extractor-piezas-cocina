@@ -174,6 +174,14 @@ Emite UN único objeto `encimera` con `vertices_mm` que recorra todo el contorno
 Ej: `[[0,0],[3870,0],[3870,280],[4415,280],[4415,600],[0,600]]` para una L donde
 el saliente continúa al final con fondo 280mm.
 
+**HUECOS — NUNCA OMITIR POR POSICIÓN DESCONOCIDA (regla de taller, J0034)**:
+si el trabajo lleva un hueco (placa, fregadero, grifo) pero no encuentras su
+posición, EMÍTELO igualmente con posición estimada (regla de los 80mm del
+frente + lateral plausible del render/módulo) y dilo en notas como estimado.
+Si se añade el fregadero estimado, la placa también (y viceversa) — solo se
+omite un hueco cuando NO existe en el trabajo (p.ej. cocina de hierro exenta
+→ sin placa; plantilla con '-').
+
 **COCINA DE HIERRO/LEÑA EXENTA (regla de taller, J0034)**: si el plano o los
 renders muestran una cocina de hierro encastrada entre muebles (range cooker):
 NO lleva hueco de placa en la encimera; el canto de la encimera que pega
