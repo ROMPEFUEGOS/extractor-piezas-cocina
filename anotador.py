@@ -1000,7 +1000,7 @@ async function guardarPaginaActual(tieneTrazos) {
     // (verificación de muesca en la encimera).
     const tipos_con_puntos = new Set(
         ['pared', 'muebles_altos', 'copete', 'pulido', 'inglete',
-         'frontal', 'zocalo', 'pilar', 'hueco']);
+         'frontal', 'zocalo', 'pilar', 'hueco', 'costado']);
     const persistir_puntos = t.tipo === 'poly'
         || tipos_con_puntos.has(t.tipo_pieza);
     if (persistir_puntos) {

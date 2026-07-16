@@ -1628,6 +1628,7 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
     ingletes_pix = []
     frontales_pix = []
     zocalos_pix = []
+    costados_pix = []
     pilares_pix = []
     huecos_pix = []
     for pid, pdata in (anot.get("paginas_anotadas") or {}).items():
@@ -1663,6 +1664,8 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
                 frontales_pix.append(pts)
             elif tipo == "zocalo":
                 zocalos_pix.append(pts)
+            elif tipo == "costado":
+                costados_pix.append(pts)
             elif tipo == "pilar":
                 pilares_pix.append(pts)
             elif tipo == "hueco":
@@ -1716,6 +1719,7 @@ def _cargar_paredes_y_muebles_altos(folder, trabajo: TrabajoExtraido) -> None:
             'ingletes_pix': ingletes_pix,
             'frontales_pix': frontales_pix,
             'zocalos_pix': zocalos_pix,
+            'costados_pix': costados_pix,
             'pilares_pix': pilares_pix,
             'huecos_pix': huecos_pix,
         }
@@ -3969,7 +3973,7 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
     import math as _math
     TOL_PERTENENCIA_MM = 400
     TIPOS = (('copetes_pix', 'copete'), ('zocalos_pix', 'zocalo'),
-             ('frontales_pix', 'frontal'))
+             ('frontales_pix', 'frontal'), ('costados_pix', 'costado'))
 
     encimeras = [p for p in trabajo.piezas
                  if p.tipo in ('encimera', 'isla') and p.vertices_mm
@@ -3991,7 +3995,7 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
         for m in trabajo.materiales:
             if m.rol and tipo in m.rol.lower() and m.altura_cm:
                 return float(m.altura_cm) * 10.0
-        return {'copete': 50.0, 'zocalo': 60.0}[tipo]
+        return {'copete': 50.0, 'zocalo': 60.0, 'costado': 900.0}[tipo]
 
     def _material_rol(tipo, enc):
         for m in trabajo.materiales:
@@ -4216,6 +4220,19 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                         f"Postproc: añadido {tipo} {L_ml}ml desde trazo del "
                         f"operador en {zona_corta} (arista idx={best_i})")
                     if tipo == 'frontal':
+                        # ¿Tramo de un paño mayor? Un frontal de Claude más
+                        # largo que la arista (el paño sigue más allá de la
+                        # encimera — J0034: 2490 en pared con arista de 1400)
+                        # no casa por tolerancia y este auto podría ser un
+                        # DUPLICADO de su tramo — avisar, no suprimir
+                        mayor = next((e for e in pool[tipo]
+                                      if e['L'] > L_ml + 0.3), None)
+                        if mayor is not None:
+                            trabajo.advertencias.append(
+                                f"⚠ Frontal auto de {L_ml:.2f}ml (arista "
+                                f"idx={best_i}) coexiste con frontal de "
+                                f"{mayor['L']:.2f}ml sin arista propia — "
+                                f"¿tramo del mismo paño? VERIFICAR duplicado")
                         # Un chapeado en esta arista anula el copete que el
                         # copete-por-exclusión emitió ANTES de conocer este
                         # trazo (copete y frontal son excluyentes — J0026)
