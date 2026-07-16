@@ -174,6 +174,12 @@ Emite UN único objeto `encimera` con `vertices_mm` que recorra todo el contorno
 Ej: `[[0,0],[3870,0],[3870,280],[4415,280],[4415,600],[0,600]]` para una L donde
 el saliente continúa al final con fondo 280mm.
 
+**VUELO DE LA ENCIMERA (regla de taller)**: las cotas de fondo del plano
+suelen acotar el MUEBLE, y la encimera vuela ~15-20mm por delante. Si una
+cota de fondo es de mueble (350, 600...), el fondo real de la encimera es
+cota + vuelo (365, 615-620). Aplícalo al construir la geometría y dilo en
+notas (ej. J0030: barra acotada 350 → encimera 365).
+
 **CHAPEADOS — REGLAS POR ZONA**:
 - **Zona con muebles altos**: chapeado de altura ≈ 600mm (espacio entre encimera
   y muebles altos, típico). Largo = largo de la pared cubierta por muebles bajos.
