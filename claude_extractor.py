@@ -174,6 +174,15 @@ Emite UN único objeto `encimera` con `vertices_mm` que recorra todo el contorno
 Ej: `[[0,0],[3870,0],[3870,280],[4415,280],[4415,600],[0,600]]` para una L donde
 el saliente continúa al final con fondo 280mm.
 
+**COCINA DE HIERRO/LEÑA EXENTA (regla de taller, J0034)**: si el plano o los
+renders muestran una cocina de hierro encastrada entre muebles (range cooker):
+NO lleva hueco de placa en la encimera; el canto de la encimera que pega
+contra ella va PULIDO (se deja junta de ~5mm por el calor y queda vista); y
+el hueco lateral entre los muebles de madera y la cocina se tapa con frentes
+estrechos (~100mm) del material, a veces con aislamiento. Señales: dos
+piezas estrechas de ~100mm con un hueco entre ellas, o una cocina negra
+exenta en los renders.
+
 **VUELO DE LA ENCIMERA (regla de taller)**: las cotas de fondo del plano
 suelen acotar el MUEBLE, y la encimera vuela ~15-20mm por delante. Si una
 cota de fondo es de mueble (350, 600...), el fondo real de la encimera es
