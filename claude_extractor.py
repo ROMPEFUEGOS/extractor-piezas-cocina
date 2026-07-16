@@ -232,6 +232,11 @@ debajo de muebles altos sin encimera) lleva rodapié. Detectar TODAS las zonas:
   del mueble bajo (típico 600mm) × altura zócalo (100mm).
 - Si el plano marca "ZOCALO 3318ml" pero el largo de encimera es solo 3870mm,
   los 3318 indican zócalo CONTINUO de varios tramos. Listar cada tramo distinto.
+- NO OLVIDES (fallos reales en modo autónomo, J0028): el zócalo de CABEZA
+  vista (largo = fondo del mueble, ~600) cuando el mueble bajo remata en un
+  extremo abierto, y el zócalo BAJO COLUMNAS/muebles altos que llegan al
+  suelo aunque esa pared no tenga encimera (busca sus cotas en el plano;
+  excluye el hueco del frigorífico).
 
 **COPETES — REGLA ESTRICTA**:
 - Una zona con frontal (chapeado) NO lleva copete. NUNCA emites ambos para la
@@ -3056,6 +3061,10 @@ def _completar_ingletes_implicitos(trabajo: TrabajoExtraido) -> None:
     fondos = [p.ancho_mm for p in trabajo.piezas
               if p.tipo == 'encimera' and p.ancho_mm]
     fondo_ref_m = (max(set(fondos), key=fondos.count) / 1000.0) if fondos else 0.6
+    # El "ancho" del bbox NO es el fondo en encimeras en L/J (J0028 crudo:
+    # bbox 2463×4150 → inglete fantasma de 4.15ml). Un fondo de encimera
+    # real nunca pasa de ~0.7m
+    fondo_ref_m = min(fondo_ref_m, 0.7)
 
     nuevos: list[Canto] = []
     for c in trabajo.cantos:
