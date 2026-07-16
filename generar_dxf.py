@@ -319,6 +319,10 @@ def _dibujar_huecos_pieza(msp, datos: dict, pieza: dict, x_off: float, y_off: fl
         if hueco_owner is not None and hueco_owner.get(id(h)) != zona_pza:
             continue
         tipo = h.get('tipo', 'hueco')
+        if tipo == 'enchufe':
+            # Los enchufes van en el chapeado (pared), nunca cortados en la
+            # encimera — se listan en el cajetín pero no se dibujan aquí
+            continue
         hw = h.get('largo_mm') or HUECOS_DEFAULT.get(tipo, (100, 100))[0]
         hh = h.get('ancho_mm') or HUECOS_DEFAULT.get(tipo, (100, 100))[1]
         # Coords con inversión Y (igual que polígono)

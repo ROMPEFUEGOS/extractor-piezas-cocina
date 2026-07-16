@@ -2645,9 +2645,11 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                     return True
                 return zona_tokens and zona_tokens in (p.zona or '').lower()
 
-            # Aristas pared cubiertas por CHAPEADO (frontal): alimenta el
-            # inglete automático de esquinas reflejas (J0026: 795/225)
+            # Aristas pared cubiertas por CHAPEADO (frontal) o COPETE:
+            # alimentan el inglete automático de esquinas reflejas
+            # (J0026: chapeados 795/225; J0030: copetes del pilar 200/200)
             frontales_en_arista: dict = {}
+            copetes_en_arista: dict = {}
 
             for suf in sufijos:
                 def _de_opcion(p):
@@ -2722,6 +2724,8 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                                 pool.remove(match)
                                 if match[1].tipo == 'copete':
                                     copetes_consumidos_global.add(id(match[1]))
+                                    copetes_en_arista.setdefault(
+                                        a['idx'], []).append(match[1])
                                 elif match[1].tipo == 'frontal':
                                     frontales_en_arista.setdefault(
                                         a['idx'], []).append(match[1])
@@ -2761,6 +2765,8 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                                     a['idx'], []).append(p)
                             if p.tipo == 'copete':
                                 copetes_consumidos_global.add(id(p))
+                                copetes_en_arista.setdefault(
+                                    a['idx'], []).append(p)
                                 if len(mejor_sub[1]) == 1:
                                     L_arista = round(a['len'] / 1000.0, 3)
                                     if abs((p.longitud_ml or 0) - L_arista) > 0.005:
@@ -2838,22 +2844,35 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                                 f"fantasma {round(L_p / 1000.0, 3)}ml{suf or ''} "
                                 f"— reclama una arista vista/pulida")
 
-            # Inglete automático entre chapeados que doblan una esquina
-            # REFLEJA (escalón/columna — J0026: 795/225). En una esquina
-            # normal de cocina (90° interior) los chapeados se juntan a
-            # testa, sin inglete: solo la esquina que ENVUELVE material
-            # (ángulo interior 270°) deja canto visto que se ingleta.
-            if frontales_en_arista and len(encimera.vertices_mm) >= 3:
+            # Inglete automático entre chapeados (o entre copetes) que
+            # doblan una esquina REFLEJA (escalón/columna/pilar — J0026:
+            # chapeados 795/225; J0030: copetes del pilar 200/200). En una
+            # esquina normal de cocina (90° interior) se juntan a testa:
+            # solo la esquina que ENVUELVE material (270° interior) deja
+            # canto visto que se ingleta. El inglete corre por la ALTURA de
+            # cada pieza (2 cantos verticales) y se emite UNO POR PIEZA con
+            # su zona en la nota, para que el DXF lo dibuje sobre el
+            # chapeado/copete y no sobre la esquina de la encimera.
+            cobertura_esquina = {}
+            for idx_a, pzs in frontales_en_arista.items():
+                cobertura_esquina[idx_a] = ('chapeado', pzs)
+            for idx_a, pzs in copetes_en_arista.items():
+                cobertura_esquina.setdefault(idx_a, ('copete', pzs))
+            if cobertura_esquina and len(encimera.vertices_mm) >= 3:
                 verts_e = encimera.vertices_mm
                 sentido = 1 if _signed_area_2d(verts_e) > 0 else -1
                 por_idx = {a['idx']: a for a in aristas_pared}
                 op_inglete = {k for k in aristas_cubiertas
                               if k not in aristas_pulido_op}
                 hechas = set()
-                for i in sorted(frontales_en_arista):
-                    for j in sorted(frontales_en_arista):
+                for i in sorted(cobertura_esquina):
+                    for j in sorted(cobertura_esquina):
                         if j <= i or (i, j) in hechas:
                             continue
+                        cat_i, pzs_i = cobertura_esquina[i]
+                        cat_j, pzs_j = cobertura_esquina[j]
+                        if cat_i != cat_j:
+                            continue  # copete y chapeado no se ingletan entre sí
                         a1, a2 = por_idx.get(i), por_idx.get(j)
                         if not a1 or not a2:
                             continue
@@ -2873,8 +2892,7 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                             continue  # esquina normal → a testa
                         # Si el operador marcó inglete en una de las dos
                         # aristas, su marca señala ESTA unión — pero el
-                        # inglete entre chapeados corre por la ALTURA de
-                        # los dos chapeados (2 cantos verticales), no por
+                        # inglete corre por la ALTURA de las piezas, no por
                         # el largo de la arista (J0026: 0.795 → 2×0.6)
                         canto_op = (ingletes_op_por_arista.get(i)
                                     or ingletes_op_por_arista.get(j))
@@ -2883,23 +2901,24 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                             trabajo.advertencias.append(
                                 f"Postproc [{zona_corta}]: inglete del "
                                 f"operador reinterpretado — la unión de "
-                                f"chapeados en esquina va por su altura")
+                                f"{cat_i}s en esquina va por su altura")
                         elif i in op_inglete or j in op_inglete:
                             continue  # inglete op de otra encimera/unión
                         hechas.add((i, j))
-                        alt = max((p.altura_mm or 600.0)
-                                  for p in (frontales_en_arista[i]
-                                            + frontales_en_arista[j]))
-                        L_ing = round(2 * alt / 1000.0, 3)
-                        trabajo.cantos.append(Canto(
-                            tipo='ingletado', longitud_ml=L_ing,
-                            notas=f'unión chapeados en esquina refleja '
-                                  f'aristas idx={i}/{j} de {zona_corta}: '
-                                  f'2 cantos × {alt:.0f}mm (postproc)'))
+                        alt_def = 600.0 if cat_i == 'chapeado' else 50.0
+                        for pz in (pzs_i[0], pzs_j[0]):
+                            alt_p = pz.altura_mm or alt_def
+                            trabajo.cantos.append(Canto(
+                                tipo='ingletado',
+                                longitud_ml=round(alt_p / 1000.0, 3),
+                                notas=f'inglete de esquina en cabeza del '
+                                      f'{cat_i} «{(pz.zona or "?")[:45]}» '
+                                      f'(unión aristas idx={i}/{j}, '
+                                      f'postproc)'))
                         trabajo.advertencias.append(
-                            f"Postproc [{zona_corta}]: inglete {L_ing}ml "
-                            f"entre chapeados de aristas idx={i}/{j} "
-                            f"(esquina refleja)")
+                            f"Postproc [{zona_corta}]: inglete de esquina "
+                            f"entre {cat_i}s (aristas idx={i}/{j}, un "
+                            f"canto por pieza, por altura)")
 
             # Cabeza VISTA de chapeado se pule (Regla A, T5551 — J0028: el
             # frontis de 2463 termina en el extremo abierto de la cocina):
@@ -3559,13 +3578,14 @@ def _reposicionar_huecos_desde_trazos(trabajo: TrabajoExtraido) -> None:
                     f"Postproc: hueco {h.tipo} reposicionado por trazo del "
                     f"operador ({old[0]:.0f},{old[1]:.0f})→({cx:.0f},{cy:.0f}) "
                     f"en {enc.zona or '?'}")
-            # Orientación: si la marca del operador es claramente apaisada o
-            # vertical y contradice el largo×ancho del hueco, se gira 90°
-            # (J0024: fregadero en el brazo vertical dibujado girado)
+            # Orientación por COSTE de encaje: si el bbox de la marca casa
+            # mejor con el hueco girado 90°, se gira (J0024: fregadero del
+            # brazo vertical; J0030: placa apaisada que el umbral de aspecto
+            # del 15% dejaba pasar)
             if (h.largo_mm and h.ancho_mm and bw >= 50 and bh >= 50
-                    and abs(bw - bh) > 0.15 * max(bw, bh)
                     and abs(h.largo_mm - h.ancho_mm) > 10
-                    and (bw > bh) != (h.largo_mm > h.ancho_mm)):
+                    and (abs(h.largo_mm - bh) + abs(h.ancho_mm - bw) + 20
+                         < abs(h.largo_mm - bw) + abs(h.ancho_mm - bh))):
                 h.largo_mm, h.ancho_mm = h.ancho_mm, h.largo_mm
                 h.notas = ((h.notas or '')
                            + ' [girado 90° según marca del operador]').strip()
@@ -4079,6 +4099,14 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                     return True
 
                 for best_i, best_len, cov, t0, t1 in objetivos_pendientes:
+                    # Un CHAPEADO solo vive en una arista PARED: un trazo de
+                    # frontal cuya cola cae sobre una arista vista no crea
+                    # pieza (J0030: chapeado fantasma de 369 sobre el frente)
+                    if tipo == 'frontal':
+                        tipos_ar_enc = getattr(enc, '_aristas_tipos', None)
+                        if (tipos_ar_enc and best_i < len(tipos_ar_enc)
+                                and tipos_ar_enc[best_i]['tipo'] != 'pared'):
+                            continue
                     # ¿Garabato redundante? Si el tramo ya está cubierto en
                     # ≥70% por trazos anteriores de este tipo en esta arista
                     # (la marca se repasa varias veces), no genera nada.
