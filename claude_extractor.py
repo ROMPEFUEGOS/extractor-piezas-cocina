@@ -2802,6 +2802,28 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                                                    + f' [ajustado a arista '
                                                      f'{L_arista}ml]').strip()
                         continue
+                    # Paño CORRIDO — SOLO EN MODO AUTÓNOMO (sin trazos del
+                    # operador; con trazos, los frontales marcados ya
+                    # retiran el copete): un frontal más largo que esta
+                    # arista y sin arista propia (±150) recorre la pared y
+                    # la cubre como tramo (J0034 crudo: frontal 2490 en la
+                    # pared norte con arista de 1395 → copete fantasma).
+                    # Solo aristas largas (traseras): las cabezas
+                    # perpendiculares no pueden ser tramo de un paño.
+                    max_pared = max(x['len'] for x in aristas_pared)
+                    pano = next(
+                        ((L, p) for L, p in pool_frontales
+                         if fuente_clasificacion == 'claude'
+                         and a['len'] >= 0.4 * max_pared
+                         and L >= a['len'] - 150
+                         and not any(abs(L - a2['len']) <= 150
+                                     for a2 in aristas_pared)), None)
+                    if pano is not None:
+                        trabajo.advertencias.append(
+                            f"Postproc [{zona_corta}]: arista pared "
+                            f"idx={a['idx']} ({a['len']:.0f}mm) cubierta por "
+                            f"paño corrido de {pano[0]:.0f}mm — sin copete")
+                        continue
                     # La cobertura PARCIAL solo con FRONTALES: un chapeado
                     # por tramos es habitual (pilar), pero un copete de
                     # cabeza nunca es "tramo" de la trasera (J0021)
