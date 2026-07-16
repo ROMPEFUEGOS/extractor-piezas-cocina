@@ -977,7 +977,13 @@ def parse_folder_name(folder_name: str) -> dict:
 def _mensaje_streaming(client, **kwargs):
     """Llamada en streaming (obligatoria para max_tokens grandes): devuelve
     el mensaje final completo. Fable/Opus razonan DENTRO del presupuesto de
-    salida, así que hace falta margen amplio."""
+    salida, así que hace falta margen amplio.
+
+    EXTRACTOR_EFFORT (env var, opcional): low|medium|high|xhigh|max —
+    profundidad de razonamiento del modelo (default del modelo: high)."""
+    effort = os.environ.get('EXTRACTOR_EFFORT')
+    if effort:
+        kwargs['output_config'] = {'effort': effort}
     with client.messages.stream(**kwargs) as stream:
         return stream.get_final_message()
 
@@ -2890,6 +2896,32 @@ def _reconciliar_geometria_encimera(trabajo: TrabajoExtraido) -> None:
                             f"entre chapeados de aristas idx={i}/{j} "
                             f"(esquina refleja)")
 
+            # Cabeza VISTA de chapeado se pule (Regla A, T5551 — J0028: el
+            # frontis de 2463 termina en el extremo abierto de la cocina):
+            # si una arista con chapeado tiene una arista VECINA vista, la
+            # cabeza del chapeado queda expuesta en esa esquina → canto
+            # pulido de su altura.
+            if frontales_en_arista:
+                n_ar = len(encimera.vertices_mm)
+                tipo_por_idx = {a['idx']: a['tipo'] for a in aristas}
+                for i, chapas in frontales_en_arista.items():
+                    for vecina in ((i - 1) % n_ar, (i + 1) % n_ar):
+                        if tipo_por_idx.get(vecina, 'pared') == 'pared':
+                            continue
+                        alt_ch = max((p.altura_mm or 600.0) for p in chapas)
+                        L_cab = round(alt_ch / 1000.0, 3)
+                        marca = (f'cabeza vista de chapeado arista idx={i} '
+                                 f'lado idx={vecina}')
+                        if any(marca in (c.notas or '') for c in trabajo.cantos):
+                            continue
+                        trabajo.cantos.append(Canto(
+                            tipo='recto_pulido', longitud_ml=L_cab,
+                            notas=f'{marca} en {zona_corta}: extremo '
+                                  f'expuesto del frontis (postproc)'))
+                        trabajo.advertencias.append(
+                            f"Postproc [{zona_corta}]: pulido {L_cab}ml en "
+                            f"cabeza vista del chapeado (arista idx={i})")
+
             # Patrón "frontal alto parte la pared" (J0025: 600−243; J0026:
             # 2410−300): si existe un frontal ALTO y un chapeado estándar
             # mide EXACTAMENTE una arista pared completa, el reparto es
@@ -4023,6 +4055,12 @@ def _completar_piezas_desde_trazos(trabajo: TrabajoExtraido) -> None:
                         L_ml = round(best_len / 1000.0, 3)
                     else:
                         L_ml = round(cov / 1000.0, 3)
+                        # Cobertura corta y fraccional = cola del trazo
+                        # doblando la esquina hacia la arista vecina, no
+                        # una pieza (J0028: copete de 0.107 fantasma desde
+                        # el trazo del copete de la columna)
+                        if L_ml < 0.2:
+                            continue
                     if L_ml < 0.1:
                         continue
                     candidatas = sorted(
