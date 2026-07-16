@@ -3719,12 +3719,11 @@ def _ajustar_profundidad_huecos(trabajo: TrabajoExtraido) -> None:
         for h in trabajo.huecos:
             if h.tipo not in ('placa', 'fregadero'):
                 continue
-            if 'trazo rojo' in (h.notas or ''):
-                continue  # la marca del operador es exacta — no tocar
             if not (zona_tokens and zona_tokens in (h.pieza_zona or '').lower()):
                 continue
             if h.centro_x_mm is None or h.centro_y_mm is None:
                 continue
+            marcado = 'trazo rojo' in (h.notas or '')
             cx, cy = h.centro_x_mm, h.centro_y_mm
             mejor = None
             for a in frentes:
@@ -3745,6 +3744,12 @@ def _ajustar_profundidad_huecos(trabajo: TrabajoExtraido) -> None:
             # Dimensión del hueco a lo largo de la normal al frente
             profundidad = (h.ancho_mm if abs(ny) >= abs(nx) else h.largo_mm) or 400.0
             objetivo = MARGEN + profundidad / 2.0
+            if marcado and nn >= objetivo - 2:
+                # La marca del operador respeta el margen mínimo: su
+                # profundidad se conserva (solo se corrige si pega el hueco
+                # al frente — el croquis no está a escala y la profundidad
+                # de la marca no es fiable; la LATERAL siempre es suya)
+                continue
             nuevo_x = round(px_ + nx / nn * objetivo, 0)
             nuevo_y = round(py_ + ny / nn * objetivo, 0)
             if abs(nuevo_x - cx) < 5 and abs(nuevo_y - cy) < 5:
