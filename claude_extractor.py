@@ -391,105 +391,31 @@ Cuando hay un **pilar/columna** en la pared, la encimera lo rodea por sus caras 
 
 NO sumes los tramos del pilar en la encimera principal. Cada cara visible del pilar que lleve encimera = 1 pieza separada con `zona`: "lateral pilar izq", "lateral pilar dch", "frente pilar", etc.
 
-**📐 EJEMPLO REAL — CÓMO INTERPRETAR ENCIMERA EN L CON ZONA FINAL ESTRECHA**:
+**📐 FORMA REAL DE LA ENCIMERA Y FONDOS REDUCIDOS**:
 
-Caso real I007 (Dekton Avorio 1.2cm):
-- **MGR**: `Encimera 4.415 × 0.620 = 2.737m²` (bounding rectangle facturado)
-- **Plano de planta** muestra cocina en L con tramo principal y zona final con cota transversal "280" + cota longitudinal "545"
-- **Realidad**: 2 tramos:
-  - Tramo principal largo: 3870 × 620 mm
-  - Tramo final estrecho: 545 × 280 mm
-- **Verificación**: 3870 + 545 = 4415mm = MGR Longo ✓ (la merma de cortar la L explica la diferencia de área 2.737 - 2.552 = 0.185 m²)
-
-**Patrón general**:
-- Cuando ves "280", "300", "350", "400" como cota TRANSVERSAL en un extremo del plano → es un fondo reducido en esa zona.
-- El MGR Longo total = SUMA de largos de los tramos (no del bounding individual).
-- El MGR Ancho = ancho del tramo más ancho (típicamente 620), NO el ancho de los tramos estrechos.
-- Emite cada tramo como pieza separada con su `(largo, ancho)` real.
-
-**🔻 ZONAS ESTRECHAS / ESCALONES / ENTRADAS DE ARMARIO — DETECCIÓN OBLIGATORIA**:
-
-**Regla**: cada vez que el FONDO de la encimera cambia (de 620 a 280, de 620 a 400, etc), eso es un tramo nuevo. Cada combinación distinta de (fondo, largo) = pieza separada.
-
-**Cómo detectarlo en el plano**:
-- Si en el plano ves cotas como "280", "300", "350", "400", "450" cerca del borde de la encimera (especialmente en extremos o esquinas), son **fondos reducidos**. NO son orientativos. Son medidas reales del armario.
-- Si ves dos cotas juntas como "620" y "280" en zonas distintas del mismo tramo → la encimera tiene 2 sub-tramos con fondos distintos.
-- Cualquier cota menor que el fondo estándar 620mm que aparezca **transversalmente** (perpendicular al largo) en el plano = fondo reducido.
-
-**Patrones típicos**:
-- Encimera larga 4000mm con armario al final más estrecho: emite pieza1 (3500×620) + pieza2 (500×280).
-- Cocina en L con esquina de armario reducido: encimera_principal + encimera_esquina con fondo distinto.
-- Barra/península con vuelo: la barra suele tener fondo mayor (700-900mm) que la encimera estándar.
-
-**Nunca asumas fondo uniforme 620mm para toda la encimera** si el plano muestra cotas distintas. SUMA de todos los tramos × fondo correspondiente debe aproximar el m² del MGR.
-
-**📏 COMO INTERPRETAR EL MGR — ES EL RECTÁNGULO DE MATERIAL CONSUMIDO, NO LA FORMA REAL**:
-
-El MGR `Encimera 4.415 × 0.620` representa **el rectángulo de material que se consume / se cobra**, incluyendo las zonas que se cortan y tiran (el hueco de una L, la esquina de una U, etc). Ejemplo: para hacer una L de 3460×620 + 955×280 se parte de un rectángulo 4415×620 y se tira la parte que no se usa — pero se cobra el rectángulo entero.
-
-**Consecuencia clave**: el MGR NO describe la forma real. **El plano/plantilla es la ÚNICA fuente de forma.**
-
-**FUENTE DE VERDAD PARA FORMA = PLANO (planta 2D)**:
-- El **plano de planta 2D** (vista aérea, programa 2020) muestra las encimeras como polígonos reales con medidas por pared.
-- La **plantilla manuscrita** muestra los tramos con cotas anotadas a mano por pared/segmento.
-- Ambos superan al MGR en descripción de forma.
-
-**OBLIGACIÓN al procesar el plano**:
-1. Mira el plano con atención. Cuenta cuántas paredes/tramos tiene la encimera.
-2. Si la encimera rodea una esquina (L), si recorre 3 paredes (U), si tiene zona estrecha al final (entrada de armario menor fondo), si tiene entrante por un pilar → son FORMAS NO RECTANGULARES y requieren MÚLTIPLES piezas.
-3. **Cada tramo recto** del polígono real = 1 pieza. Ej: L → 2 piezas. U → 3 piezas. Rectángulo con final estrecho → 2 piezas.
-4. Las medidas en el plano son DEFINITIVAS. Si aparecen "3460" y "600" en paredes perpendiculares, son largo del tramo 1 y largo del tramo 2 — no son orientativas.
-5. El ancho de cada tramo también se lee del plano. Habitual 620mm, pero puede variar (ej: esquina a 280mm, zona estrecha final a 280mm).
-
-**Validación con MGR (pero NUNCA anular la forma del plano)**:
-- El área total de tus tramos debe ser ≤ área MGR (porque MGR incluye merma).
-- Puedes anotar en advertencias la diferencia como "cut-off de la L" o "material cortado en entrante".
-
-**Cuando emites 1 sola pieza**:
-- Solo si el plano muestra inequívocamente UNA pared rectangular única.
-- O es isla/península exenta rectangular.
-
-**REGLA IMPERATIVA**: ante duda entre "1 rectángulo" vs "2+ tramos", **SIEMPRE prefiere multi-tramo**. Es peor perder información de forma que sobrar.
-
-**🎯 PROPÓSITO DEL OUTPUT — IMPORTANTE para tomar decisiones**:
-Tu output NO se usa para hacer presupuestos (los presupuestos ya están hechos por el MGR humano). Tu output se usa para **NESTING**: calcular cuántas tablas hay que comprar y cómo se reparten las piezas. Para que el nesting funcione necesitamos las piezas REALES, no el rectángulo bounding del MGR.
-
-**REGLA DE COHERENCIA INTERNA — VERIFICACIÓN FINAL OBLIGATORIA**:
-Antes de emitir el JSON final, RE-LEE tus propias notas y advertencias. Si en cualquier punto dices "la forma es en L/U", "el plano muestra forma en L", "según plano hay península/barra", "hay tramos en paredes perpendiculares", "multi-tramo recomendado", "forma no rectangular", "TRASETA"/"TRASENA"/anotaciones de tramos, o cualquier otra observación que reconozca forma NO rectangular → **OBLIGATORIO** emitir multi-tramo.
-
-**NO es válido**:
-- ❌ Notas: "es L según plano" + emitir 1 rectángulo
-- ❌ Notas: "Geometría exacta de tramos no confirmada sin plano CAD preciso" + emitir 1 rectángulo
-- ❌ Notas: "Idealmente debería emitirse como N tramos separados pero las cotas exactas..." + emitir 1 rectángulo
-- ❌ Notas: "Sin cotas explícitas de cada brazo en el plano, se emite como pieza única" + emitir 1 rectángulo
-
-**SÍ es válido**:
-- ✓ Notas: "forma en L. Tramo largo y corto estimados proporcionalmente del dibujo (60%/40% del MGR total)" + emitir 2 piezas
-- ✓ Notas: "tramo norte y oeste leídos del plano: 287cm + 106cm" + emitir 2 piezas
-
-**Si no tienes cotas exactas**, ESTIMA por proporción del dibujo. Es preferible 2 tramos estimados (60/40 o 50/50) que 1 rectángulo monolítico que rompe el nesting. NUNCA escribas "ideal sería multi-tramo pero emito 1" — eso es inválido.
-
-Cuando emites multi-tramo y no hay cotas claras de cada tramo, usa estas reglas para estimar:
-- En L: si MGR dice "Longo 4415×0.620" y ves L en el plano, divide 4415 en 2 tramos: estima el largo de cada brazo proporcionalmente al dibujo (ej: 60% pared larga + 40% pared corta = 2650 + 1765).
-- En U: 3 tramos. Estima el del medio según dibujo (suele ser el más corto, que es la "panza" del U).
-- Anota `notas` que las medidas son ESTIMADAS por proporción del plano cuando no hay cota explícita.
-
-Casos típicos:
-- **Encimera en L**: 2 piezas, una por cada brazo. Ej: brazo largo 2500×620 + brazo corto 1400×620. Usa `zona` para distinguir ("tramo pared norte", "tramo pared oeste").
-- **Encimera en U**: 3 piezas, una por cada tramo.
-- **Entrante por pilar/columna**: si la pared tiene un pilar que hace que la encimera tenga un tramo más estrecho (ej: 280mm de fondo en vez de 620mm), emite ese tramo como pieza separada con el ancho real.
-- **Zona final más estrecha** (típica en esquinas con armarios de menor fondo): pieza separada con el ancho real (ej: final a 280mm).
-
-Cuando SÍ es una sola pieza:
-- Encimera puramente rectangular en una sola pared.
-- Isla/península exenta (una pieza única con su largo×ancho).
-
-**Verificación de áreas**: la suma de áreas de los tramos debe aproximarse al m² total del MGR (tolerancia ±5%). Si no cuadra, revisa las medidas. Si el MGR tiene 2.5m² y tus tramos suman 3.1m², has medido algo mal o hay solape.
-
-**Pistas en el plano**:
-- Medidas manuscritas en los extremos de cada pared (ej: "2.50", "1.90") indican tramos.
-- Cambios de fondo marcados (ej: "620" en tramo largo, "280" en tramo esquina).
-- Anotaciones como "L", "U", "pilar", "entrada de pilar", "armario corto".
+- Una encimera continua (L, U, G, con escalón, con entrante de pilar o con zona final
+  estrecha) es UN SOLO polígono: emite UNA pieza con `vertices_mm` que recorra todo el
+  contorno (ver REPRESENTACIÓN GEOMÉTRICA 2D). NO la dividas en rectángulos por tramo:
+  el reparto en sub-rectángulos lo hace después el programa de nesting. Emite piezas de
+  encimera separadas SOLO cuando físicamente están separadas (isla/península exenta,
+  encimera de otra zona o de otra opción de material).
+- Cuando el FONDO cambia (620 → 280/300/350/400/450) NO es una pieza nueva: son vértices
+  adicionales del mismo polígono. Las cotas transversales pequeñas (280, 300, 350, 400,
+  450) cerca de un extremo o esquina son fondos reducidos reales del mueble, no
+  orientativas. Nunca asumas fondo uniforme si el plano muestra cotas distintas.
+- Barra/península: suele tener fondo mayor (700-900) o acotado el mueble (350 → encimera
+  365 con vuelo). Si está físicamente unida a la encimera, forma parte del mismo polígono.
+- Las cotas del plano son DEFINITIVAS: si aparecen "3460" y "600" en paredes
+  perpendiculares son los largos de dos brazos de la misma L. Si falta una cota, derívala
+  por cierre del polígono (Σ por eje) o estímala por proporción del dibujo y dilo en `notas`.
+- Ejemplo real (I007, Dekton Avorio 1.2cm): L con tramo principal 3870×620 y zona final
+  545×280 → UN polígono `[[0,0],[3870,0],[3870,280],[4415,280],[4415,620],[0,620]]`
+  (largo total 4415, `largo_mm` 4415, `ancho_mm` 620), no dos piezas.
+- Coherencia interna obligatoria: si en `notas` o `advertencias` reconoces "forma en L/U",
+  "península", "zona estrecha" o "entrante", los `vertices_mm` deben reflejarlo (6, 8, 10
+  vértices…). Es inválido describir una L y emitir un rectángulo de 4 vértices.
+- Propósito del output: las piezas REALES, con su forma, para presupuestar y para el
+  nesting (cuántas tablas hacen falta y cómo se reparten). Nunca el rectángulo envolvente.
 
 ### Frontal (= Chapeado = Chapeado Pared)
 **IMPORTANTE**: "Frontal", "chapeado" y "chapeado pared" son EXACTAMENTE el mismo tipo de pieza.

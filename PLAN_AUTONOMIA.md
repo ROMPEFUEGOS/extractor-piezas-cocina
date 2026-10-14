@@ -156,7 +156,36 @@ ANTHROPIC_BASE_URL=<endpoint Anthropic-compatible de Qwen> ANTHROPIC_API_KEY=$QW
   ../datos/Cocimoble2025/J0028_* ../datos/Cocimoble2025/J0030_* ../datos/Cocimoble2025/J0033_* ../datos/Cocimoble2025/J0034_*
 ```
 
-y comparar el scoreboard con el de Fable sobre los mismos 4 proyectos. Riesgos a vigilar en
+y comparar el scoreboard con el de Fable sobre los mismos 4 proyectos.
+
+**Resultado (15/10/2026, fuentes limpias, qwen3.8-max, razonamiento activado):**
+
+| Proyecto | Fable jul | Qwen prompt viejo | Qwen prompt A4 | Excel: Fable / Qwen A4 |
+|---|---|---|---|---|
+| J0028 | 0,77 | 0,68 | 0,64 | 7/8 / 6/8 |
+| J0030 | 0,83 | 0,48 | 0,72 | 4/8 / 5/8 |
+| J0033 | 0,82 | 0,68 | 0,81 | 6/8 / 7/8 |
+| J0034 | 0,79 | 0,79 | 0,73 | 5/7 / 5/7 |
+| Media | 0,80 | 0,66 | 0,73 | |
+
+"Prompt A4" = sección multi-tramo (capa de abril, era MGR) sustituida por "Forma real de la encimera
+y fondos reducidos" (polígono único), commit del 15/10. Con ello Qwen emite la encimera como un solo
+polígono en J0028 (8 vértices), J0033 (L, 6) y J0034 (L, 6); J0030 (G con barra) sigue mal
+(2117×1700 frente a 2115×2150). Corridas únicas: hay varianza entre corridas (J0028/J0034 bajan
+0,04-0,05 sin cambio atribuible), así que las comparaciones finas necesitan 2-3 repeticiones.
+
+Huecos: 1,0 en los cuatro con ambos modelos. A nivel de conceptos facturables (Excel) Qwen iguala o
+supera a los crudos de Fable; a nivel de piezas pierde sobre todo por GEOMETRÍA: parte la encimera en
+rectángulos por tramo (J0033: 2600×600 + 1550×350 en vez de la L 1550×2600; J0030: tres rectángulos
+en vez de la G), que es la contradicción "multi-tramo vs polígono único" (hallazgo A4 de la auditoría:
+Qwen obedece la regla antigua, Fable la nueva). También omite el `acabado` del material y, en J0030,
+los frontales. Conclusión: Qwen vale como extractor de primer escalón a coste marginal cero (huecos 1,0; a nivel
+de Excel iguala a Fable; geometría correcta en 3 de 4 tras A4). Sus huecos restantes coinciden con
+los de Fable (copetes por exclusión, zócalos/frontales sin cota, J0030) más dos propios: omite el
+`acabado` del material y en J0028 parte los frontales con la regla de "zona sin muebles altos →
+H1000". Siguientes pasos del bucle (todos a coste cero con Qwen): `acabado` desde plantilla, aplicar
+el resto de la auditoría (structured outputs, MGR muerto, huecos duplicados) un cambio por corrida,
+y la capa vectorial para la forma. Riesgos a vigilar en
 esa prueba: `max_tokens=64000` y streaming (qwen-chat usa llamadas sin streaming; probar), el
 razonamiento de Qwen va activado por defecto y cuesta tokens (qwen-chat lo apaga con
 `thinking: {type: disabled}`; el extractor no lo envía, añadir un interruptor), bloques de
