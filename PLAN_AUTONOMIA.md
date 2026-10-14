@@ -124,6 +124,40 @@ regla de 80 mm; (A7) sin caché del prompt. Ahorro: 24.000 → ~18.000 tokens en
 con caché, ~0,19 $ menos por llamada. Aplicar en rama y medir con el banco, un cambio cada vez
 (A4, A6, división del prompt y ejemplo son cambios de comportamiento).
 
+## 2d. ¿Qwen en lugar de Claude? (pregunta de Fran, 14/10/2026)
+
+Qwen (plan de tokens, modelos qwen3.8-max / qwen3.7-max / qwen3.7-plus con visión, endpoint
+compatible con la API de Anthropic) tiene coste marginal ~0 dentro de la cuota mensual, así que
+es el candidato natural a **extractor de primer escalón** en la cascada (2b): Qwen extrae, Jev
+verifica por campo, y solo lo dudoso escala a Fable. Lo que sabemos (registro del toolkit,
+pruebas del 30/09): visión fiable para CONTENIDO (textos literales, presencia de elementos,
+estado); coordenadas en píxel NO fiables. Para este extractor eso significa:
+
+- Probablemente suficiente: campos de la plantilla manuscrita, clasificación de documentos
+  (sustituye a Haiku), lectura de cotas impresas en planos CAD limpios, materiales, huecos.
+- Dudoso: geometría del contorno a partir de la imagen (vértices en mm por cierre de cotas en
+  planos girados/escaneados) y cualquier salida en píxel (anotaciones sintéticas).
+- Irrelevante donde ya no hace falta visión: planos PDF vectoriales (capa 0 del plan).
+
+Decisión por datos, no por intuición: el extractor usa el SDK de Anthropic y lee
+`ANTHROPIC_BASE_URL`, así que se puede medir SIN cambiar código:
+
+```
+set -a; . ~/.config/fable/qwen.env; set +a      # exporta la clave del plan de Qwen
+ANTHROPIC_BASE_URL=<endpoint Anthropic-compatible de Qwen> ANTHROPIC_API_KEY=$QWEN_API_KEY \
+  .venv/bin/python bench_autonomo.py --model qwen3.8-max --salida bench_out/qwen \
+  ../datos/Cocimoble2025/J0028_* ../datos/Cocimoble2025/J0030_* ../datos/Cocimoble2025/J0033_* ../datos/Cocimoble2025/J0034_*
+```
+
+y comparar el scoreboard con el de Fable sobre los mismos 4 proyectos. Riesgos a vigilar en
+esa prueba: `max_tokens=64000` y streaming (qwen-chat usa llamadas sin streaming; probar), el
+razonamiento de Qwen va activado por defecto y cuesta tokens (qwen-chat lo apaga con
+`thinking: {type: disabled}`; el extractor no lo envía, añadir un interruptor), bloques de
+`thinking` en la respuesta (el extractor ya los ignora), tamaño del prompt (24k tokens) y de las imágenes, y la
+cuota mensual (cada proyecto son 60-100k tokens de entrada; la cuota se agotó el 14/10 y vuelve
+el 30/10/2026). Si Qwen iguala a Fable en materiales/huecos/tiras y solo pierde en contorno, el
+reparto queda: Qwen + capa vectorial/OpenCV para la forma, Fable solo como árbitro.
+
 ## 3. Secuencia propuesta
 
 | Fase | Entregable | Coste estimado |
