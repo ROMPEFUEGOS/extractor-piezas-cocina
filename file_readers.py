@@ -16,8 +16,12 @@ EXCEL_EXTENSIONS = {'.xlsx', '.xls'}
 TXT_EXTENSIONS = {'.txt'}
 
 # Archivos a ignorar
+# '_extraccion' cubre TODAS las salidas del propio extractor (_extraccion.json/.txt,
+# _extraccion_cruda*, _extraccion_validada*, batch_extraccion.json): si entran como
+# fuente, el modelo copia la extracción anterior en vez de leer los documentos
+# (contaminación detectada el 14/10/2026 en el banco autónomo).
 IGNORE_PATTERNS = {'.tmp', '.lnk', '.dat', 'winmail', '.log',
-                    '_extraccion.json', '_extraccion.txt', '_tablas.pdf',
+                    '_extraccion', 'divergencia', '_tablas.pdf',
                     '_tablas.json', '_tablas.txt', 'clasificacion.json'}
 
 
