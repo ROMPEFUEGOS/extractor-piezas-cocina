@@ -25,3 +25,6 @@ Cocimoble2026/
 
 # Modelos EasyOCR descargados (pesados)
 .EasyOCR/
+
+# Salidas del benchmark autónomo
+bench_out/
