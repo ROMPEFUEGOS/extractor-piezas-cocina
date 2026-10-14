@@ -17,6 +17,7 @@ Uso:
     Abre http://127.0.0.1:5050
 """
 
+import os
 import argparse
 import base64
 import io
@@ -45,11 +46,14 @@ def no_cache(response):
     response.headers["Expires"] = "0"
     return response
 
-# Roots por defecto: las 3 carpetas conocidas
+# Roots por defecto: las 3 carpetas conocidas, en datos/ junto al repo
+# (~/PresupuestosEncimeras/datos). Se puede cambiar con la variable EXTRACTOR_DATOS.
+_DATOS = Path(os.environ.get("EXTRACTOR_DATOS",
+                             Path(__file__).resolve().parent.parent / "datos"))
 ROOTS = [
-    Path("/home/kecojones/Documents/ProgramaDeAcotacionesDXF/Cocimoble2025"),
-    Path("/home/kecojones/Documents/ProgramaDeAcotacionesDXF/Cocimoble2026"),
-    Path("/home/kecojones/Documents/ProgramaDeAcotacionesDXF/ACyC Accesorios y cocinas"),
+    _DATOS / "Cocimoble2025",
+    _DATOS / "Cocimoble2026",
+    _DATOS / "ACyC Accesorios y cocinas",
 ]
 
 PALETA = [
