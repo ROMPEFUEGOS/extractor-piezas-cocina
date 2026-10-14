@@ -41,6 +41,13 @@ frente a 4,52 y 1,79. Conclusión: entre el JSON de piezas y el presupuesto falt
 **presupuestador** (JSON → líneas MGR: m² por tipo, ml de canto según material/grosor, huecos,
 enchufes). Hasta tenerla, el verificador Excel solo sirve para material y nº de huecos.
 
+**Contaminación por salidas propias (corregida el 14/10, commit en file_readers).** Los `.txt` de
+extracciones anteriores (`*_extraccion_cruda.txt`) entraban como fuente de texto: el modelo copiaba la
+extracción previa en vez de leer los documentos. Se detectó al medir Qwen (avisos idénticos a los de
+Fable de julio). Afecta también al crudo de J0034 de julio (existía un `_cruda.txt` previo). Regla:
+toda medida del banco debe hacerse con fuentes limpias; `should_ignore` ya excluye `_extraccion` y
+`divergencia` por subcadena, con test.
+
 **Crudo frente a validado (4 proyectos, 51 discrepancias, clasificadas con Jev).**
 hueco_estimado 21 (en su mayoría ruido de marco de coordenadas distinto + posiciones estimadas,
 irrelevantes para presupuestar), omisión de tiras sin cota 13 (zócalo bajo columnas, zócalo de
