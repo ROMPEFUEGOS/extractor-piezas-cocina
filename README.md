@@ -23,7 +23,9 @@ ExtractorPiezas/
 ## Requisitos
 
 ```bash
-pip install anthropic pdf2image easyocr openpyxl pdfplumber ezdxf python-docx
+pip install anthropic pdf2image rapidocr onnxruntime openpyxl pdfplumber ezdxf python-docx
+# EasyOCR queda como fallback opcional de OCR (si falla el OCR local):
+pip install easyocr
 # También necesario: poppler-utils (para pdf2image)
 sudo apt install poppler-utils
 ```
@@ -47,11 +49,14 @@ python generar_dxf.py "/ruta/J0297_extraccion.json"
 
 | Documento | Método | Notas |
 |-----------|--------|-------|
-| Plantilla marmolista (PDF manuscrito) | Imagen + EasyOCR | DPI 250 para mejor lectura |
+| Plantilla marmolista (PDF manuscrito) | Imagen 300 dpi + OCR local (PP-OCRv5) | Pista de cotas y letra manuscrita |
+| Plano CAD en PDF vectorial | texto des-girado con posiciones (plano_vectorial) + imagen 200 dpi | La capa de texto plana invierte las cotas (930 → "039"); plano_vectorial las recompone |
+| Plano escaneado (PDF imagen) | Imagen 300 dpi + OCR local (PP-OCRv5) | Un escaneo con capa OCR-texto sigue por la vía de imagen |
 | Presupuesto MGR (PDF digital) | Texto (pdfplumber) | ~80% menos tokens que imagen |
-| Plano 2020 (PDF digital) | Imagen | Contiene cotas y geometría |
 | Renders 3D (JPG/PNG) | Imagen | Confirma disposición y materiales |
 | Excel presupuesto | openpyxl texto | Estructurado como texto |
+
+Los PDF se enrutan por su **contenido** (`clasificar_pdf`: vectorial / digital / escaneado), nunca por su nombre. Las imágenes y páginas escaneadas llevan una pista de OCR local (RapidOCR, PP-OCRv5, sin red); con `EXTRACTOR_OCR=0` se desactivan todas las pistas de OCR.
 
 ## Empresas soportadas
 

@@ -1,5 +1,13 @@
 """
 Lectura y conversión de archivos: PDF → imágenes, XLSX, TXT.
+
+Los PDF se enrutan por su CONTENIDO (`clasificar_pdf`), nunca por su nombre:
+  * 'vectorial_plano' → cotas des-giradas de la capa de texto (plano_vectorial)
+    + imagen de las páginas a 200 dpi;
+  * 'digital_texto'   → solo texto (pdfplumber);
+  * 'escaneado'       → imagen a 300 dpi + pista de OCR local (plano_raster,
+    RapidOCR/PP-OCRv5; EasyOCR queda como fallback). `EXTRACTOR_OCR=0`
+    desactiva todas las pistas de OCR.
 """
 import base64
 import os
@@ -8,6 +16,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 import openpyxl
+
+import plano_vectorial
 
 # Extensiones soportadas
 IMG_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif'}
@@ -103,6 +113,94 @@ def run_easyocr_on_image(img) -> str:
         return '\n'.join(lines)
     except Exception as e:
         return f"[EasyOCR error: {e}]"
+
+
+def es_plantilla(nombre: str) -> bool:
+    """True si el nombre (en minúsculas) contiene 'plantilla' o
+    'presupuesto encimera' (plantillas manuscritas del marmolista).
+
+    Se usa SOLO para redacción/dpi, NUNCA para decidir texto vs imagen: el
+    enrutado de PDFs lo hace `clasificar_pdf` mirando el contenido. Un plano
+    CAD llamado "ENCIMERA 1 CLIENTE.pdf" ya NO se considera plantilla.
+    """
+    n = nombre.lower()
+    return 'plantilla' in n or 'presupuesto encimera' in n
+
+
+def _ocr_habilitado() -> bool:
+    """EXTRACTOR_OCR=0 desactiva todas las pistas de OCR (local y fallback)."""
+    return os.environ.get("EXTRACTOR_OCR") != "0"
+
+
+def _ocr_hint(img) -> str:
+    """Pista de OCR local de una imagen (plano_raster, RapidOCR/PP-OCRv5).
+
+    Import perezoso de plano_raster: importar file_readers no carga modelos.
+    Si el motor local falla (hint que empieza por "[OCR local error"),
+    degrada a EasyOCR con el formato antiguo "[EasyOCR ...]".
+    """
+    try:
+        import plano_raster  # noqa: import perezoso (no arrastra onnxruntime)
+        pista = plano_raster.ocr_hint_imagen(img)
+    except Exception as exc:
+        pista = f"[OCR local error: {exc}]"
+    if isinstance(pista, str) and pista.startswith("[OCR local error"):
+        texto_easy = run_easyocr_on_image(img)
+        return (f"[EasyOCR — texto detectado, úsalo como pista para leer la "
+                f"letra manuscrita]:\n{texto_easy}")
+    return pista
+
+
+def clasificar_pdf(path: Path, max_pages: int = 5) -> str:
+    """Clasifica un PDF por su CONTENIDO (no por su nombre) en tres rutas:
+
+      * 'vectorial_plano': alguna de las primeras `max_pages` páginas es un
+        plano vectorial (`plano_vectorial.es_plano_vectorial`: >= 100
+        primitivas de dibujo + caracteres). Sus cotas van como texto
+        des-girado (la extracción plana de pdfplumber las corrompe: 930 →
+        "039", COPETE → "ETEPOC").
+      * 'escaneado': sin capa de texto suficiente (equivalente a que
+        `pdf_extract_text` devuelva None) O la primera página está cubierta
+        >= 50% por imágenes ráster (un escaneo CON capa OCR-texto sigue
+        siendo un escaneo y debe ir por la vía de imagen + OCR).
+      * 'digital_texto': todo lo demás (PDF digital de texto corrido).
+
+    Ante cualquier excepción → 'escaneado' (vía imagen, la más segura).
+    Barato: abre el PDF con pdfplumber una sola vez.
+    """
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(path)) as pdf:
+            paginas = pdf.pages[:max_pages]
+            if not paginas:
+                return 'escaneado'
+            # 1) ¿Hay algún plano vectorial? (dibujo + texto en la misma página)
+            for page in paginas:
+                if plano_vectorial.es_plano_vectorial(page):
+                    return 'vectorial_plano'
+            # 2) ¿Escaneado? Mismo criterio que pdf_extract_text (>= 80
+            #    chars/página de media) o primera página cubierta por imágenes.
+            total_chars = 0
+            for page in paginas:
+                total_chars += len(page.extract_text() or '')
+            sin_texto = (total_chars / len(paginas)) < 80
+            pag1 = paginas[0]
+            area_pagina = float(pag1.width) * float(pag1.height)
+            cubierto = 0.0
+            if area_pagina > 0:
+                for imagen in (pag1.images or []):
+                    x0 = max(float(imagen.get("x0", 0.0)), 0.0)
+                    x1 = min(float(imagen.get("x1", 0.0)), float(pag1.width))
+                    top = max(float(imagen.get("top", 0.0)), 0.0)
+                    bottom = min(float(imagen.get("bottom", 0.0)), float(pag1.height))
+                    if x1 > x0 and bottom > top:
+                        cubierto += (x1 - x0) * (bottom - top)
+            if sin_texto or (cubierto / area_pagina) >= 0.5:
+                return 'escaneado'
+            # 3) PDF digital con capa de texto útil
+            return 'digital_texto'
+    except Exception:
+        return 'escaneado'
 
 
 def pdf_extract_text(path: Path, max_pages: int = 5, min_chars_per_page: int = 80) -> Optional[str]:
@@ -415,6 +513,35 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
             return f"[TIPO:{cat}]"
         return ""
 
+    def _anexar_imagen_pagina(pdf_path: Path, i: int, data: str, media_type: str) -> None:
+        """Vía de imagen común a todas las rutas de PDF: imagen de la página
+        i+1 (original) y, si el operador la anotó, el overlay aislado con su
+        explicación. Sin OCR aquí (la pista de OCR va aparte, si toca)."""
+        pagina_id = f"pdf::{pdf_path.name}::{i+1}"
+        overlay_solo = _overlay_solo_b64(pagina_id)
+        tag = _tag(pdf_path.name, pagina=i+1)
+        if overlay_solo:
+            # Tiene anotación: enviar 2 imágenes — original + overlay solo
+            content.append({"type": "text",
+                             "text": f"[Página {i+1} de '{pdf_path.name}' — IMAGEN ORIGINAL del plano] {tag}"})
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": media_type, "data": data}})
+            content.append({"type": "text",
+                             "text": (f"[Página {i+1} de '{pdf_path.name}' — OVERLAY DEL OPERADOR sobre fondo blanco]\n"
+                                      f"Esta imagen muestra ÚNICAMENTE los trazos del rotulador del operador. "
+                                      f"Las áreas blancas NO ESTÁN MARCADAS y por tanto NO existen como pieza física. "
+                                      f"Solo emite piezas en zonas con color en esta imagen. Usa la imagen original "
+                                      f"de arriba para leer las cotas exactas (mm).")})
+            ov_data, ov_mt = overlay_solo
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": ov_mt, "data": ov_data}})
+        else:
+            if tag:
+                content.append({"type": "text",
+                                 "text": f"[Página {i+1} de '{pdf_path.name}'] {tag}"})
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": media_type, "data": data}})
+
     segundas = [p for p, lbl in files['pdfs'] if lbl != 'Primeras']
     if verbose:
         omit_info = f", PDFs omitidos: {len(files['pdfs_omitidos'])}" if files['pdfs_omitidos'] else ""
@@ -635,21 +762,50 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
         })
         archivos.append(xl_path.name)
 
-    # 4. PDFs → texto (si digital) o imágenes (si escaneado)
+    # 4. PDFs → enrutado por CONTENIDO (clasificar_pdf), no por nombre:
+    #    vectorial (texto des-girado + imagen 200 dpi), digital (solo texto)
+    #    o escaneado (imagen 300 dpi + OCR local)
     for pdf_path, pdf_label in files['pdfs']:
         label_str = f" [{pdf_label}]" if pdf_label != 'Primeras' else ""
         label_header = f" — MEDIDAS REVISADAS ({pdf_label})" if pdf_label != 'Primeras' else ""
-        name_lower = pdf_path.name.lower()
 
-        # Plantillas manuscritas: siempre usar imágenes (escritura a mano, no digital)
-        is_handwritten = any(w in name_lower for w in ('plantilla', 'presupuesto encimera', 'encimera '))
+        ruta = clasificar_pdf(pdf_path)
 
-        # Intentar extracción de texto para PDFs no manuscritos
-        pdf_text = None
-        if not is_handwritten:
-            pdf_text = pdf_extract_text(pdf_path)
+        # Caso borde: clasificado como plano vectorial pero sin páginas de
+        # plano en el hint → tratarlo como escaneado.
+        hint_vectorial = plano_vectorial.hint_plano_vectorial(pdf_path) \
+            if ruta == 'vectorial_plano' else None
+        if ruta == 'vectorial_plano' and hint_vectorial is None:
+            ruta = 'escaneado'
 
-        if pdf_text:
+        # La extracción de texto sólo para la ruta digital (misma decisión
+        # que clasificar_pdf; si discrepan, manda la vía de imagen).
+        pdf_text = pdf_extract_text(pdf_path) if ruta == 'digital_texto' else None
+        if ruta == 'digital_texto' and not pdf_text:
+            ruta = 'escaneado'
+
+        if ruta == 'vectorial_plano':
+            # Plano CAD vectorial: cotas y etiquetas des-giradas de la capa de
+            # texto (pdfplumber plano las corrompe: 930 → "039") + el dibujo
+            # como imagen (200 dpi, misma vía de imagen/overlay de siempre).
+            n_cotas = hint_vectorial.count(" pt, giro")
+            if verbose:
+                print(f"  PDF vectorial: {pdf_path.name}{label_str} [{n_cotas} cotas]")
+            content.append({
+                "type": "text",
+                "text": (f"\n--- PDF VECTORIAL (cotas y textos extraídos de la capa de texto, "
+                         f"ya des-girados): {pdf_path.name}{label_header} ---\n{hint_vectorial}")
+            })
+            pages = pdf_pages_to_base64(pdf_path, dpi=200)
+            if pages:
+                content.append({
+                    "type": "text",
+                    "text": f"\n--- PDF: {pdf_path.name} ({len(pages)} páginas){label_header} ---"
+                })
+                for i, page_data in enumerate(pages):
+                    _anexar_imagen_pagina(pdf_path, i, page_data[0], page_data[1])
+                archivos.append(pdf_path.name)
+        elif ruta == 'digital_texto':
             # PDF digital con texto — enviar como texto (mucho más barato)
             if verbose:
                 print(f"  Texto PDF: {pdf_path.name}{label_str} [{len(pdf_text)} chars]")
@@ -659,66 +815,63 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
             })
             archivos.append(pdf_path.name)
         else:
-            # PDF escaneado o con elementos gráficos — usar imágenes
+            # PDF escaneado (o planta/foto) — imagen a 300 dpi + pista de OCR
+            # local por página (EasyOCR sólo como fallback dentro de _ocr_hint)
+            pages = pdf_pages_to_base64(pdf_path, dpi=300, return_pil=True)
             if verbose:
-                print(f"  Convirtiendo PDF: {pdf_path.name}{label_str}")
-            dpi = 250 if is_handwritten else 200
-            pages = pdf_pages_to_base64(pdf_path, dpi=dpi, return_pil=is_handwritten)
+                print(f"  PDF escaneado: {pdf_path.name}{label_str} "
+                      f"({len(pages)} páginas, OCR local)")
             if pages:
                 content.append({
                     "type": "text",
                     "text": f"\n--- PDF: {pdf_path.name} ({len(pages)} páginas){label_header} ---"
                 })
                 for i, page_data in enumerate(pages):
-                    if is_handwritten and isinstance(page_data, tuple) and len(page_data) == 3:
-                        data, media_type, pil_img = page_data
-                        # Pre-OCR con EasyOCR para ayudar a Claude con la letra manuscrita
+                    data, media_type = page_data[0], page_data[1]
+                    pil_img = page_data[2] if len(page_data) == 3 else None
+                    if pil_img is not None and _ocr_habilitado():
                         if verbose:
-                            print(f"    EasyOCR pág {i+1}...")
-                        ocr_text = run_easyocr_on_image(pil_img)
-                        if ocr_text:
-                            content.append({
-                                "type": "text",
-                                "text": f"[EasyOCR pág {i+1} — texto detectado, úsalo como pista para leer la letra manuscrita]:\n{ocr_text}"
-                            })
-                    else:
-                        data, media_type = page_data[0], page_data[1]
-                    pagina_id = f"pdf::{pdf_path.name}::{i+1}"
-                    overlay_solo = _overlay_solo_b64(pagina_id)
-                    tag = _tag(pdf_path.name, pagina=i+1)
-                    if overlay_solo:
-                        # Tiene anotación: enviar 2 imágenes — original + overlay solo
-                        content.append({"type": "text",
-                                         "text": f"[Página {i+1} de '{pdf_path.name}' — IMAGEN ORIGINAL del plano] {tag}"})
-                        content.append({"type": "image", "source": {
-                            "type": "base64", "media_type": media_type, "data": data}})
-                        content.append({"type": "text",
-                                         "text": (f"[Página {i+1} de '{pdf_path.name}' — OVERLAY DEL OPERADOR sobre fondo blanco]\n"
-                                                  f"Esta imagen muestra ÚNICAMENTE los trazos del rotulador del operador. "
-                                                  f"Las áreas blancas NO ESTÁN MARCADAS y por tanto NO existen como pieza física. "
-                                                  f"Solo emite piezas en zonas con color en esta imagen. Usa la imagen original "
-                                                  f"de arriba para leer las cotas exactas (mm).")})
-                        ov_data, ov_mt = overlay_solo
-                        content.append({"type": "image", "source": {
-                            "type": "base64", "media_type": ov_mt, "data": ov_data}})
-                    else:
-                        if tag:
-                            content.append({"type": "text",
-                                             "text": f"[Página {i+1} de '{pdf_path.name}'] {tag}"})
-                        content.append({"type": "image", "source": {
-                            "type": "base64", "media_type": media_type, "data": data}})
+                            print(f"    OCR local pág {i+1}...")
+                        pista = _ocr_hint(pil_img)
+                        content.append({
+                            "type": "text",
+                            "text": (f"[OCR local pág {i+1} de '{pdf_path.name}' — pista para "
+                                     f"leer cotas y letra manuscrita; las posiciones son "
+                                     f"píxeles de la imagen a 300 dpi]:\n{pista}")
+                        })
+                    _anexar_imagen_pagina(pdf_path, i, data, media_type)
                 archivos.append(pdf_path.name)
 
-    # 5. Imágenes directas
+    # 5. Imágenes directas (con pista de OCR local si son grandes)
     for img_path in files['images']:
         try:
             data, media_type = image_to_base64(img_path)
             pagina_id = f"img::{img_path.name}"
             overlay_solo = _overlay_solo_b64(pagina_id)
             tag = _tag(img_path.name)
+
+            # Pista de OCR local para imágenes con >= 400 px en el lado mayor
+            # (una miniatura no aporta nada y cuesta lo mismo). image_to_base64
+            # no devuelve la PIL, así que se abre una sola vez aquí.
+            pista_ocr = None
+            if _ocr_habilitado():
+                try:
+                    from PIL import Image
+                    with Image.open(img_path) as pil_img:
+                        if max(pil_img.size) >= 400:
+                            pista_ocr = _ocr_hint(pil_img)
+                except Exception:
+                    pista_ocr = None
+            bloque_pista = {"type": "text",
+                            "text": (f"[OCR local imagen '{img_path.name}' — pista para leer "
+                                     f"cotas y letra manuscrita; las posiciones son píxeles "
+                                     f"de la imagen]:\n{pista_ocr}")} if pista_ocr else None
+
             if overlay_solo:
                 content.append({"type": "text",
                                  "text": f"\n--- IMAGEN ORIGINAL: {img_path.name} --- {tag}"})
+                if bloque_pista:
+                    content.append(bloque_pista)
                 content.append({"type": "image", "source": {
                     "type": "base64", "media_type": media_type, "data": data}})
                 content.append({"type": "text",
@@ -734,6 +887,8 @@ def build_claude_content(folder: Path, verbose: bool = True, max_pdfs: int = 5,
                 "type": "text",
                 "text": f"\n--- IMAGEN: {img_path.name} --- {tag}"
             })
+            if bloque_pista:
+                content.append(bloque_pista)
             content.append({
                 "type": "image",
                 "source": {
