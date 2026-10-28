@@ -200,7 +200,7 @@ reparto queda: Qwen + capa vectorial/OpenCV para la forma, Fable solo como árbi
 |---|---|---|
 | F0 (hoy) | Entorno, mapa de arquitectura, banco + comparador, línea base, inventario | hecho |
 | F1 Medir | Re-medir los 4 crudos con el código actual; validar cuáles de las 29 extracciones anotadas son verdad; banco sobre 29; escribir `presupuestador.py` (JSON → conceptos MGR, con las reglas de canto 12+12, pulido por material, enchufes) y medir contra el Excel a ese nivel | 29 extracciones × ~1-2 $ (Fable, 60-100k tokens de imagen); mitad con Batch + caché |
-| F2 Local primero | `plano_vectorial.py` (PDF nativo) + `plano_raster.py` (OpenCV + EasyOCR) → anotaciones sintéticas; validar en J0020/J0024/I018 (vectoriales) y en planos PNG; re-medir. En paralelo, experimento de VLM local y de detector entrenado con las 29 anotaciones | GLM para el código con fixtures sintéticos; GPU local; 0 $ de API |
+| F2 Local primero | **Hecho el 28/10/2026 (primera mitad)**: `plano_vectorial.py` (cotas des-giradas con posición desde la capa de texto; J0020/J0024 exactos), `plano_raster.py` (RapidOCR PP-OCRv5 + cls 0/180 + corrección de página; J0030/J0033 13/14 y 7/7) y enrutado por contenido en `file_readers.py` (`clasificar_pdf`: vectorial → texto + imagen 200 dpi; escaneado → imagen 300 dpi + pista OCR; `EXTRACTOR_OCR=0`); 99 tests. **Banco A/B medido el 28/10 con `claude-fable-5`** (4 trabajos, HEAD vs integración, 10,7 $): media 0,796 → 0,798, neutral dentro del ruido (escaneados +0,03, plantillas digitales −0,03); Fable ya leía los dígitos, la pista sola no desbloquea nada: lo que domina son copetes/zócalos, metros de canto y la segmentación de encimeras (ver INFORME). Línea base para próximos cambios: `bench_out/fable_A_head/`. Pendiente: convertir cotas+líneas en anotaciones sintéticas; validar en J0020/J0024/I018 (vectoriales) y en planos PNG; re-medir. En paralelo, experimento de VLM local y de detector entrenado con las 29 anotaciones | GLM para el código con fixtures sintéticos; GPU local; 0 $ de API |
 | F3 Raster difícil | Solo lo que F2 no resuelva (escaneos torcidos, fotos): pasada "anotador automático" con Claude + cierre de cotas; re-medir en los 22 escaneados | API, acotada al residuo |
 | F4 Verificación | Cascada Opus 5.5 → Jev por campo → Fable solo en dudas; checklist de taller | Jev ≈0,35 s y céntimos por campo |
 | F5 Prompt/API | Modularizar, structured outputs, caché, fallbacks, auditoría | API para A/B |
@@ -223,11 +223,23 @@ nuevos y 0 piezas inventadas; lo que no llegue, con aviso VERIFICAR explícito.
   `TerminalSkills/architectural-drawing-parser` (solo prompt, raster, normativa IBC);
   `earthtojake/text-to-cad` dxf (genera DXF, no lee geometría); `pyPDFtoDXF` (pdf2svg +
   Inkscape; queda como fallback si pdfplumber no bastara). No existe librería pública que
-  parsee planos de cocina vectoriales.
+  parsee planos de cocina vectoriales. `baidu/Unlimited-OCR` (28/10/2026): VLM documento→Markdown
+  solo EN/ZH, sin manuscrita ni rotación ni cajas en píxel, `.cuda()`+bf16+Triton (no corre en la
+  1080 Ti); descartado sin ejecutar, ver `docs/evaluaciones/2026-10-28_ocr_local/INFORME.md`.
+- **Medido y recomendado para `plano_raster.py` (28/10/2026)**: PP-OCRv5 vía RapidOCR 3.10 (CPU,
+  venv 3.14, ~12 s/página): cotas 13/14 y 7/7 todas exactas con la página orientada por el
+  clasificador 0/180 por línea (EasyOCR 12/14, 7/7 con 600→009), etiquetas manuscritas 7/10 y 5/5
+  (EasyOCR 1/10, 0/5), plantilla a boli 14/22 (EasyOCR 4/22). Usar rec `latin_PP-OCRv5_mobile`
+  (no alucina texto) y det server a resolución nativa; scripts en la misma carpeta de evaluación.
+- **Integrado y medido en el banco (28/10/2026)**: con la integración completa el scoreboard de Fable no se
+  mueve (0,796 → 0,798 sobre 4 trabajos). Regla de coste para medir: cambios que no tocan lo que ve el modelo
+  → tests + comprobación en seco (0 $); cambios de prompt o pistas → un brazo contra la línea base (~5 $ con
+  Fable) o Sonnet 5.5 como proxy (~1 $) y Fable solo para confirmar. Pendientes de aplicar en el extractor:
+  caché del prompt estable (~24 k tokens por llamada al 10 %) y Batch API (−50 %) para el banco.
 
 ## 5. Decisiones que necesita Fran
 
-1. La API key que había en la memoria ya NO es válida (401 el 14/10). Está en `~/.config/fable/anthropic.env` (600): sustituir el valor por una clave nueva de console.anthropic.com y cargarla con `set -a; . ~/.config/fable/anthropic.env; set +a` antes de correr el banco.
+1. ~~API key inválida~~ Clave nueva instalada el 28/10 en `~/.config/fable/anthropic.env` (600, verificada con HTTP 200): cargarla con `set -a; . ~/.config/fable/anthropic.env; set +a` antes de correr el banco. Borrar la copia en texto plano del escritorio.
 2. Presupuesto para F1 (orden de 30-60 $) y confirmar qué extracciones cuentan como verdad.
 3. Commit de lo creado hoy (`ARQUITECTURA.md`, banco, comparador, tests, `.gitignore`,
    este plan) o descartarlo.
